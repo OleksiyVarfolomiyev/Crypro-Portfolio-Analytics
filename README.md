@@ -7,12 +7,12 @@ This repository contains two Jupyter notebooks for complementary views of a cryp
 
 ## Notebooks
 
-The two main notebooks provide portfolio and Hyperliquid account analytics. `crypto_read_daily_returns.ipynb` is a supporting notebook for refreshing the shared crypto price history.
+The two notebooks below contain the complete workflows, including price-history refresh.
 
 | Notebook | What it does | Main data files |
 | --- | --- | --- |
-| [`Crypto correlations, constrained Kelly, and portfolio metrics.ipynb`](Crypto%20correlations%2C%20constrained%20Kelly%2C%20and%20portfolio%20metrics.ipynb) | Fetches daily USD prices from CoinGecko; calculates returns and correlations; optimizes long-only constrained full-Kelly weights; compares portfolio results with BTC; writes metrics and return series to CSV. | `data/crypto_daily_prices_usd.csv`, `data/crypto_daily_returns.csv`, `data/crypto_return_correlation.csv`, `data/crypto_kelly_full_weights.csv`, `data/crypto_kelly_weights.csv`, `data/crypto_portfolio_daily_returns.csv`, `data/crypto_portfolio_metrics.csv` |
-| [`hyperliquid.ipynb`](hyperliquid.ipynb) | Reads current account and position data from Hyperliquid; saves account history locally; reports spot/perp balances, realized and unrealized PnL, risk metrics, PnL attribution, and charts against BTC. | `data/hyperliquid_account_history.csv` |
+| [`crypto_portfolio_analytics.ipynb`](crypto_portfolio_analytics.ipynb) | Fetches daily USD prices from CoinGecko; calculates returns and correlations; optimizes long-only constrained full-Kelly weights; compares portfolio results with BTC; writes metrics and return series to CSV. | `data/crypto_daily_prices_usd.csv`, `data/crypto_daily_returns.csv`, `data/crypto_return_correlation.csv`, `data/crypto_kelly_full_weights.csv`, `data/crypto_kelly_weights.csv`, `data/crypto_portfolio_daily_returns.csv`, `data/crypto_portfolio_metrics.csv` |
+| [`hyperliquid_account_analytics.ipynb`](hyperliquid_account_analytics.ipynb) | Reads current account and position data from Hyperliquid; saves account history locally; reports spot/perp balances, realized and unrealized PnL, risk metrics, PnL attribution, and charts against BTC. | `data/hyperliquid_account_history.csv` |
 
 All CSV and spreadsheet data files are stored in the `data/` subfolder. The notebooks create this folder when needed and read/write their files there. Keep the existing files in `data/` between runs to preserve price and account history.
 
@@ -34,9 +34,9 @@ Open either notebook and run its cells from top to bottom. Each notebook is inde
 
 ## 1. Portfolio analytics notebook
 
-Open **Crypto correlations, constrained Kelly, and portfolio metrics.ipynb** and run all cells in order.
+Open **crypto_portfolio_analytics.ipynb** and run all cells in order.
 
-- The first data-fetch cell asks for a CoinGecko Demo API key using hidden input. Create a key in your CoinGecko account and paste it when prompted. The key is not saved in the notebook.
+- The first data-fetch cell asks you to choose a CoinGecko Demo or Pro plan, then enter its API key using hidden input. Create a key in your CoinGecko account and paste it when prompted. The key is not saved in the notebook.
 - The notebook fetches daily USD price history for its configured coin basket and updates `data/crypto_daily_prices_usd.csv`.
 - The remaining cells calculate daily returns, a correlation matrix, constrained full-Kelly weights, and portfolio performance metrics versus BTC.
 - The final export cell writes the weights, daily return series, correlations, and performance metrics to CSV files.
@@ -45,7 +45,7 @@ The default basket, weight bounds, and benchmark assumptions are documented in t
 
 ## 2. Hyperliquid account analytics notebook
 
-Open **hyperliquid.ipynb** and run all cells in order.
+Open **hyperliquid_account_analytics.ipynb** and run all cells in order.
 
 - The notebook queries the configured Hyperliquid account through the public API and fetches current spot balances, perp positions, fills, and BTC candles. No API secret is required for these public account-data requests.
 - It creates or updates `data/hyperliquid_account_history.csv` with new account snapshots and realized PnL. Keep `data/hyperliquid_account_history.csv` between runs to preserve the local history used by the charts and statistics.
