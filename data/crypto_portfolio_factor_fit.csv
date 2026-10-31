@@ -1,7 +1,7 @@
 ,Factor model fit
-Observations,300.0
-R-squared,0.5555337360261758
-Adjusted R-squared,0.5525406972115373
-Annual alpha,0.5244377217291846
-BTC beta (factor model),0.3509797108767462
-BTC beta (single factor),0.3359790658094502
+Observations,283.0
+R-squared,0.8206407764245087
+Adjusted R-squared,0.8174032453130378
+Annual alpha,0.07725114250842977
+BTC beta (factor model),3.0361644656502573
+BTC beta (single factor),0.8077648384414867
