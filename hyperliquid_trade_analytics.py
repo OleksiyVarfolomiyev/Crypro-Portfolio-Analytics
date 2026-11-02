@@ -21,6 +21,11 @@ FUNDING_TIMESTAMP_TOLERANCE = pd.Timedelta(seconds=2)
 
 
 def _rate_limit_delay(response: requests.Response, retry_number: int) -> float:
+    """Return how long to wait before retrying a rate-limited request.
+
+    Uses the server's ``Retry-After`` header when it contains a valid delay or
+    date, and otherwise falls back to exponential backoff.
+    """
     retry_after = response.headers.get("Retry-After")
     if retry_after:
         try:
@@ -39,6 +44,11 @@ def _rate_limit_delay(response: requests.Response, retry_number: int) -> float:
 
 
 def post_info(payload: dict[str, Any], timeout: float = 30) -> Any:
+    """Send a request to Hyperliquid's public info endpoint.
+
+    Rate-limit responses are retried with backoff. Transport errors, other
+    unsuccessful HTTP responses, and invalid JSON are reported as exceptions.
+    """
     for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
         try:
             response = requests.post(INFO_URL, json=payload, timeout=timeout)
@@ -57,6 +67,11 @@ def post_info(payload: dict[str, Any], timeout: float = 30) -> Any:
 
 
 def normalize_market_symbol(coin: str, dex: str = "") -> tuple[str, str]:
+    """Return a canonical market symbol and its DEX name.
+
+    A DEX prefix embedded in ``coin`` is extracted. If both arguments specify
+    different DEXes, the function raises ``ValueError``.
+    """
     coin = coin.strip()
     dex = dex.strip()
     if ":" in coin:
@@ -75,6 +90,11 @@ def fetch_daily_candles(
     lookback_days: int = 365,
     end_time: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
+    """Fetch completed daily OHLC candles for a market.
+
+    The returned frame has UTC ``time`` values and ``open``, ``high``, ``low``,
+    and ``close`` columns. The still-forming current daily candle is excluded.
+    """
     if not coin or lookback_days <= 0:
         raise ValueError("coin must be non-empty and lookback_days must be positive.")
     end = pd.Timestamp.now(tz="UTC") if end_time is None else pd.Timestamp(end_time)
@@ -114,6 +134,11 @@ def fetch_daily_candles(
 
 
 def fetch_mark_and_oracle(coin: str, dex: str = "") -> tuple[float, float]:
+    """Fetch a market's current mark and oracle prices.
+
+    Returns ``(mark_price, oracle_price)`` and raises ``ValueError`` if the
+    market context is missing, malformed, or contains invalid prices.
+    """
     market_coin, dex = normalize_market_symbol(coin, dex)
     coin = market_coin.split(":", 1)[-1]
     payload: dict[str, Any] = {"type": "metaAndAssetCtxs"}
@@ -146,6 +171,12 @@ def fetch_funding_history(
     end_time: pd.Timestamp | None = None,
     allow_empty: bool = False,
 ) -> pd.DataFrame:
+    """Fetch and normalize hourly funding observations for a market.
+
+    Results are paginated as needed and returned in ascending time order with
+    UTC ``time`` and numeric ``fundingRate`` columns. An empty result is
+    returned only when ``allow_empty`` is true.
+    """
     if not coin or lookback_days <= 0:
         raise ValueError("coin must be non-empty and lookback_days must be positive.")
     end = pd.Timestamp.now(tz="UTC") if end_time is None else pd.Timestamp(end_time)
@@ -204,6 +235,12 @@ def fetch_funding_history(
 
 
 def true_range(candles: pd.DataFrame) -> pd.Series:
+    """Calculate true range for each candle that has a previous close.
+
+    ``candles`` must contain ``high``, ``low``, and ``close`` columns. The
+    result is a series containing the maximum of the intraday range and both
+    previous-close gaps; the first candle is omitted.
+    """
     required = {"high", "low", "close"}
     if not required.issubset(candles.columns):
         raise ValueError(f"Daily candle data is missing columns: {sorted(required - set(candles.columns))}")
@@ -220,16 +257,23 @@ def true_range(candles: pd.DataFrame) -> pd.Series:
 
 
 def wilder_atr(candles: pd.DataFrame, period: int = 14) -> float:
+    """Calculate Wilder's average true range for completed candles.
+
+    The first ATR value is the mean of the first ``period`` true ranges;
+    subsequent values use Wilder's recursive smoothing. Insufficient history
+    or a non-positive result raises ``ValueError``.
+    """
     if not isinstance(period, int) or period <= 0:
         raise ValueError("ATR period must be a positive integer.")
     ranges = true_range(candles)
-    if len(ranges) < period:
-        raise ValueError(f"ATR({period}) requires at least {period} completed true-range values; got {len(ranges)}.")
-    atr = float(ranges.iloc[:period].mean())
-    for value in ranges.iloc[period:]:
-        atr = (atr * (period - 1) + float(value)) / period
+    if len(ranges) == 0:
+        raise ValueError("No completed daily true-range values are available.")
+    effective_period = min(period, len(ranges))
+    atr = float(ranges.iloc[:effective_period].mean())
+    for value in ranges.iloc[effective_period:]:
+        atr = (atr * (effective_period - 1) + float(value)) / effective_period
     if not np.isfinite(atr) or atr <= 0:
-        raise ValueError(f"ATR({period}) is not a positive finite value.")
+        raise ValueError(f"ATR({effective_period}) is not a positive finite value.")
     return atr
 
 
@@ -237,6 +281,11 @@ def rolling_funding_sums(
     funding: pd.DataFrame,
     horizon_hours: int = DEFAULT_HORIZON_DAYS * 24,
 ) -> pd.Series:
+    """Sum funding rates over complete, contiguous hourly windows.
+
+    Returns one sum per ``horizon_hours`` window. When timestamps are present,
+    gaps larger than the configured hourly tolerance invalidate a window.
+    """
     if not isinstance(horizon_hours, int) or horizon_hours <= 0:
         raise ValueError("Funding horizon must be a positive number of hours.")
     if "fundingRate" not in funding:
@@ -277,6 +326,13 @@ def adverse_funding_cost_per_unit(
     horizon_hours: int = DEFAULT_HORIZON_DAYS * 24,
     percentile: float = 0.95,
 ) -> float:
+    """Estimate adverse funding cost per coin over a holding horizon.
+
+    The requested percentile is applied to rolling funding sums after
+    adjusting for position direction. Favorable funding is floored at zero,
+    and the resulting rate is converted to quote-currency value using the
+    oracle price.
+    """
     direction = side_to_direction(side)
     if not np.isfinite(oracle_price) or oracle_price <= 0:
         raise ValueError("Oracle price must be positive and finite.")
@@ -287,6 +343,7 @@ def adverse_funding_cost_per_unit(
 
 
 def side_to_direction(side: str) -> int:
+    """Convert a long/buy or short/sell label to ``1`` or ``-1``."""
     normalized = str(side).strip().upper()
     if normalized in {"LONG", "BUY", "B"}:
         return 1
@@ -296,6 +353,13 @@ def side_to_direction(side: str) -> int:
 
 
 def consolidate_current_funding(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate current funding metrics by market and position side.
+
+    Each input row is expected to contain ``Coin``, ``Side``, ``Pos``, ``Sz``,
+    and optionally ``Funding (1h)`` (expressed as a percentage). Missing or
+    invalid funding rates are excluded from funding-weighted values, while
+    their position notionals remain included in coverage calculations.
+    """
     grouped: dict[tuple[str, str], dict[str, float | int]] = {}
     for row in rows:
         coin = str(row["Coin"])
@@ -363,7 +427,102 @@ def consolidate_current_funding(rows: list[dict[str, Any]]) -> list[dict[str, An
     return consolidated
 
 
+def fetch_collateral_equity(wallet: str, perp_equity: float) -> float:
+    """Return a wallet's margin collateral, using USDC balance on unified accounts.
+
+    A unified account's perp account value is already included in its USDC
+    balance, so the two are never added. Other account modes keep perp equity.
+    """
+    if post_info({"type": "userAbstraction", "user": wallet}) != "unifiedAccount":
+        return perp_equity
+    response = post_info({"type": "spotClearinghouseState", "user": wallet})
+    balances = response.get("balances") if isinstance(response, dict) else None
+    if not isinstance(balances, list):
+        raise ValueError(f"Invalid spot balance response returned for wallet {wallet}.")
+    usdc = next((item for item in balances if item.get("coin") == "USDC"), None)
+    try:
+        collateral = float(usdc["total"]) if usdc is not None else 0.0
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Wallet {wallet} returned an invalid USDC balance.") from exc
+    if not np.isfinite(collateral) or collateral < 0:
+        raise ValueError(f"Wallet {wallet} returned an invalid USDC balance.")
+    return collateral
+
+
+def apply_fill_fees(fills: pd.DataFrame) -> pd.DataFrame:
+    """Make ``closedPnl`` net of USDC fees and keep the exchange value as ``grossPnl``.
+
+    Hyperliquid reports ``closedPnl`` before fees, on opening and closing fills
+    alike. Fees paid in other tokens cannot be valued here and are not subtracted.
+    """
+    fills = fills.copy()
+    fills["grossPnl"] = fills["closedPnl"]
+    usdc_fee = fills["fee"].where(fills["feeToken"] == "USDC", 0.0).fillna(0.0)
+    fills["closedPnl"] = fills["closedPnl"] - usdc_fee
+    return fills
+
+
+def drop_refreshed_daily_rows(saved: pd.DataFrame, sources: list[str], days: pd.Series) -> pd.DataFrame:
+    """Remove saved daily rows of the given sources that fresh API data will rebuild.
+
+    A row dated differently from its rebuilt replacement would otherwise stay and
+    double-count. Rows from before the fetched data begin are kept, in case the API
+    stops returning its oldest events.
+    """
+    if saved.empty or days.empty:
+        return saved
+    covered = pd.to_datetime(saved["ts"], utc=True) >= pd.to_datetime(days, utc=True).min()
+    return saved.loc[~(saved["source"].isin(sources) & covered)].copy()
+
+
+def net_funding_apr_history(
+    events: list[dict[str, Any]],
+    timezone: str = "America/New_York",
+    window_days: int = 7,
+) -> pd.DataFrame:
+    """Build daily and rolling net funding APR from ``userFunding`` events.
+
+    Uses the formula behind ``Net Funding APR (%) (simple, covered)``: net funding
+    cash flow divided by gross notional, annualized. Cash divided by the hourly
+    rate gives notional-hours, which holds for hourly events and for the older
+    daily events that total 24 hours of funding. Zero-rate events carry no
+    recoverable notional and are excluded.
+    """
+    rows = []
+    for event in events:
+        delta = event.get("delta", {})
+        if delta.get("type", "funding") != "funding":
+            continue
+        rate = float(delta["fundingRate"])
+        cash = float(delta["usdc"])
+        if not np.isfinite(rate) or not np.isfinite(cash) or rate == 0:
+            continue
+        rows.append({"time": event["time"], "funding_pnl": cash, "notional_hours": abs(cash / rate)})
+    columns = ["funding_pnl", "notional_hours", "apr_pct", "rolling_apr_pct"]
+    if not rows:
+        return pd.DataFrame(columns=columns, index=pd.DatetimeIndex([], name="date"))
+
+    frame = pd.DataFrame(rows)
+    frame["date"] = (
+        pd.to_datetime(frame["time"], unit="ms", utc=True)
+        .dt.tz_convert(timezone)
+        .dt.tz_localize(None)
+        .dt.normalize()
+    )
+    daily = frame.groupby("date")[["funding_pnl", "notional_hours"]].sum().sort_index()
+    daily["apr_pct"] = daily["funding_pnl"] / daily["notional_hours"] * 24 * 365 * 100.0
+    rolling = daily[["funding_pnl", "notional_hours"]].rolling(f"{window_days}D").sum()
+    daily["rolling_apr_pct"] = rolling["funding_pnl"] / rolling["notional_hours"] * 24 * 365 * 100.0
+    return daily[columns]
+
+
 def summarize_current_funding(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize gross/net exposure and current funding cash flow.
+
+    Input rows use ``Pos`` for notional and optionally ``Funding (1h)`` as a
+    percentage. The returned dictionary includes long/short exposure, net
+    direction, funding coverage, and estimated hourly/daily funding PnL.
+    """
     long_notional = 0.0
     short_notional = 0.0
     long_positions = 0
@@ -427,6 +586,13 @@ def summarize_current_funding(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class ExpectedPnl:
+    """Hold-period PnL estimate and the observations used to calculate it.
+
+    Price and funding PnL are expressed in quote currency. The mean forward
+    return is a decimal return, and the observation fields count usable
+    historical samples.
+    """
+
     price_pnl: float
     funding_pnl: float
     net_pnl: float
@@ -444,6 +610,12 @@ def expected_position_pnl(
     oracle_price: float,
     horizon_days: int = DEFAULT_HORIZON_DAYS,
 ) -> ExpectedPnl:
+    """Estimate price, funding, and net PnL for a position over a horizon.
+
+    Historical mean forward close-to-close returns estimate price PnL, and
+    the mean contiguous funding sum estimates funding PnL. ``quantity`` is an
+    absolute coin amount; ``side`` determines the direction of both effects.
+    """
     if not isinstance(horizon_days, int) or horizon_days <= 0:
         raise ValueError("Holding horizon must be a positive integer number of daily bars.")
     if not np.isfinite(quantity) or quantity < 0:
@@ -473,6 +645,11 @@ def expected_position_pnl(
 
 
 def expected_forward_return(closes: pd.Series, horizon_days: int = DEFAULT_HORIZON_DAYS) -> tuple[float, int]:
+    """Return the mean historical forward return and its sample count.
+
+    Each observation compares a close with the close ``horizon_days`` later.
+    Raises ``ValueError`` when there are not enough usable closes.
+    """
     if not isinstance(horizon_days, int) or horizon_days <= 0:
         raise ValueError("Holding horizon must be a positive integer number of daily bars.")
     values = pd.to_numeric(closes, errors="coerce").dropna()
@@ -486,6 +663,12 @@ def add_expected_pnl_columns(
     rows: list[dict[str, Any]],
     horizon_days: int = DEFAULT_HORIZON_DAYS,
 ) -> tuple[list[dict[str, Any]], list[str]]:
+    """Add historical price/funding PnL estimates to position rows.
+
+    Candle and funding data are cached per market during the call. Rows with
+    insufficient or invalid history are retained with ``NaN`` estimates, and
+    a corresponding explanation is returned in the warnings list.
+    """
     enriched: list[dict[str, Any]] = []
     warnings: list[str] = []
     cache: dict[tuple[str, str], tuple[pd.DataFrame, pd.DataFrame]] = {}

@@ -1,20 +1,27 @@
+import importlib
+import importlib.util
+import sys
 import unittest
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from hyperliquid_backtest import BacktestSettings, backtest_signal
 from hyperliquid_trade_analytics import (
     adverse_funding_cost_per_unit,
     add_expected_pnl_columns,
+    apply_fill_fees,
     consolidate_current_funding,
+    drop_refreshed_daily_rows,
     expected_position_pnl,
     expected_forward_return,
+    fetch_collateral_equity,
     fetch_daily_candles,
     fetch_funding_history,
+    net_funding_apr_history,
     post_info,
     rolling_funding_sums,
     side_to_direction,
@@ -25,6 +32,8 @@ from hyperliquid_trade_execution import (
     AccountSnapshot,
     Market,
     Position,
+    collect_snapshot,
+    fetch_open_orders,
     plan_position_protection,
     plan_protection_ladder,
     plan_position_actions,
@@ -33,6 +42,7 @@ from hyperliquid_trade_execution import (
     PositionAction,
     plan_open_position_protection,
     read_position_actions,
+    _matching_protection_orders,
     _price_tick,
     _round_price,
     _submit_protection_order,
@@ -63,7 +73,116 @@ def make_funding(count=500, rate=0.00001):
     )
 
 
+def load_account_implementation():
+    """Import the account implementation, stubbing display packages when not installed."""
+    stubs = {
+        name: MagicMock()
+        for name in ("plotly", "plotly.graph_objects", "plotly.subplots", "IPython", "IPython.display")
+        if importlib.util.find_spec(name.split(".")[0]) is None
+    }
+    with patch.dict(sys.modules, stubs):
+        return importlib.import_module("hyperliquid_account_analytics_implementation")
+
+
+class RealizedPnlTests(unittest.TestCase):
+    def setUp(self):
+        self.account = load_account_implementation()
+
+    def fills(self):
+        def fill(time, direction, closed_pnl, fee, token="USDC"):
+            return {
+                "time": time,
+                "coin": "BTC",
+                "dir": direction,
+                "side": "B",
+                "px": "100",
+                "sz": "1",
+                "closedPnl": str(closed_pnl),
+                "fee": str(fee),
+                "feeToken": token,
+            }
+
+        return self.account.normalize_fills(
+            [
+                fill(1_790_000_000_000, "Open Long", 0, 0.4),
+                fill(1_790_000_100_000, "Close Long", 10, 0.5),
+                fill(1_790_000_200_000, "Open Long", 0, 0.4),
+                fill(1_790_000_300_000, "Close Long", -3, 0.5),
+                # Before fees this is a win; after fees it is a loss.
+                fill(1_790_000_400_000, "Open Long", 0, 0.1),
+                fill(1_790_000_500_000, "Close Long", 0.2, 0.3),
+            ]
+        )
+
+    def test_realized_pnl_subtracts_fees_on_opening_and_closing_fills(self):
+        stats = self.account.realized_pnl_stats(self.fills())
+        self.assertAlmostEqual(stats["total"], 7.2 - 2.2)
+
+    def test_opening_fees_do_not_count_as_losing_closes(self):
+        stats = self.account.realized_pnl_stats(self.fills())
+        self.assertEqual(stats["wins"], 1)
+        self.assertEqual(stats["losses"], 2)
+        self.assertEqual(int(self.account.perp_close_counts(self.fills()).sum()), 3)
+
+    def test_breakdown_reconciles_gross_trading_fees_and_funding(self):
+        funding = pd.DataFrame({"fundingPnl": [-1.0]})
+        breakdown, non_usd = self.account.perp_pnl_breakdown(self.fills(), funding)
+        amounts = breakdown.set_index("Component")["Amount ($)"]
+        self.assertIsNone(non_usd)
+        self.assertAlmostEqual(amounts["Trading"], 7.2)
+        self.assertAlmostEqual(amounts["Fees"], -2.2)
+        self.assertAlmostEqual(amounts["Net perp PnL"], 7.2 - 2.2 - 1.0)
+
+    def test_non_usdc_fee_is_not_subtracted_from_usdc_pnl(self):
+        fills = pd.DataFrame(
+            {"closedPnl": [5.0, 5.0, 5.0], "fee": [1.0, 1.0, float("nan")], "feeToken": ["USDC", "HYPE", "USDC"]}
+        )
+        self.assertEqual(apply_fill_fees(fills)["closedPnl"].tolist(), [4.0, 5.0, 5.0])
+
+    def test_fresh_data_replaces_saved_rows_but_keeps_older_and_other_sources(self):
+        day = lambda text: pd.Timestamp(text, tz="America/New_York")
+        saved = pd.DataFrame(
+            {
+                "ts": [day("2026-01-01"), day("2026-01-05"), day("2026-01-05")],
+                "source": ["funding_daily", "funding_daily", "perp_realized_daily"],
+                "realized_pnl": [1.0, 12.8, 2.0],
+            }
+        )
+        days = pd.Series([day("2026-01-03")])
+        kept = drop_refreshed_daily_rows(saved, ["funding_daily"], days)
+        self.assertEqual(kept["realized_pnl"].tolist(), [1.0, 2.0])
+        self.assertTrue(drop_refreshed_daily_rows(saved, ["funding_daily"], days.iloc[0:0]).equals(saved))
+
+
 class TradeAnalyticsTests(unittest.TestCase):
+    def test_net_funding_apr_history_matches_current_funding_formula(self):
+        def event(day, usdc, rate, kind="funding"):
+            time_ms = int(pd.Timestamp(day, tz="America/New_York").timestamp() * 1000)
+            return {"time": time_ms, "delta": {"type": kind, "usdc": str(usdc), "fundingRate": str(rate)}}
+
+        # A $1,000 short receiving 0.01%/h and a $1,000 long paying 0.005%/h.
+        events = [
+            event("2026-01-01 12:00", 0.1, 0.0001),
+            event("2026-01-01 12:00", -0.05, 0.00005),
+            event("2026-01-01 12:00", 0.0, 0.0),
+            event("2026-01-01 12:00", 5, 0.1, kind="other"),
+            event("2026-01-10 12:00", -0.1, 0.0001),
+        ]
+        history = net_funding_apr_history(events)
+
+        summary = summarize_current_funding(
+            [
+                {"Coin": "A", "Side": "SHORT", "Pos": 1_000, "Sz": 1, "Funding (1h)": 0.01},
+                {"Coin": "B", "Side": "LONG", "Pos": 1_000, "Sz": 1, "Funding (1h)": 0.005},
+            ]
+        )
+        first = history.loc["2026-01-01"]
+        self.assertAlmostEqual(first["apr_pct"], summary["Net Funding APR (%) (simple, covered)"])
+        self.assertAlmostEqual(first["notional_hours"], 2_000)
+        # Nine days apart, so the 7-day window does not reach back to the first event.
+        self.assertAlmostEqual(history.loc["2026-01-10", "rolling_apr_pct"], -87.6)
+        self.assertTrue(net_funding_apr_history([]).empty)
+
     def test_consolidated_current_funding_is_notional_weighted_and_side_aware(self):
         rows = [
             {"Coin": "BTC", "Side": "LONG", "Pos": 1000, "Sz": 10, "Funding (1h)": 0.01},
@@ -400,6 +519,27 @@ class TradeAnalyticsTests(unittest.TestCase):
         self.assertEqual(markets["xyz:AAPL"].dex, "xyz")
         self.assertNotIn("xyz:xyz:AAPL", markets)
 
+    def test_fetch_open_orders_collects_default_and_dex_orders(self):
+        wallet = "0x" + "1" * 40
+        default_order = {"oid": 1, "coin": "BTC"}
+        xyz_order = {"oid": 2, "coin": "xyz:AAPL"}
+        responses = [[default_order], [xyz_order]]
+
+        with (
+            patch("hyperliquid_trade_execution.get_dexes", return_value=["", "xyz"]),
+            patch("hyperliquid_trade_execution.post_info", side_effect=responses) as post_info_mock,
+        ):
+            orders = fetch_open_orders(wallet)
+
+        self.assertEqual(orders, [default_order, xyz_order])
+        self.assertEqual(
+            [call.args[0] for call in post_info_mock.call_args_list],
+            [
+                {"type": "frontendOpenOrders", "user": wallet},
+                {"type": "frontendOpenOrders", "user": wallet, "dex": "xyz"},
+            ],
+        )
+
     def test_open_position_protection_only_adds_uncovered_exit_quantity(self):
         market = Market("BTC", "", 100, 100, 3, 10)
         position = Position(
@@ -555,6 +695,70 @@ class TradeAnalyticsTests(unittest.TestCase):
             position, [], make_candles(), make_funding(rate=0.0001)
         )
         self.assertGreater(adverse_funding.stop_price, no_funding.stop_price)
+
+    def test_reduce_only_limit_beyond_mark_counts_as_target_on_losing_position(self):
+        market = Market("BTC", "", 80, 80, 3, 10)
+        position = Position(
+            wallet="0x" + "1" * 40,
+            coin="BTC",
+            dex="",
+            quantity=3,
+            entry_price=100,
+            mark_price=80,
+            oracle_price=80,
+            margin_used=80,
+            market=market,
+        )
+        def limit(oid, price):
+            return {
+                "oid": oid,
+                "coin": "BTC",
+                "side": "A",
+                "sz": "1",
+                "limitPx": str(price),
+                "orderType": "Limit",
+                "reduceOnly": True,
+            }
+
+        orders = [limit(1, 85), limit(2, 90), limit(3, 75)]
+        _, targets = _matching_protection_orders(position, orders)
+        self.assertEqual([order["oid"] for order in targets], [1, 2])
+
+    def _snapshot_with_abstraction(self, abstraction):
+        wallet = "0x" + "1" * 40
+        state = {
+            "marginSummary": {"accountValue": "400", "totalMarginUsed": "390"},
+            "assetPositions": [],
+        }
+        balances = {
+            "balances": [
+                {"coin": "USDC", "total": "1000", "hold": "390"},
+                {"coin": "HYPE", "total": "10", "hold": "0"},
+            ]
+        }
+        with (
+            patch("hyperliquid_trade_execution.fetch_user_state", return_value=state),
+            patch("hyperliquid_trade_execution.parse_fee_rates", return_value=(0.0001, 0.0004)),
+            patch("hyperliquid_trade_analytics.post_info", side_effect=[abstraction, balances]),
+        ):
+            return collect_snapshot([wallet], [""], {})
+
+    def test_unified_account_equity_is_usdc_collateral_without_double_counting(self):
+        snapshot = self._snapshot_with_abstraction("unifiedAccount")
+        self.assertEqual(snapshot.equity, 1_000)
+        self.assertEqual(snapshot.target_equity, 1_000)
+        self.assertEqual(snapshot.margin_used, 390)
+
+    def test_non_unified_account_equity_stays_perp_account_value(self):
+        snapshot = self._snapshot_with_abstraction("default")
+        self.assertEqual(snapshot.equity, 400)
+        self.assertEqual(snapshot.target_equity, 400)
+
+    def test_unified_account_rejects_invalid_usdc_balance(self):
+        responses = ["unifiedAccount", {"balances": [{"coin": "USDC", "total": "bad"}]}]
+        with patch("hyperliquid_trade_analytics.post_info", side_effect=responses):
+            with self.assertRaises(ValueError):
+                fetch_collateral_equity("0x" + "1" * 40, 400)
 
     def test_target_action_uses_per_position_risk_cap(self):
         market = Market("BTC", "", 100, 100, 3, 10)

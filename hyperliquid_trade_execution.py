@@ -25,6 +25,7 @@ from hyperliquid_trade_analytics import (
     ExpectedPnl,
     adverse_funding_cost_per_unit,
     expected_position_pnl,
+    fetch_collateral_equity,
     fetch_daily_candles,
     fetch_funding_history,
     post_info,
@@ -48,6 +49,8 @@ MONITOR_INTERVAL_SECONDS = 15
 
 @dataclass(frozen=True)
 class Market:
+    """Market metadata and current reference prices used for sizing orders."""
+
     coin: str
     dex: str
     mark_price: float
@@ -58,6 +61,8 @@ class Market:
 
 @dataclass(frozen=True)
 class Position:
+    """A wallet's open position together with market and margin details."""
+
     wallet: str
     coin: str
     dex: str
@@ -72,6 +77,8 @@ class Position:
 
 @dataclass(frozen=True)
 class AccountSnapshot:
+    """Combined account balances, positions, fees, and sizing-wallet totals."""
+
     equity: float
     margin_used: float
     target_equity: float
@@ -84,6 +91,8 @@ class AccountSnapshot:
 
 @dataclass(frozen=True)
 class PlannedTrade:
+    """Risk-checked entry size, reference levels, and expected-PnL estimate."""
+
     coin: str
     dex: str
     side: str
@@ -104,6 +113,8 @@ class PlannedTrade:
 
 @dataclass
 class ActiveTrade:
+    """Runtime state for a submitted trade monitored by the live guard."""
+
     plan: PlannedTrade
     quantity: float
     entry_price: float
@@ -115,6 +126,8 @@ class ActiveTrade:
 
 @dataclass(frozen=True)
 class ProtectionPlan:
+    """Missing stop/target quantities and levels for an open position."""
+
     position: Position
     side: str
     stop_price: float
@@ -130,12 +143,16 @@ class ProtectionPlan:
 
 @dataclass(frozen=True)
 class LadderOrder:
+    """One position-protection ladder leg with its size and limit/trigger price."""
+
     quantity: float
     price: float
 
 
 @dataclass(frozen=True)
 class ProtectionLadderPlan:
+    """Complete stop and take-profit ladders plus IDs of orders to replace."""
+
     position: Position
     side: str
     atr: float
@@ -147,6 +164,8 @@ class ProtectionLadderPlan:
 
 @dataclass(frozen=True)
 class PositionAction:
+    """One requested open, resize, target, or close action for a market."""
+
     action: str
     coin: str
     dex: str
@@ -156,6 +175,8 @@ class PositionAction:
 
 @dataclass(frozen=True)
 class ReconcilePlan:
+    """Preflight result describing a position action and its order consequences."""
+
     action: PositionAction
     position: Position | None
     side: str
@@ -173,6 +194,7 @@ class ReconcilePlan:
 
 
 def normalize_market(coin: str, dex: str = "") -> tuple[str, str]:
+    """Normalize a market symbol and resolve its optional DEX prefix."""
     coin = coin.strip()
     dex = dex.strip()
     if ":" in coin:
@@ -188,6 +210,7 @@ def normalize_market(coin: str, dex: str = "") -> tuple[str, str]:
 
 
 def get_dexes(signals: list[dict[str, str]]) -> list[str]:
+    """Return the default DEX, DEXes named by signals, and all listed perp DEXes."""
     dexes = {""}
     for signal in signals:
         _, dex = normalize_market(signal["coin"], signal.get("dex", ""))
@@ -205,6 +228,7 @@ def get_dexes(signals: list[dict[str, str]]) -> list[str]:
 
 
 def fetch_markets(dexes: list[str]) -> dict[str, Market]:
+    """Fetch metadata and current mark/oracle prices for the requested DEXes."""
     markets: dict[str, Market] = {}
     for dex in dexes:
         request: dict[str, Any] = {"type": "metaAndAssetCtxs"}
@@ -242,6 +266,7 @@ def fetch_markets(dexes: list[str]) -> dict[str, Market]:
 
 
 def fetch_user_state(wallet: str, dex: str) -> dict[str, Any]:
+    """Fetch and validate one wallet's clearinghouse state for a DEX."""
     request: dict[str, Any] = {"type": "clearinghouseState", "user": wallet}
     if dex:
         request["dex"] = dex
@@ -251,14 +276,34 @@ def fetch_user_state(wallet: str, dex: str) -> dict[str, Any]:
     return response
 
 
-def fetch_open_orders(wallet: str) -> list[dict[str, Any]]:
-    response = post_info({"type": "frontendOpenOrders", "user": wallet})
-    if not isinstance(response, list) or any(not isinstance(order, dict) for order in response):
-        raise ValueError(f"Invalid open-order response returned for wallet {wallet}.")
-    return response
+def fetch_open_orders(wallet: str, dexes: list[str] | None = None) -> list[dict[str, Any]]:
+    """Fetch and combine a wallet's open orders across the default and named DEXs."""
+    selected_dexes = get_dexes([]) if dexes is None else list(dict.fromkeys(dexes))
+    orders_by_id: dict[int, dict[str, Any]] = {}
+    for dex in selected_dexes:
+        request: dict[str, Any] = {"type": "frontendOpenOrders", "user": wallet}
+        if dex:
+            request["dex"] = dex
+        response = post_info(request)
+        if not isinstance(response, list) or any(not isinstance(order, dict) for order in response):
+            raise ValueError(
+                f"Invalid open-order response returned for wallet {wallet} on DEX {dex or 'default'}."
+            )
+        for order in response:
+            if order.get("oid") is None:
+                raise ValueError(
+                    f"Open order for wallet {wallet} on DEX {dex or 'default'} has no order ID."
+                )
+            order_id = int(order["oid"])
+            existing = orders_by_id.get(order_id)
+            if existing is not None and existing != order:
+                raise ValueError(f"Conflicting open-order data returned for order {order_id}.")
+            orders_by_id[order_id] = order
+    return list(orders_by_id.values())
 
 
 def parse_fee_rates(wallet: str) -> tuple[float, float]:
+    """Return the wallet's maker and taker fee rates from Hyperliquid."""
     response = post_info({"type": "userFees", "user": wallet})
     if not isinstance(response, dict) or "userAddRate" not in response or "userCrossRate" not in response:
         raise ValueError(f"Could not read the maker/taker fee rates for wallet {wallet}.")
@@ -269,6 +314,12 @@ def parse_fee_rates(wallet: str) -> tuple[float, float]:
 
 
 def collect_snapshot(wallets: list[str], dexes: list[str], markets: dict[str, Market]) -> AccountSnapshot:
+    """Collect validated positions, margin totals, and collateral equity across wallets.
+
+    The first wallet is the execution wallet; its equity and margin are kept
+    separately for sizing, while all supplied wallets contribute to aggregate
+    risk and total equity.
+    """
     wallets = list(dict.fromkeys(wallet.lower() for wallet in wallets))
     if not wallets:
         raise ValueError("At least one risk wallet address is required.")
@@ -278,6 +329,7 @@ def collect_snapshot(wallets: list[str], dexes: list[str], markets: dict[str, Ma
     target_equity = 0.0
     target_margin_used = 0.0
     for wallet_index, wallet in enumerate(wallets):
+        perp_equity = 0.0
         for dex in dexes:
             state = fetch_user_state(wallet, dex)
             margin_summary = state.get("marginSummary", {})
@@ -290,10 +342,9 @@ def collect_snapshot(wallets: list[str], dexes: list[str], markets: dict[str, Ma
                 ) from exc
             if account_value < 0 or used_margin < 0:
                 raise ValueError(f"Wallet {wallet} returned negative account or margin values.")
-            equity += account_value
+            perp_equity += account_value
             margin_used += used_margin
             if wallet_index == 0:
-                target_equity += account_value
                 target_margin_used += used_margin
             for item in state["assetPositions"]:
                 position = item.get("position", {})
@@ -331,8 +382,12 @@ def collect_snapshot(wallets: list[str], dexes: list[str], markets: dict[str, Ma
                         leverage=leverage,
                     )
                 )
+        wallet_equity = fetch_collateral_equity(wallet, perp_equity)
+        equity += wallet_equity
+        if wallet_index == 0:
+            target_equity = wallet_equity
     if equity <= 0:
-        raise ValueError("Combined perp account equity must be positive.")
+        raise ValueError("Combined account equity must be positive.")
     maker_rate, taker_rate = parse_fee_rates(wallets[0])
     return AccountSnapshot(
         equity=equity,
@@ -353,6 +408,7 @@ def position_risk(
     taker_fee_rate: float,
     maker_fee_rate: float = 0.0,
 ) -> float:
+    """Estimate a position's stop, adverse-funding, and round-trip fee risk."""
     side = "LONG" if position.quantity > 0 else "SHORT"
     atr = wilder_atr(candles, 14)
     funding_reserve = adverse_funding_cost_per_unit(
@@ -369,6 +425,7 @@ def position_risk(
 
 
 def _order_side_direction(order: dict[str, Any]) -> int:
+    """Map an exchange order's side field to buy/sell direction."""
     side = str(order.get("side", "")).strip().upper()
     if side in {"B", "BUY", "BID"}:
         return 1
@@ -378,6 +435,7 @@ def _order_side_direction(order: dict[str, Any]) -> int:
 
 
 def _is_reduce_only(order: dict[str, Any]) -> bool:
+    """Return whether an order is explicitly marked reduce-only."""
     value = order.get("reduceOnly", False)
     return value is True or (isinstance(value, str) and value.strip().lower() == "true")
 
@@ -386,6 +444,7 @@ def _matching_protection_orders(
     position: Position,
     open_orders: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separate close-side orders matching a position into stops and targets."""
     direction = 1 if position.quantity > 0 else -1
     close_direction = -direction
     stops: list[dict[str, Any]] = []
@@ -412,17 +471,19 @@ def _matching_protection_orders(
             limit_price = float(order.get("limitPx") or 0)
         except (TypeError, ValueError):
             continue
-        is_profitable_exit = (
-            limit_price > position.entry_price
+        # A ladder on a losing position rests beyond the mark but short of entry.
+        is_favorable_exit = (
+            limit_price > min(position.entry_price, position.mark_price)
             if direction > 0
-            else 0 < limit_price < position.entry_price
+            else 0 < limit_price < max(position.entry_price, position.mark_price)
         )
-        if is_profitable_exit:
+        if is_favorable_exit:
             targets.append(order)
     return stops, targets
 
 
 def _open_order_quantity(order: dict[str, Any]) -> float:
+    """Read a non-negative finite remaining order size, or zero if invalid."""
     try:
         quantity = float(order.get("sz") or order.get("origSz") or 0)
     except (TypeError, ValueError):
@@ -434,6 +495,7 @@ def _protection_coverage(
     position: Position,
     open_orders: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float, float]:
+    """Calculate existing stop/target orders and uncovered position quantities."""
     stops, targets = _matching_protection_orders(position, open_orders)
     open_quantity = abs(position.quantity)
     step = 10 ** -position.market.size_decimals
@@ -458,6 +520,7 @@ def plan_position_protection(
     candles: pd.DataFrame,
     funding: pd.DataFrame | None = None,
 ) -> ProtectionPlan:
+    """Plan missing single-level ATR stop and take-profit protection."""
     direction = 1 if position.quantity > 0 else -1
     side = "LONG" if direction > 0 else "SHORT"
     stops, targets, stop_quantity_to_add, target_quantity_to_add = _protection_coverage(
@@ -526,6 +589,7 @@ def plan_protection_ladder(
     steps: int = 3,
     atr_multiple: float = STOP_ATR_MULTIPLE,
 ) -> ProtectionLadderPlan:
+    """Split an open position into size-valid ATR stop and take-profit steps."""
     if not isinstance(steps, int) or steps <= 0:
         raise ValueError("Protection-ladder steps must be a positive integer.")
     if not np.isfinite(atr_multiple) or atr_multiple <= 0:
@@ -643,6 +707,7 @@ def plan_protection_ladder(
 
     old_stops, old_targets = _matching_protection_orders(position, open_orders)
     def order_ids(orders: list[dict[str, Any]]) -> tuple[int, ...]:
+        """Return required exchange IDs for a set of replaceable orders."""
         identifiers = []
         for order in orders:
             oid = order.get("oid")
@@ -666,6 +731,7 @@ def plan_open_position_protection(
     positions: tuple[Position, ...],
     open_orders: list[dict[str, Any]],
 ) -> list[ProtectionPlan]:
+    """Plan missing protections for each position without changing live orders."""
     plans: list[ProtectionPlan] = []
     for position in positions:
         direction = 1 if position.quantity > 0 else -1
@@ -730,6 +796,7 @@ def size_trade(
     maker_fee_rate: float,
     taker_fee_rate: float,
 ) -> PlannedTrade:
+    """Calculate an entry quantity constrained by risk, margin, and leverage."""
     direction = side_to_direction(side)
     if not np.isfinite(equity) or equity <= 0:
         raise ValueError("Account equity must be positive and finite.")
@@ -805,6 +872,7 @@ def size_trade(
 
 
 def read_signals(path: Path) -> list[dict[str, str]]:
+    """Load and validate unique market-side entries from a signal CSV."""
     import csv
 
     with path.open(newline="", encoding="utf-8-sig") as file:
@@ -831,6 +899,7 @@ def read_signals(path: Path) -> list[dict[str, str]]:
 
 
 def read_position_actions(path: Path) -> list[PositionAction]:
+    """Load and validate position-sizing actions from an action CSV."""
     import csv
 
     allowed = {"target", "open_target", "open_margin", "adjust_margin", "close"}
@@ -895,6 +964,7 @@ def plan_trades(
     markets: dict[str, Market],
     snapshot: AccountSnapshot,
 ) -> tuple[list[PlannedTrade], float]:
+    """Build risk- and margin-limited entry plans and report current portfolio risk."""
     caches: dict[tuple[str, str], tuple[pd.DataFrame, pd.DataFrame]] = {}
     current_risk = 0.0
     for position in snapshot.positions:
@@ -964,7 +1034,9 @@ def plan_position_actions(
     markets: dict[str, Market],
     snapshot: AccountSnapshot,
     open_orders: list[dict[str, Any]],
+    always_allow: bool = False,
 ) -> list[ReconcilePlan]:
+    """Plan requested position changes within risk and margin limits."""
     candles_by_market: dict[tuple[str, str], pd.DataFrame] = {}
     funding_by_market: dict[tuple[str, str], pd.DataFrame] = {}
     current_risk = 0.0
@@ -1059,15 +1131,23 @@ def plan_position_actions(
             else 0.0
         )
         other_risk = max(0.0, current_risk - own_risk)
-        risk_allowed_for_position = max(
-            0.0,
-            min(per_position_cap, total_risk_cap - other_risk),
+        risk_allowed_for_position = (
+            per_position_cap
+            if always_allow
+            else max(
+                0.0,
+                min(per_position_cap, total_risk_cap - other_risk),
+            )
         )
         maximum_risk_quantity = risk_allowed_for_position / risk_per_unit
         available_margin_quantity = margin_available * leverage / market.mark_price
-        maximum_total_quantity = min(
-            maximum_risk_quantity,
-            current_quantity + available_margin_quantity,
+        maximum_total_quantity = (
+            maximum_risk_quantity
+            if always_allow
+            else min(
+                maximum_risk_quantity,
+                current_quantity + available_margin_quantity,
+            )
         )
         quantity_step = 10 ** -market.size_decimals
         if request.action in {"open_target", "target"}:
@@ -1097,6 +1177,20 @@ def plan_position_actions(
         quantity_delta = target_quantity - current_quantity
 
         if quantity_delta > 0 and not block_reason:
+            headroom_for_entry = (
+                quantity_delta * risk_per_unit
+                if always_allow
+                else max(0.0, min(
+                    total_risk_cap - current_risk,
+                    per_position_cap - own_risk,
+                    quantity_delta * risk_per_unit,
+                ))
+            )
+            margin_for_entry = (
+                quantity_delta * market.mark_price / leverage
+                if always_allow
+                else margin_available
+            )
             entry_plan = size_trade(
                 request.coin,
                 request.dex,
@@ -1105,12 +1199,8 @@ def plan_position_actions(
                 candles,
                 funding,
                 snapshot.equity,
-                max(0.0, min(
-                    total_risk_cap - current_risk,
-                    per_position_cap - own_risk,
-                    quantity_delta * risk_per_unit,
-                )),
-                margin_available,
+                headroom_for_entry,
+                margin_for_entry,
                 snapshot.maker_fee_rate,
                 snapshot.taker_fee_rate,
             )
@@ -1189,6 +1279,7 @@ def plan_position_actions(
 
 
 def _round_price(price: float, size_decimals: int) -> float:
+    """Round a positive price to the exchange precision allowed for a market."""
     if price <= 0:
         raise ValueError("Order price must be positive.")
     max_decimals = 6 - size_decimals
@@ -1197,6 +1288,7 @@ def _round_price(price: float, size_decimals: int) -> float:
 
 
 def _price_tick(price: float, size_decimals: int) -> float:
+    """Return the smallest valid price increment near the supplied price."""
     if price <= 0 or not np.isfinite(price):
         raise ValueError("Cannot determine a price tick from an invalid price.")
     decimals = min(6 - size_decimals, 4 - math.floor(math.log10(price)))
@@ -1204,6 +1296,7 @@ def _price_tick(price: float, size_decimals: int) -> float:
 
 
 def post_only_price(coin: str, dex: str, side: str, size_decimals: int) -> float:
+    """Choose a non-crossing midpoint-based limit price for a post-only order."""
     request: dict[str, Any] = {"type": "l2Book", "coin": coin}
     if dex:
         request["dex"] = dex
@@ -1232,6 +1325,7 @@ def post_only_price(coin: str, dex: str, side: str, size_decimals: int) -> float
 
 
 def _status_rows(response: Any) -> list[dict[str, Any]]:
+    """Extract order status entries from a validated exchange response."""
     if not isinstance(response, dict):
         raise ValueError("Exchange returned an invalid order response.")
     statuses = response.get("response", {}).get("data", {}).get("statuses")
@@ -1241,6 +1335,7 @@ def _status_rows(response: Any) -> list[dict[str, Any]]:
 
 
 def _oid_from_status(status: dict[str, Any]) -> int | None:
+    """Return the exchange order ID for a resting or immediately filled order."""
     item = status.get("resting") or status.get("filled")
     if isinstance(item, dict) and item.get("oid") is not None:
         return int(item["oid"])
@@ -1248,6 +1343,7 @@ def _oid_from_status(status: dict[str, Any]) -> int | None:
 
 
 def _order_status(wallet: str, oid: int) -> dict[str, Any]:
+    """Fetch the exchange's current status for one wallet order ID."""
     response = post_info({"type": "orderStatus", "user": wallet, "oid": oid})
     if not isinstance(response, dict):
         raise ValueError(f"Could not read order status for order {oid}.")
@@ -1255,6 +1351,7 @@ def _order_status(wallet: str, oid: int) -> dict[str, Any]:
 
 
 def _filled_size(status: dict[str, Any]) -> tuple[float, float]:
+    """Return the filled quantity and average execution price from an order status."""
     filled = status.get("filled")
     if isinstance(filled, dict):
         return float(filled.get("totalSz", 0)), float(filled.get("avgPx", 0))
@@ -1262,6 +1359,7 @@ def _filled_size(status: dict[str, Any]) -> tuple[float, float]:
 
 
 def _place_entry(exchange: Any, wallet: str, plan: PlannedTrade, market: Market) -> tuple[float, float]:
+    """Chase the planned entry with post-only limits and return filled size and average price."""
     deadline = time.monotonic() + ENTRY_TIMEOUT_SECONDS
     filled_total = 0.0
     weighted_entry = 0.0
@@ -1320,6 +1418,7 @@ def _place_exit_orders(
     entry_price: float,
     size_decimals: int,
 ) -> tuple[int, int]:
+    """Submit reduce-only stop-market and post-only take-profit orders for a filled entry."""
     direction = side_to_direction(plan.side)
     stop_distance = plan.price_stop_distance or plan.stop_distance
     stop_price = _round_price(entry_price - direction * stop_distance, size_decimals)
@@ -1385,12 +1484,14 @@ def _place_exit_orders(
 
 
 def _cancel_if_open(exchange: Any, coin: str, wallet: str, oid: int) -> None:
+    """Cancel an order only when the exchange reports it is still active."""
     status = _order_status(wallet, oid).get("order", {})
     if str(status.get("status", "")).lower() in {"open", "triggered"}:
         exchange.cancel(coin, oid)
 
 
 def _current_position_quantity(wallet: str, dex: str, coin: str) -> float:
+    """Return the wallet's signed open quantity for one market, or zero if flat."""
     state = fetch_user_state(wallet, dex)
     for item in state["assetPositions"]:
         position = item.get("position", {})
@@ -1400,6 +1501,7 @@ def _current_position_quantity(wallet: str, dex: str, coin: str) -> float:
 
 
 def _watch_trades(exchange: Any, wallet: str, active_trades: list[ActiveTrade], maker_rate: float, taker_rate: float) -> None:
+    """Monitor managed entries, cancel sibling exits, and enforce the net-loss guard."""
     remaining = list(active_trades)
     while remaining:
         for trade in list(remaining):
@@ -1481,6 +1583,7 @@ def _watch_trades(exchange: Any, wallet: str, active_trades: list[ActiveTrade], 
 
 
 def _load_key_from_keychain(wallet: str) -> str:
+    """Load the API-wallet private key associated with a main wallet from OS keychain."""
     try:
         import keyring
     except ImportError as exc:
@@ -1496,6 +1599,7 @@ def _load_key_from_keychain(wallet: str) -> str:
 
 
 def store_key(wallet: str) -> None:
+    """Prompt for and securely store a confirmed API-wallet key in the OS keychain."""
     _validate_address(wallet, "main-wallet address")
     try:
         import keyring
@@ -1512,6 +1616,7 @@ def store_key(wallet: str) -> None:
 
 
 def build_exchange(wallet_address: str, private_key: str, dexes: list[str]) -> Any:
+    """Create an authenticated Hyperliquid exchange client for the selected DEXes."""
     try:
         from eth_account import Account
         from hyperliquid.exchange import Exchange
@@ -1528,6 +1633,7 @@ def build_exchange(wallet_address: str, private_key: str, dexes: list[str]) -> A
 
 
 def read_target_wallets(wallet: str, risk_wallets: str | None) -> list[str]:
+    """Return the execution wallet first, followed by distinct validated risk wallets."""
     wallets = [item.strip().lower() for item in (risk_wallets or wallet).split(",") if item.strip()]
     target_wallet = wallet.lower()
     result = [target_wallet] + list(dict.fromkeys(item for item in wallets if item != target_wallet))
@@ -1537,6 +1643,7 @@ def read_target_wallets(wallet: str, risk_wallets: str | None) -> list[str]:
 
 
 def _validate_address(address: str, label: str) -> None:
+    """Reject wallet strings that are not 42-character hexadecimal addresses."""
     if (
         len(address) != 42
         or not address.startswith("0x")
@@ -1546,22 +1653,23 @@ def _validate_address(address: str, label: str) -> None:
 
 
 def print_plan(snapshot: AccountSnapshot, plans: list[PlannedTrade], current_risk: float) -> None:
+    """Display account limits, estimated existing risk, and proposed entry details."""
     print(f"Risk wallets: {len(snapshot.risk_wallets)}")
-    print(f"Perp equity (spot balances excluded): ${snapshot.equity:,.2f}")
+    print(f"Collateral equity: ${snapshot.equity:,.2f}")
     print(f"Perp margin used: ${snapshot.margin_used:,.2f}")
     print(
         f"Execution-wallet margin available above its 20% reserve: "
         f"${max(0.0, snapshot.target_equity * (1 - RESERVE_PCT) - snapshot.target_margin_used):,.2f}"
     )
     print(f"Estimated current stop + 5-day adverse funding risk: ${current_risk:,.2f} "
-          f"({current_risk / snapshot.equity:.2%} of perp equity)")
+          f"({current_risk / snapshot.equity:.2%} of collateral equity)")
     print(f"Aggregate stop-risk cap: ${snapshot.equity * MAX_TOTAL_RISK_PCT:,.2f} "
-          f"({MAX_TOTAL_RISK_PCT:.0%} of perp equity)")
+          f"({MAX_TOTAL_RISK_PCT:.0%} of collateral equity)")
     print(
         f"Per-position risk budget: ${snapshot.equity * (1 - RESERVE_PCT) * RISK_PCT_OF_USABLE_MARGIN:,.2f} "
         f"(5% of the 80% usable-equity amount)"
     )
-    print("Spot balances are excluded from equity/risk sizing; this is conservative.")
+    print("Unified accounts use USDC collateral; other account modes use perp equity.")
     for plan in plans:
         print(
             f"{plan.coin} {plan.side}: quantity={plan.quantity:g}, reference=${plan.entry_reference:,.6g}, "
@@ -1575,6 +1683,7 @@ def print_plan(snapshot: AccountSnapshot, plans: list[PlannedTrade], current_ris
 
 
 def print_protection_plans(plans: list[ProtectionPlan]) -> None:
+    """Display current position protection gaps and reasons additions are blocked."""
     if not plans:
         print("No open positions were found in this wallet.")
         return
@@ -1612,6 +1721,7 @@ def print_protection_plans(plans: list[ProtectionPlan]) -> None:
 
 
 def has_submitable_protection(plans: list[ProtectionPlan]) -> bool:
+    """Return whether any protection plan contains an unblocked order to submit."""
     return any(
         (plan.stop_quantity_to_add > 0 and not plan.stop_block_reason)
         or (plan.target_quantity_to_add > 0 and not plan.target_block_reason)
@@ -1626,6 +1736,7 @@ def run_open_position_protection(
     plans: list[ProtectionPlan],
     markets: dict[str, Market],
 ) -> None:
+    """Submit missing stop/target protections after rechecking live positions and orders."""
     exchange = build_exchange(wallet, private_key, dexes)
     failures: list[str] = []
     positions_by_market: dict[tuple[str, str], tuple[float, float]] = {}
@@ -1780,6 +1891,7 @@ def run_open_position_protection(
 
 
 def print_reconcile_plans(plans: list[ReconcilePlan]) -> None:
+    """Display proposed position sizes, margin estimates, and reconciliation warnings."""
     for plan in plans:
         request = plan.action
         quantity_change = (
@@ -1818,6 +1930,7 @@ def print_reconcile_plans(plans: list[ReconcilePlan]) -> None:
 
 
 def has_submitable_reconciliation(plans: list[ReconcilePlan]) -> bool:
+    """Return whether any unblocked plan changes size or otherwise requires reconciliation."""
     return any(
         not plan.block_reason
         and (
@@ -1829,6 +1942,7 @@ def has_submitable_reconciliation(plans: list[ReconcilePlan]) -> bool:
 
 
 def _cancel_protection_orders(exchange: Any, coin: str, order_ids: tuple[int, ...]) -> None:
+    """Cancel each specified protection order and raise if the exchange rejects a cancellation."""
     for oid in order_ids:
         response = exchange.cancel(coin, oid)
         if not isinstance(response, dict) or response.get("status") != "ok":
@@ -1836,6 +1950,7 @@ def _cancel_protection_orders(exchange: Any, coin: str, order_ids: tuple[int, ..
 
 
 def _current_position_details(wallet: str, dex: str, coin: str) -> tuple[float, float]:
+    """Return the current signed position quantity and entry price for one market."""
     state = fetch_user_state(wallet, dex)
     for item in state["assetPositions"]:
         position = item.get("position", {})
@@ -1854,6 +1969,7 @@ def _submit_protection_order(
     price: float,
     order_kind: str,
 ) -> int:
+    """Place one reduce-only stop or post-only target and return its resting order ID."""
     direction = side_to_direction(side)
     close_is_buy = direction < 0
     if order_kind == "stop":
@@ -1887,6 +2003,7 @@ def run_protection_ladder_replacement(
     dexes: list[str],
     plans: list[ProtectionLadderPlan],
 ) -> None:
+    """Replace reviewed protections with verified ladders, retaining old orders until new placement succeeds."""
     if not plans:
         print("No open positions were found; no protection orders were changed.")
         return
@@ -2006,6 +2123,7 @@ def run_position_reconciliation(
     plans: list[ReconcilePlan],
     markets: dict[str, Market],
 ) -> None:
+    """Apply approved position-size changes, then restore reduce-only protections."""
     exchange = build_exchange(wallet, private_key, dexes)
     failures: list[str] = []
     for plan in plans:
@@ -2137,6 +2255,7 @@ def run_position_reconciliation(
 
 
 def run_live(wallet: str, private_key: str, dexes: list[str], plans: list[PlannedTrade], markets: dict[str, Market]) -> None:
+    """Execute planned entries, place protective exits, and monitor resulting trades."""
     exchange = build_exchange(wallet, private_key, dexes)
     active: list[ActiveTrade] = []
     failures: list[str] = []
@@ -2195,6 +2314,7 @@ def run_live(wallet: str, private_key: str, dexes: list[str], plans: list[Planne
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse command-line options and run the selected planning or execution workflow."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wallet", required=True, help="Main wallet address linked to the API wallet key.")
     parser.add_argument("--risk-wallets", help="Comma-separated public addresses included in aggregate risk.")
