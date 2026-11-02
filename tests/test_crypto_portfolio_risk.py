@@ -23,6 +23,16 @@ class PortfolioRiskMetricTests(unittest.TestCase):
             metrics["Arithmetic Return (annualized)"],
             returns.mean() * 365,
         )
+        self.assertAlmostEqual(
+            metrics["Sharpe (raw, 252d)"],
+            returns.mean() / returns.std(ddof=1) * np.sqrt(252),
+        )
+        self.assertAlmostEqual(
+            metrics["Sharpe (excess, 252d)"],
+            (returns.mean() - risk_free_daily)
+            / returns.std(ddof=1)
+            * np.sqrt(252),
+        )
         self.assertEqual(metrics["Daily Return Observations"], 5)
 
     def test_empirical_var_and_normal_var_are_distinguished(self):
@@ -35,6 +45,11 @@ class PortfolioRiskMetricTests(unittest.TestCase):
         self.assertAlmostEqual(
             metrics["Normal VaR 99%"],
             max(0, -(returns.mean() - 2.326347874 * returns.std(ddof=1))),
+            places=8,
+        )
+        self.assertAlmostEqual(
+            metrics["Normal VaR 99% (zero mean)"],
+            2.326347874 * returns.std(ddof=1),
             places=8,
         )
         self.assertEqual(metrics["Historical VaR 99% Tail Observations"], 1)
