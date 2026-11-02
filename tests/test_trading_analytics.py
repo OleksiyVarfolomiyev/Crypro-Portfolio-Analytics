@@ -10,12 +10,15 @@ from hyperliquid_backtest import BacktestSettings, backtest_signal
 from hyperliquid_trade_analytics import (
     adverse_funding_cost_per_unit,
     add_expected_pnl_columns,
+    consolidate_current_funding,
     expected_position_pnl,
     expected_forward_return,
     fetch_daily_candles,
     fetch_funding_history,
+    post_info,
     rolling_funding_sums,
     side_to_direction,
+    summarize_current_funding,
     wilder_atr,
 )
 from hyperliquid_trade_execution import (
@@ -60,6 +63,87 @@ def make_funding(count=500, rate=0.00001):
 
 
 class TradeAnalyticsTests(unittest.TestCase):
+    def test_consolidated_current_funding_is_notional_weighted_and_side_aware(self):
+        rows = [
+            {"Coin": "BTC", "Side": "LONG", "Pos": 1000, "Sz": 10, "Funding (1h)": 0.01},
+            {"Coin": "BTC", "Side": "LONG", "Pos": 3000, "Sz": 30, "Funding (1h)": 0.02},
+            {"Coin": "BTC", "Side": "SHORT", "Pos": -2000, "Sz": -20, "Funding (1h)": 0.02},
+        ]
+        long_row, short_row = consolidate_current_funding(rows)
+        self.assertEqual((long_row["Coin"], long_row["Side"]), ("BTC", "LONG"))
+        self.assertAlmostEqual(long_row["Current Funding / 1h (%)"], 0.0175)
+        self.assertAlmostEqual(long_row["Funding APR (%)"], 153.3)
+        self.assertAlmostEqual(long_row["Estimated Funding PnL / hour ($)"], -0.7)
+        self.assertAlmostEqual(long_row["Estimated Funding PnL / day ($)"], -16.8)
+        self.assertEqual(long_row["Funding Coverage (%)"], 100)
+        self.assertEqual((short_row["Coin"], short_row["Side"]), ("BTC", "SHORT"))
+        self.assertAlmostEqual(short_row["Estimated Funding PnL / hour ($)"], 0.4)
+
+    def test_consolidated_current_funding_reports_rate_coverage(self):
+        rows = [
+            {"Coin": "ETH", "Side": "LONG", "Pos": 250, "Sz": 1, "Funding (1h)": -0.01},
+            {"Coin": "ETH", "Side": "LONG", "Pos": 750, "Sz": 3, "Funding (1h)": float("nan")},
+        ]
+        [result] = consolidate_current_funding(rows)
+        self.assertEqual(result["Funding Coverage (%)"], 25)
+        self.assertEqual(result["Estimated Funding PnL / hour ($)"], 0.025)
+
+    def test_account_funding_summary_reports_direction_and_net_carry(self):
+        rows = [
+            {"Coin": "BTC", "Side": "LONG", "Pos": 1000, "Funding (1h)": 0.01},
+            {"Coin": "ETH", "Side": "LONG", "Pos": 500, "Funding (1h)": -0.02},
+            {"Coin": "SOL", "Side": "SHORT", "Pos": -1200, "Funding (1h)": 0.03},
+        ]
+        summary = summarize_current_funding(rows)
+        self.assertEqual(summary["Net Direction"], "NET LONG")
+        self.assertEqual(summary["Long Positions"], 2)
+        self.assertEqual(summary["Short Positions"], 1)
+        self.assertEqual(summary["Long Notional ($)"], 1500)
+        self.assertEqual(summary["Short Notional ($)"], 1200)
+        self.assertEqual(summary["Net Notional ($)"], 300)
+        self.assertEqual(summary["Gross Notional ($)"], 2700)
+        self.assertAlmostEqual(summary["Estimated Net Funding PnL / hour ($)"], 0.36)
+        self.assertAlmostEqual(summary["Estimated Net Funding PnL / day ($)"], 8.64)
+        self.assertAlmostEqual(
+            summary["Net Funding Rate / 1h (%) (covered)"],
+            0.36 / 2700 * 100,
+        )
+        self.assertEqual(summary["Funding Coverage (%)"], 100)
+
+    def test_account_funding_summary_exposes_missing_rate_coverage(self):
+        summary = summarize_current_funding(
+            [
+                {"Coin": "BTC", "Side": "LONG", "Pos": 1000, "Funding (1h)": 0.01},
+                {"Coin": "ETH", "Side": "SHORT", "Pos": -1000, "Funding (1h)": float("nan")},
+            ]
+        )
+        self.assertEqual(summary["Net Direction"], "FLAT")
+        self.assertEqual(summary["Funding-Covered Notional ($)"], 1000)
+        self.assertEqual(summary["Funding Coverage (%)"], 50)
+
+    def test_info_request_retries_rate_limit_using_retry_after(self):
+        rate_limited = unittest.mock.Mock(
+            status_code=429,
+            ok=False,
+            headers={"Retry-After": "3"},
+        )
+        successful = unittest.mock.Mock(status_code=200, ok=True, json=lambda: {"ok": True})
+        with (
+            patch("hyperliquid_trade_analytics.requests.post", side_effect=[rate_limited, successful]),
+            patch("hyperliquid_trade_analytics.time.sleep") as sleep,
+        ):
+            self.assertEqual(post_info({"type": "meta"}), {"ok": True})
+        sleep.assert_called_once_with(3.0)
+
+    def test_info_request_reports_rate_limit_after_retry_limit(self):
+        rate_limited = unittest.mock.Mock(status_code=429, ok=False, headers={})
+        with (
+            patch("hyperliquid_trade_analytics.requests.post", return_value=rate_limited),
+            patch("hyperliquid_trade_analytics.time.sleep"),
+            self.assertRaisesRegex(RuntimeError, r"HTTP 429"),
+        ):
+            post_info({"type": "meta"})
+
     def test_side_direction_is_explicit(self):
         self.assertEqual(side_to_direction("long"), 1)
         self.assertEqual(side_to_direction("SHORT"), -1)

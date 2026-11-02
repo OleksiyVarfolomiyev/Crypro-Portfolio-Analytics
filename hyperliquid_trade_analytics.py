@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import math
+import time
 from typing import Any
 
 import numpy as np
@@ -10,18 +14,42 @@ import pandas as pd
 import requests
 
 INFO_URL = "https://api.hyperliquid.xyz/info"
+MAX_RATE_LIMIT_RETRIES = 4
 DEFAULT_HORIZON_DAYS = 5
 FUNDING_INTERVAL_HOURS = 1
 FUNDING_TIMESTAMP_TOLERANCE = pd.Timedelta(seconds=2)
 
 
+def _rate_limit_delay(response: requests.Response, retry_number: int) -> float:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            delay = float(retry_after)
+            if math.isfinite(delay):
+                return max(0.0, delay)
+        except ValueError:
+            try:
+                retry_time = parsedate_to_datetime(retry_after)
+                if retry_time.tzinfo is None:
+                    retry_time = retry_time.replace(tzinfo=timezone.utc)
+                return max(0.0, (retry_time - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return float(2 ** (retry_number - 1))
+
+
 def post_info(payload: dict[str, Any], timeout: float = 30) -> Any:
-    try:
-        response = requests.post(INFO_URL, json=payload, timeout=timeout)
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Hyperliquid info request failed ({type(exc).__name__}).") from exc
-    if not response.ok:
-        raise RuntimeError(f"Hyperliquid info request failed (HTTP {response.status_code}).")
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        try:
+            response = requests.post(INFO_URL, json=payload, timeout=timeout)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Hyperliquid info request failed ({type(exc).__name__}).") from exc
+        if response.status_code == 429 and attempt < MAX_RATE_LIMIT_RETRIES:
+            time.sleep(_rate_limit_delay(response, attempt + 1))
+            continue
+        if not response.ok:
+            raise RuntimeError(f"Hyperliquid info request failed (HTTP {response.status_code}).")
+        break
     try:
         return response.json()
     except ValueError as exc:
@@ -265,6 +293,136 @@ def side_to_direction(side: str) -> int:
     if normalized in {"SHORT", "SELL", "S"}:
         return -1
     raise ValueError(f"Unsupported position side: {side!r}. Use LONG or SHORT.")
+
+
+def consolidate_current_funding(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], dict[str, float | int]] = {}
+    for row in rows:
+        coin = str(row["Coin"])
+        side = str(row["Side"]).strip().upper()
+        direction = side_to_direction(side)
+        notional = abs(float(row["Pos"]))
+        size = abs(float(row["Sz"]))
+        if not np.isfinite(notional) or not np.isfinite(size):
+            raise ValueError(f"Invalid position size or notional for {coin} {side}.")
+
+        key = (coin, side)
+        group = grouped.setdefault(
+            key,
+            {
+                "Positions": 0,
+                "Size": 0.0,
+                "Position Value ($)": 0.0,
+                "Funding-Covered Value ($)": 0.0,
+                "Weighted Funding Rate": 0.0,
+                "Funding PnL / hour ($)": 0.0,
+            },
+        )
+        group["Positions"] += 1
+        group["Size"] += size
+        group["Position Value ($)"] += notional
+
+        try:
+            rate_pct = float(row["Funding (1h)"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not np.isfinite(rate_pct):
+            continue
+        group["Funding-Covered Value ($)"] += notional
+        group["Weighted Funding Rate"] += notional * rate_pct
+        group["Funding PnL / hour ($)"] += -direction * notional * rate_pct / 100.0
+
+    consolidated = []
+    for (coin, side), group in sorted(grouped.items()):
+        total_notional = float(group["Position Value ($)"])
+        covered_notional = float(group["Funding-Covered Value ($)"])
+        funding_rate_pct = (
+            float(group["Weighted Funding Rate"]) / covered_notional
+            if covered_notional > 0
+            else float("nan")
+        )
+        hourly_funding_pnl = float(group["Funding PnL / hour ($)"])
+        consolidated.append(
+            {
+                "Coin": coin,
+                "Side": side,
+                "Positions": int(group["Positions"]),
+                "Size": float(group["Size"]),
+                "Position Value ($)": total_notional,
+                "Current Funding / 1h (%)": funding_rate_pct,
+                "Funding APR (%)": funding_rate_pct * 24 * 365,
+                "Estimated Funding PnL / hour ($)": hourly_funding_pnl,
+                "Estimated Funding PnL / day ($)": hourly_funding_pnl * 24,
+                "Funding Coverage (%)": (
+                    covered_notional / total_notional * 100.0
+                    if total_notional > 0
+                    else float("nan")
+                ),
+            }
+        )
+    return consolidated
+
+
+def summarize_current_funding(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    long_notional = 0.0
+    short_notional = 0.0
+    long_positions = 0
+    short_positions = 0
+    funded_notional = 0.0
+    funding_pnl_per_hour = 0.0
+
+    for row in rows:
+        side = str(row["Side"]).strip().upper()
+        direction = side_to_direction(side)
+        notional = abs(float(row["Pos"]))
+        if not np.isfinite(notional):
+            raise ValueError(f"Invalid position notional for {row.get('Coin', 'unknown')} {side}.")
+
+        if direction > 0:
+            long_notional += notional
+            long_positions += 1
+        else:
+            short_notional += notional
+            short_positions += 1
+
+        try:
+            rate_pct = float(row["Funding (1h)"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not np.isfinite(rate_pct):
+            continue
+        funded_notional += notional
+        funding_pnl_per_hour += -direction * notional * rate_pct / 100.0
+
+    gross_notional = long_notional + short_notional
+    net_notional = long_notional - short_notional
+    net_funding_rate_pct = (
+        funding_pnl_per_hour / funded_notional * 100.0
+        if funded_notional > 0
+        else float("nan")
+    )
+    return {
+        "Net Direction": (
+            "NET LONG" if net_notional > 0.01 else "NET SHORT" if net_notional < -0.01 else "FLAT"
+        ),
+        "Long Positions": long_positions,
+        "Short Positions": short_positions,
+        "Long Notional ($)": long_notional,
+        "Short Notional ($)": short_notional,
+        "Gross Notional ($)": gross_notional,
+        "Net Notional ($)": net_notional,
+        "Net Exposure / Gross (%)": (
+            net_notional / gross_notional * 100.0 if gross_notional > 0 else float("nan")
+        ),
+        "Net Funding Rate / 1h (%) (covered)": net_funding_rate_pct,
+        "Net Funding APR (%) (simple, covered)": net_funding_rate_pct * 24 * 365,
+        "Estimated Net Funding PnL / hour ($)": funding_pnl_per_hour,
+        "Estimated Net Funding PnL / day ($)": funding_pnl_per_hour * 24,
+        "Funding-Covered Notional ($)": funded_notional,
+        "Funding Coverage (%)": (
+            funded_notional / gross_notional * 100.0 if gross_notional > 0 else float("nan")
+        ),
+    }
 
 
 @dataclass(frozen=True)
