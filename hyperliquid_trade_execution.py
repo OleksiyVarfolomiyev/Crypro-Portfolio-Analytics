@@ -40,6 +40,7 @@ MAX_TOTAL_RISK_PCT = 0.20
 STOP_ATR_MULTIPLE = 1.25
 REWARD_RISK_RATIO = 1.0
 FUNDING_STRESS_PERCENTILE = 0.95
+MIN_ORDER_VALUE_USD = 10.0
 ENTRY_TIMEOUT_SECONDS = 5 * 60
 CHASE_INTERVAL_SECONDS = 10
 MONITOR_INTERVAL_SECONDS = 15
@@ -125,6 +126,23 @@ class ProtectionPlan:
     non_reduce_only_stop_order_ids: tuple[int, ...] = ()
     stop_block_reason: str = ""
     target_block_reason: str = ""
+
+
+@dataclass(frozen=True)
+class LadderOrder:
+    quantity: float
+    price: float
+
+
+@dataclass(frozen=True)
+class ProtectionLadderPlan:
+    position: Position
+    side: str
+    atr: float
+    stop_steps: tuple[LadderOrder, ...]
+    target_steps: tuple[LadderOrder, ...]
+    existing_stop_order_ids: tuple[int, ...]
+    existing_target_order_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -498,6 +516,149 @@ def plan_position_protection(
         ),
         stop_block_reason=stop_block_reason,
         target_block_reason=target_block_reason,
+    )
+
+
+def plan_protection_ladder(
+    position: Position,
+    open_orders: list[dict[str, Any]],
+    candles: pd.DataFrame,
+    steps: int = 3,
+    atr_multiple: float = STOP_ATR_MULTIPLE,
+) -> ProtectionLadderPlan:
+    if not isinstance(steps, int) or steps <= 0:
+        raise ValueError("Protection-ladder steps must be a positive integer.")
+    if not np.isfinite(atr_multiple) or atr_multiple <= 0:
+        raise ValueError("Protection-ladder ATR multiple must be positive and finite.")
+    if not np.isfinite(position.quantity) or position.quantity == 0:
+        raise ValueError("A protection ladder requires a non-zero position.")
+    if not np.isfinite(position.mark_price) or position.mark_price <= 0:
+        raise ValueError("A protection ladder requires a positive finite mark price.")
+
+    atr = wilder_atr(candles, 14)
+    distance = atr * atr_multiple
+    direction = 1 if position.quantity > 0 else -1
+    stop_endpoint = position.mark_price - direction * distance
+    target_endpoint = position.mark_price + direction * distance
+    if stop_endpoint <= 0 or target_endpoint <= 0:
+        raise ValueError(f"ATR protection levels for {position.coin} are not positive prices.")
+
+    quantity_step = 10 ** -position.market.size_decimals
+    quantity_units = int(round(abs(position.quantity) / quantity_step))
+    if quantity_units <= 0 or not np.isclose(
+        quantity_units * quantity_step,
+        abs(position.quantity),
+        atol=quantity_step / 2,
+    ):
+        raise ValueError(f"Position quantity for {position.coin} does not align to its size precision.")
+
+    level_count = min(steps, quantity_units)
+    while level_count > 1:
+        fractions = [(index + 1) / level_count for index in range(level_count)]
+        stop_prices = [
+            _round_price(position.mark_price - direction * distance * fraction,
+                         position.market.size_decimals)
+            for fraction in fractions
+        ]
+        target_prices = [
+            _round_price(position.mark_price + direction * distance * fraction,
+                         position.market.size_decimals)
+            for fraction in fractions
+        ]
+        stop_is_ordered = all(
+            direction * (current - previous) < 0
+            for previous, current in zip(stop_prices, stop_prices[1:])
+        )
+        target_is_ordered = all(
+            direction * (current - previous) > 0
+            for previous, current in zip(target_prices, target_prices[1:])
+        )
+        stop_is_protective = all(
+            direction * (price - position.mark_price) < 0 for price in stop_prices
+        )
+        target_is_profitable = all(
+            direction * (price - position.mark_price) > 0 for price in target_prices
+        )
+        base_units, remainder = divmod(quantity_units, level_count)
+        candidate_quantities = [
+            (base_units + (index < remainder)) * quantity_step
+            for index in range(level_count)
+        ]
+        minimum_value_met = all(
+            quantity * price >= MIN_ORDER_VALUE_USD
+            for quantity, price in zip(candidate_quantities, stop_prices)
+        ) and all(
+            quantity * price >= MIN_ORDER_VALUE_USD
+            for quantity, price in zip(candidate_quantities, target_prices)
+        )
+        if (
+            stop_is_ordered
+            and target_is_ordered
+            and stop_is_protective
+            and target_is_profitable
+            and minimum_value_met
+        ):
+            break
+        level_count -= 1
+
+    fractions = [(index + 1) / level_count for index in range(level_count)]
+    stop_prices = tuple(
+        _round_price(position.mark_price - direction * distance * fraction,
+                     position.market.size_decimals)
+        for fraction in fractions
+    )
+    target_prices = tuple(
+        _round_price(position.mark_price + direction * distance * fraction,
+                     position.market.size_decimals)
+        for fraction in fractions
+    )
+    if any(direction * (price - position.mark_price) >= 0 for price in stop_prices):
+        raise ValueError(f"ATR stop levels for {position.coin} are not separated from mark by a price tick.")
+    if any(direction * (price - position.mark_price) <= 0 for price in target_prices):
+        raise ValueError(f"ATR target levels for {position.coin} are not separated from mark by a price tick.")
+    base_units, remainder = divmod(quantity_units, level_count)
+    quantities = tuple(
+        (base_units + (index < remainder)) * quantity_step
+        for index in range(level_count)
+    )
+    if any(
+        quantity * price < MIN_ORDER_VALUE_USD
+        for quantity, price in zip(quantities, stop_prices)
+    ) or any(
+        quantity * price < MIN_ORDER_VALUE_USD
+        for quantity, price in zip(quantities, target_prices)
+    ):
+        raise ValueError(
+            f"{position.coin}: position size is too small to place even one "
+            f"${MIN_ORDER_VALUE_USD:g}-minimum stop and target order."
+        )
+    stop_steps = tuple(
+        LadderOrder(quantity=quantity, price=price)
+        for quantity, price in zip(quantities, stop_prices)
+    )
+    target_steps = tuple(
+        LadderOrder(quantity=quantity, price=price)
+        for quantity, price in zip(quantities, target_prices)
+    )
+
+    old_stops, old_targets = _matching_protection_orders(position, open_orders)
+    def order_ids(orders: list[dict[str, Any]]) -> tuple[int, ...]:
+        identifiers = []
+        for order in orders:
+            oid = order.get("oid")
+            if oid is None:
+                raise ValueError(f"Existing protection order for {position.coin} has no order ID.")
+            identifiers.append(int(oid))
+        return tuple(identifiers)
+
+    return ProtectionLadderPlan(
+        position=position,
+        side="LONG" if direction > 0 else "SHORT",
+        atr=atr,
+        stop_steps=stop_steps,
+        target_steps=target_steps,
+        existing_stop_order_ids=order_ids(old_stops),
+        existing_target_order_ids=order_ids(old_targets),
     )
 
 
@@ -1718,6 +1879,124 @@ def _submit_protection_order(
     if oid is None or "filled" in status:
         raise RuntimeError(f"reduce-only {order_kind} order was not confirmed resting: {status!r}")
     return oid
+
+
+def run_protection_ladder_replacement(
+    wallet: str,
+    private_key: str,
+    dexes: list[str],
+    plans: list[ProtectionLadderPlan],
+) -> None:
+    if not plans:
+        print("No open positions were found; no protection orders were changed.")
+        return
+    wallet = wallet.lower()
+    if any(plan.position.wallet.lower() != wallet for plan in plans):
+        raise ValueError("Every protection-ladder plan must belong to the signing wallet.")
+
+    exchange = build_exchange(wallet, private_key, dexes)
+    for plan in plans:
+        position = plan.position
+        coin = position.coin
+        dex = position.dex
+        quantity_step = 10 ** -position.market.size_decimals
+        current_quantity, current_entry = _current_position_details(wallet, dex, coin)
+        if (
+            not np.isclose(
+                abs(current_quantity),
+                abs(position.quantity),
+                atol=quantity_step / 2,
+            )
+            or np.sign(current_quantity) != np.sign(position.quantity)
+            or not np.isclose(
+                current_entry,
+                position.entry_price,
+                atol=_price_tick(position.entry_price, position.market.size_decimals),
+            )
+        ):
+            raise RuntimeError(f"{coin}: position changed since ladder review; no orders were changed.")
+
+        live_orders = fetch_open_orders(wallet)
+        current_stops, current_targets = _matching_protection_orders(position, live_orders)
+        current_stop_ids = tuple(int(order["oid"]) for order in current_stops)
+        current_target_ids = tuple(int(order["oid"]) for order in current_targets)
+        if (
+            set(current_stop_ids) != set(plan.existing_stop_order_ids)
+            or set(current_target_ids) != set(plan.existing_target_order_ids)
+        ):
+            raise RuntimeError(f"{coin}: existing protection orders changed since review; no orders were changed.")
+
+        new_order_ids: list[int] = []
+        try:
+            for kind, steps in (
+                ("stop", plan.stop_steps),
+                ("take-profit", plan.target_steps),
+            ):
+                for step in steps:
+                    new_order_ids.append(
+                        _submit_protection_order(
+                            exchange,
+                            coin,
+                            plan.side,
+                            step.quantity,
+                            step.price,
+                            kind,
+                        )
+                    )
+                    time.sleep(0.25)
+            confirmed_orders = fetch_open_orders(wallet)
+            confirmed_ids = {int(order["oid"]) for order in confirmed_orders if order.get("oid") is not None}
+            if not set(new_order_ids).issubset(confirmed_ids):
+                raise RuntimeError(f"{coin}: one or more new ladder orders are not visible as open.")
+            refreshed_quantity, refreshed_entry = _current_position_details(wallet, dex, coin)
+            if (
+                not np.isclose(
+                    abs(refreshed_quantity),
+                    abs(position.quantity),
+                    atol=quantity_step / 2,
+                )
+                or np.sign(refreshed_quantity) != np.sign(position.quantity)
+                or not np.isclose(
+                    refreshed_entry,
+                    position.entry_price,
+                    atol=_price_tick(position.entry_price, position.market.size_decimals),
+                )
+            ):
+                raise RuntimeError(f"{coin}: position changed during ladder placement.")
+        except Exception as exc:
+            cleanup_errors: list[str] = []
+            for oid in reversed(new_order_ids):
+                try:
+                    response = exchange.cancel(coin, oid)
+                    if not isinstance(response, dict) or response.get("status") != "ok":
+                        cleanup_errors.append(f"{oid}: {response!r}")
+                    time.sleep(0.25)
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f"{oid}: {type(cleanup_exc).__name__}: {cleanup_exc}")
+            detail = (
+                f" New-order cleanup was incomplete: {'; '.join(cleanup_errors)}."
+                if cleanup_errors
+                else " Previously open protections were left in place."
+            )
+            raise RuntimeError(f"{coin}: ladder placement failed: {exc}.{detail}") from exc
+
+        old_order_ids = (*plan.existing_stop_order_ids, *plan.existing_target_order_ids)
+        _cancel_protection_orders(exchange, coin, old_order_ids)
+        final_orders = fetch_open_orders(wallet)
+        final_ids = {int(order["oid"]) for order in final_orders if order.get("oid") is not None}
+        missing_new = set(new_order_ids) - final_ids
+        lingering_old = set(old_order_ids) & final_ids
+        if missing_new or lingering_old:
+            raise RuntimeError(
+                f"{coin}: post-replacement verification failed "
+                f"(missing new IDs={sorted(missing_new)}, old IDs still open={sorted(lingering_old)})."
+            )
+        print(
+            f"{coin}: replaced {len(old_order_ids)} existing protection orders with "
+            f"{len(plan.stop_steps)} trigger-market stops and "
+            f"{len(plan.target_steps)} post-only take-profits; "
+            f"new order IDs: {', '.join(map(str, new_order_ids))}."
+        )
 
 
 def run_position_reconciliation(

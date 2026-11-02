@@ -26,6 +26,7 @@ from hyperliquid_trade_execution import (
     Market,
     Position,
     plan_position_protection,
+    plan_protection_ladder,
     plan_position_actions,
     fetch_markets,
     post_only_price,
@@ -278,6 +279,115 @@ class TradeAnalyticsTests(unittest.TestCase):
         order_type = exchange.args[4]
         self.assertEqual(order_type["trigger"]["triggerPx"], 95.0)
         self.assertIsInstance(order_type["trigger"]["triggerPx"], float)
+
+    def test_take_profit_protection_order_is_post_only_and_reduce_only(self):
+        class FakeExchange:
+            def order(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+                return {"response": {"data": {"statuses": [{"resting": {"oid": 124}}]}}}
+
+        exchange = FakeExchange()
+        oid = _submit_protection_order(
+            exchange,
+            "BTC",
+            "SHORT",
+            1.0,
+            90.0,
+            "take-profit",
+        )
+
+        self.assertEqual(oid, 124)
+        self.assertTrue(exchange.args[1])
+        self.assertEqual(exchange.args[4], {"limit": {"tif": "Alo"}})
+        self.assertTrue(exchange.kwargs["reduce_only"])
+
+    def test_protection_ladder_splits_size_and_ends_at_mark_anchored_atr_levels(self):
+        market = Market("BTC", "", 100.0, 100.0, 2, 10)
+        position = Position(
+            wallet="0x" + "1" * 40,
+            coin="BTC",
+            dex="",
+            quantity=-9.0,
+            entry_price=110.0,
+            mark_price=100.0,
+            oracle_price=100.0,
+            margin_used=50.0,
+            market=market,
+            leverage=3,
+        )
+        open_orders = [
+            {
+                "coin": "BTC",
+                "side": "B",
+                "orderType": "Stop Limit",
+                "triggerPx": "130",
+                "reduceOnly": False,
+                "oid": 101,
+            },
+            {
+                "coin": "BTC",
+                "side": "B",
+                "orderType": "Limit",
+                "limitPx": "80",
+                "reduceOnly": True,
+                "oid": 102,
+            },
+        ]
+
+        plan = plan_protection_ladder(position, open_orders, make_candles(30))
+
+        self.assertEqual(plan.side, "SHORT")
+        self.assertEqual(plan.existing_stop_order_ids, (101,))
+        self.assertEqual(plan.existing_target_order_ids, (102,))
+        self.assertEqual(len(plan.stop_steps), 3)
+        self.assertEqual(len(plan.target_steps), 3)
+        self.assertAlmostEqual(sum(step.quantity for step in plan.stop_steps), 9.0)
+        self.assertAlmostEqual(sum(step.quantity for step in plan.target_steps), 9.0)
+        self.assertEqual(
+            [step.quantity for step in plan.stop_steps],
+            [step.quantity for step in plan.target_steps],
+        )
+        self.assertGreater(plan.stop_steps[0].price, position.mark_price)
+        self.assertGreater(plan.stop_steps[-1].price, plan.stop_steps[0].price)
+        self.assertLess(plan.target_steps[0].price, position.mark_price)
+        self.assertLess(plan.target_steps[-1].price, plan.target_steps[0].price)
+        self.assertEqual(
+            plan.stop_steps[-1].price,
+            _round_price(position.mark_price + plan.atr * 1.25, market.size_decimals),
+        )
+        self.assertEqual(
+            plan.target_steps[-1].price,
+            _round_price(position.mark_price - plan.atr * 1.25, market.size_decimals),
+        )
+
+    def test_protection_ladder_reduces_steps_to_meet_exchange_minimum_order_value(self):
+        scale = 0.03
+        candles = make_candles(30)
+        for column in ("open", "high", "low", "close"):
+            candles[column] *= scale
+        market = Market("LIT", "", 3.12, 3.12, 0, 10)
+        position = Position(
+            wallet="0x" + "1" * 40,
+            coin="LIT",
+            dex="",
+            quantity=-9.0,
+            entry_price=3.25,
+            mark_price=3.12,
+            oracle_price=3.12,
+            margin_used=10.0,
+            market=market,
+            leverage=3,
+        )
+
+        plan = plan_protection_ladder(position, [], candles)
+
+        self.assertEqual(len(plan.stop_steps), 2)
+        self.assertEqual(len(plan.target_steps), 2)
+        self.assertAlmostEqual(sum(step.quantity for step in plan.stop_steps), 9.0)
+        self.assertAlmostEqual(sum(step.quantity for step in plan.target_steps), 9.0)
+        self.assertTrue(all(step.quantity * step.price >= 10.0 for step in plan.stop_steps))
+        self.assertTrue(all(step.quantity * step.price >= 10.0 for step in plan.target_steps))
 
     def test_fetch_markets_does_not_duplicate_dex_prefix(self):
         response = [
