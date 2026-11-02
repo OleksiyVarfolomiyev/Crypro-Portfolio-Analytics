@@ -12,9 +12,15 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 from hyperliquid_trade_analytics import (
+    MAX_RATE_LIMIT_RETRIES,
+    _rate_limit_delay,
     add_expected_pnl_columns,
     apply_fill_fees,
+    drop_inactive_weeks,
     drop_refreshed_daily_rows,
+    inactive_periods,
+    time_weighted_index,
+    visible_month_starts,
 )
 from IPython.display import HTML, display
 from plotly.subplots import make_subplots
@@ -118,18 +124,24 @@ undefined, {{numeric:true, sensitivity:'base'}});
 
 
 def post(payload):
-    """Send one request to Hyperliquid's public info endpoint."""
-    for attempt in range(3):
+    """Send one request to Hyperliquid's public info endpoint, retrying rate limits."""
+    transport_failures = 0
+    rate_limit_retries = 0
+    while True:
         try:
             response = requests.post(API, json=payload, timeout=30)
-            break
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-            if attempt == 2:
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            transport_failures += 1
+            if transport_failures == 3:
                 raise
-            delay = 2 ** attempt
-            sleep(delay)
-    response.raise_for_status()
-    return response.json()
+            sleep(2 ** (transport_failures - 1))
+            continue
+        if response.status_code == 429 and rate_limit_retries < MAX_RATE_LIMIT_RETRIES:
+            rate_limit_retries += 1
+            sleep(_rate_limit_delay(response, rate_limit_retries))
+            continue
+        response.raise_for_status()
+        return response.json()
 
 
 def as_float(value, default=0.0):
@@ -222,6 +234,21 @@ def fetch_all_time_history(user):
     if not history:
         raise ValueError('No allTime account value history was returned.')
     return history
+
+
+def fetch_portfolio_history(user):
+    """Fetch the account's all-time value and cumulative PnL history."""
+    portfolio = post({'type': 'portfolio', 'user': user})
+    periods = {item[0]: item[1] for item in portfolio if isinstance(item, (list,
+                tuple)) and len(item) == 2 and isinstance(item[1], dict)}
+    all_time = periods.get('allTime', {})
+    values = pd.DataFrame(all_time.get('accountValueHistory', []), columns=['time', 'accountValue'])
+    pnl = pd.DataFrame(all_time.get('pnlHistory', []), columns=['time', 'pnl'])
+    history = values.merge(pnl, on='time').astype({'accountValue': float, 'pnl': float})
+    history['ts'] = pd.to_datetime(history['time'], unit='ms', utc=True).dt.tz_convert(
+        ACCOUNTING_TIMEZONE
+    )
+    return history[['ts', 'accountValue', 'pnl']]
 
 
 def fetch_perp_states(user):
@@ -687,10 +714,33 @@ class _AccountPnLMixin:
 # `_AccountChartsMixin.show_account_charts()`.
 
 
+def clip_inactive_periods(fig, periods, axis_selector=None):
+    """Collapse inactive periods on a figure's date axes and label each one."""
+    if not periods:
+        return
+    times = pd.concat([
+        pd.to_datetime(pd.Series(trace.x), utc=True, errors='coerce')
+        for trace in fig.data if trace.type == 'scatter' and trace.x is not None
+    ]).dropna().dt.tz_localize(None)
+    fig.update_xaxes(
+        rangebreaks=[{'bounds': [start, end]} for start, end in periods],
+        tickmode='array', tickformat='%b %Y',
+        tickvals=visible_month_starts(times.min(), times.max(), periods),
+        **(axis_selector or {}),
+    )
+    for start, end in periods:
+        fig.add_annotation(
+            x=end, xref='x', y=1, yref='y domain', yanchor='bottom', xanchor='left', showarrow=False,
+            text=f'Inactive {start:%b %Y} to {end:%b %Y} ({(end-start).days} days hidden)',
+            font={'size': 11, 'color': '#52514e'},
+        )
+
+
 def plot_account_dashboard(metrics):
     'Show account history and PnL distribution in ' \
         'linked Plotly subplots.'
-    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+    # Only the three time panels share an axis; the histogram's x-axis is a return.
+    fig = make_subplots(rows=4, cols=1, vertical_spacing=0.08,
         subplot_titles=('Account Value', 'Daily Realized and Unrealized PnL', 'Cumulative PnL',
             'Weekly Return Distribution'), row_heights=[0.28, 0.28, 0.24, 0.2])
     if not metrics.daily_account.empty:
@@ -707,7 +757,13 @@ def plot_account_dashboard(metrics):
         fig.add_trace(go.Scatter(x=metrics.cumulative_pnl.index,
                 y=metrics.cumulative_pnl.values, name='Cumulative PnL', line={'color': '#8e44ad',
                     'width': 2}), row=3, col=1)
-    returns = metrics.weekly_return_pct
+    periods = inactive_periods(pd.Index(metrics.day_index)[
+        np.asarray(metrics.daily_realized.values) != 0
+    ]) if not metrics.daily_realized.empty else []
+    returns = drop_inactive_weeks(metrics.weekly_return_pct, periods)
+    if len(returns) < len(metrics.weekly_return_pct):
+        print(f'Weekly return chart omits {len(metrics.weekly_return_pct) - len(returns)} '
+              'inactive weeks; statistics still include them.')
     if not returns.empty:
         display_returns = returns[returns >= -100]
         excluded = len(returns) - len(display_returns)
@@ -734,6 +790,9 @@ def plot_account_dashboard(metrics):
     fig.update_yaxes(title_text='USD', row=3, col=1)
     fig.update_yaxes(title_text='Weeks', row=4, col=1)
     fig.update_xaxes(title_text='Weekly return (%)', row=4, col=1)
+    fig.update_xaxes(matches='x3', showticklabels=False, row=1, col=1)
+    fig.update_xaxes(matches='x3', showticklabels=False, row=2, col=1)
+    clip_inactive_periods(fig, periods, {'selector': lambda axis: axis.anchor != 'y4'})
     fig.update_layout(height=1000, template='plotly_white', barmode='overlay',
         hovermode='x unified', showlegend=False, margin={'l': 65, 'r': 25, 't': 95, 'b': 50})
     fig.show()
@@ -748,20 +807,24 @@ class _AccountChartsMixin:
 # ----------------------------------------------------------------------------
 # Account vs BTC
 # ----------------------------------------------------------------------------
-# Intraday and lifetime account-vs-BTC index charts.
+# Time-weighted account-vs-BTC index chart.
 #
 # Dashboard call: `analytics.show_account_vs_btc()`. Implementation method:
 # `_AccountVsBTCMixin.show_account_vs_btc()`.
 
 
-def plot_value_added_indexes(metrics, chart_df, current_account_value):
-    'Plot account-vs-BTC daily and monthly ' \
-        'realized-PnL lifetime indexes.'
+def plot_value_added_index(metrics, chart_df, account_index):
+    """Plot the time-weighted account index against BTC."""
     btc_daily = metrics.btc_df
-    account_points = chart_df.loc[
-        chart_df['source'].isin(['portfolio_allTime','live_snapshot']),
-        ['ts','accountValue'],
-    ].dropna().copy()
+    account_points = pd.DataFrame({'ts': account_index.index, 'accountValue': account_index.values})
+    realized_rows = chart_df.loc[
+        chart_df['source'].isin(['perp_realized_daily','spot_realized_daily','funding_daily'])
+        & (chart_df['realized_pnl'].fillna(0) != 0),
+        'ts',
+    ]
+    periods = inactive_periods(
+        pd.to_datetime(realized_rows,utc=True).dt.tz_convert(ACCOUNTING_TIMEZONE)
+    )
     if not account_points.empty and not btc_daily.empty:
         account_points = account_points.rename(columns={'ts':'time','accountValue':'Account'})
         account_points['time'] = pd.to_datetime(account_points['time'],utc=True).dt.tz_convert(
@@ -789,78 +852,24 @@ def plot_value_added_indexes(metrics, chart_df, current_account_value):
             fig.add_trace(go.Scatter(x=index.index, y=index['BTC'], name='BTC (daily)',
                     mode='lines+markers', line={'color': '#e76f51'}))
             fig.add_hline(y=100, line_dash='dash', line_color='#777')
-            fig.update_layout(title='Value Added Index ($100 start): Account vs BTC',
+            fig.update_layout(title='Value Added Index ($100 start): Account (time-weighted) vs BTC',
                 yaxis_title='Value of $100', template='plotly_white', height=480,
                     hovermode='x unified')
+            clip_inactive_periods(fig, periods)
             fig.show()
+            print('The account line is a time-weighted return: deposits, withdrawals, and '
+                  'transfers do not move it. BTC is shown on the same dates.')
         else:
             print('Value Added Index unavailable: no matching daily account and BTC values.')
     else:
         print('Value Added Index unavailable: need daily account history and BTC candles.')
-    perp_pnl = chart_df.loc[chart_df['source'] == 'perp_realized_daily', ['ts',
-            'realized_pnl']].dropna()
-    spot_pnl = chart_df.loc[chart_df['source'] == 'spot_realized_daily', ['ts',
-            'realized_pnl']].dropna()
-    funding_pnl = chart_df.loc[chart_df['source'] == 'funding_daily', ['ts',
-            'realized_pnl']].dropna()
-    realized = pd.concat([perp_pnl, spot_pnl, funding_pnl], ignore_index=True)
-    if realized.empty or current_account_value <= 0 or btc_daily.empty:
-        print('Lifetime index unavailable: need saved ' \
-            'realized PnL, positive account value, and BTC' \
-            ' daily candles.')
-        return
-    realized['day'] = pd.to_datetime(realized['ts']).dt.normalize()
-    daily_pnl = realized.groupby('day')['realized_pnl'].sum().sort_index()
-    days = pd.date_range(daily_pnl.index.min(),
-        pd.Timestamp.now(tz=ACCOUNTING_TIMEZONE).normalize(), freq='1D')
-    cumulative = daily_pnl.reindex(days, fill_value=0.0).cumsum()
-    reconstructed = current_account_value - (cumulative.iloc[-1] - cumulative)
-    monthly = reconstructed.resample('ME').last().dropna()
-    monthly = monthly[monthly > 0]
-    if monthly.empty:
-        print('Lifetime index unavailable: reconstructed ' \
-            'historical account values are not positive.')
-        return
-    account_monthly = monthly.rename('Account (realized PnL)').rename_axis('time').reset_index()
-    account_monthly['time'] = pd.to_datetime(account_monthly['time'])
-    btc_monthly = pd.DataFrame({'time': pd.to_datetime(btc_daily['T'], unit='ms',
-                utc=True).dt.tz_convert(ACCOUNTING_TIMEZONE),
-            'BTC': btc_daily['c'].astype(float)}).dropna().sort_values('time'). \
-                drop_duplicates('time',
-        keep='last')
-    merge_time_dtype = pd.DatetimeTZDtype(unit='ns', tz=ACCOUNTING_TIMEZONE)
-    account_monthly['time'] = account_monthly['time'].astype(merge_time_dtype)
-    btc_monthly['time'] = btc_monthly['time'].astype(merge_time_dtype)
-    matched = pd.merge_asof(account_monthly.sort_values('time'), btc_monthly, on='time',
-        direction='backward')
-    matched = matched.dropna(subset=['BTC'])
-    matched = matched[(matched['Account (realized PnL)'] > 0) & (matched['BTC'] > 0)]
-    if matched.empty:
-        print('Lifetime index unavailable: no overlapping ' \
-            'reconstructed account values and BTC candles.')
-        return
-    index = matched.set_index('time')[['Account (realized PnL)', 'BTC']]
-    index = index.div(index.iloc[0]).mul(100)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=index.index, y=index['Account (realized PnL)'],
-            name='Account (realized PnL, monthly)', line={'color': '#457b9d'}))
-    fig.add_trace(go.Scatter(x=index.index, y=index['BTC'], name='BTC (monthly points)',
-            line={'color': '#e76f51'}))
-    fig.add_hline(y=100, line_dash='dash', line_color='#777')
-    fig.update_layout(title='Lifetime Value Added Index ($100 start): Realized PnL vs BTC',
-        yaxis_title='Value of $100', template='plotly_white', height=480, hovermode='x unified')
-    fig.show()
-    print('Lifetime account series is anchored to ' \
-        'current account value; it includes fee-net ' \
-        'realized trades and perp funding, but ' \
-        'excludes historical cash flows and unrealized' \
-        ' PnL.')
 
 
 class _AccountVsBTCMixin:
     def show_account_vs_btc(self):
         data = self._require_data()
-        plot_value_added_indexes(self.account_metrics, data.chart_df, data.current_account_value)
+        account_index = time_weighted_index([fetch_portfolio_history(self.wallet_address)])
+        plot_value_added_index(self.account_metrics, data.chart_df, account_index)
 
 
 # ----------------------------------------------------------------------------

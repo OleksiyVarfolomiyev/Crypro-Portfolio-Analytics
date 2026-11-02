@@ -16,15 +16,17 @@ from hyperliquid_account_analytics_implementation import (
     HISTORY_COLUMNS,
     HyperliquidAnalytics,
     breakdown_style,
+    clip_inactive_periods,
     build_daily_volume_pnl,
     build_pnl_attribution,
     calculate_account_metrics,
     display_interactive_table,
+    fetch_portfolio_history,
     fetch_user_funding,
     liquidation_stats,
     perp_pnl_breakdown,
     plot_account_dashboard,
-    plot_value_added_indexes,
+    plot_value_added_index,
     plot_volume_pnl,
     print_account_metrics,
     print_realized_stats,
@@ -48,6 +50,8 @@ from hyperliquid_trade_analytics import (
     fetch_collateral_equity,
     fetch_daily_candles,
     fetch_funding_history,
+    inactive_periods,
+    time_weighted_index,
     net_funding_apr_history,
     summarize_current_funding,
     true_range,
@@ -565,7 +569,10 @@ class _MultiWalletAccountMixin:
 
     def show_account_vs_btc(self):
         data=self._require_data()
-        plot_value_added_indexes(self.account_metrics,data.chart_display_df,data.current_account_value)
+        account_index=time_weighted_index([
+            fetch_portfolio_history(wallet) for wallet in self.wallet_addresses
+        ])
+        plot_value_added_index(self.account_metrics,data.chart_display_df,account_index)
 
 
 # ----------------------------------------------------------------------------
@@ -587,13 +594,7 @@ class _MultiWalletPositionsMixin:
         if history.empty:
             print('No funding history is available for the configured wallets.')
             return None
-        # Long flat stretches are collapsed so active periods stay readable.
-        dates=history.index.to_series()
-        gaps=[
-            (previous+pd.Timedelta(days=1),current)
-            for previous,current in zip(dates.iloc[:-1],dates.iloc[1:])
-            if current-previous>pd.Timedelta(days=30)
-        ]
+        periods=inactive_periods(history.index)
         filled=history.reindex(pd.date_range(history.index.min(),history.index.max(),freq='D'))
         fig=go.Figure()
         fig.add_trace(go.Scatter(
@@ -607,23 +608,15 @@ class _MultiWalletPositionsMixin:
             hovertemplate='7-day %{y:.2f}%<extra></extra>',
         ))
         fig.add_hline(y=0,line_color='#52514e',line_width=1)
-        for start,end in gaps:
-            fig.add_annotation(
-                x=end,y=1,yref='paper',yanchor='top',xanchor='right',showarrow=False,
-                text=f'No funding {start:%b %Y} to {end:%b %Y}<br>({(end-start).days} days hidden)',
-                font={'size':11,'color':'#52514e'},align='right',
-            )
         fig.update_layout(
             title='Net Funding APR (%) (simple, covered) over time, all wallets',
             template='plotly_white',height=480,hovermode='x unified',
             yaxis_title='Net funding APR (positive = received)',yaxis_ticksuffix='%',
-            legend={'orientation':'h','y':1.02,'yanchor':'bottom','x':1,'xanchor':'right'},
+            legend={'orientation':'h','y':1.02,'yanchor':'bottom','x':0,'xanchor':'left'},
             margin={'t':90},
         )
-        fig.update_xaxes(
-            rangebreaks=[{'bounds':[start,end]} for start,end in gaps],
-            showgrid=False,dtick='M1',tickformat='%b %Y',
-        )
+        fig.update_xaxes(showgrid=False)
+        clip_inactive_periods(fig,periods)
         fig.update_yaxes(gridcolor='#ecebe6',zeroline=False)
         latest=history.iloc[-1]
         print(f"Latest 7-day net funding APR: {latest['rolling_apr_pct']:.2f}% "

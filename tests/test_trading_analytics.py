@@ -15,17 +15,21 @@ from hyperliquid_trade_analytics import (
     add_expected_pnl_columns,
     apply_fill_fees,
     consolidate_current_funding,
+    drop_inactive_weeks,
     drop_refreshed_daily_rows,
     expected_position_pnl,
     expected_forward_return,
     fetch_collateral_equity,
     fetch_daily_candles,
     fetch_funding_history,
+    inactive_periods,
     net_funding_apr_history,
     post_info,
     rolling_funding_sums,
     side_to_direction,
     summarize_current_funding,
+    time_weighted_index,
+    visible_month_starts,
     wilder_atr,
 )
 from hyperliquid_trade_execution import (
@@ -114,6 +118,18 @@ class RealizedPnlTests(unittest.TestCase):
             ]
         )
 
+    def test_post_retries_rate_limits_then_returns_data(self):
+        limited = MagicMock(status_code=429, headers={"Retry-After": "0"})
+        success = MagicMock(status_code=200)
+        success.json.return_value = {"ok": True}
+        with (
+            patch.object(self.account.requests, "post", side_effect=[limited, success]) as post,
+            patch.object(self.account, "sleep") as sleep,
+        ):
+            self.assertEqual(self.account.post({"type": "meta"}), {"ok": True})
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once_with(0.0)
+
     def test_realized_pnl_subtracts_fees_on_opening_and_closing_fills(self):
         stats = self.account.realized_pnl_stats(self.fills())
         self.assertAlmostEqual(stats["total"], 7.2 - 2.2)
@@ -152,6 +168,78 @@ class RealizedPnlTests(unittest.TestCase):
         kept = drop_refreshed_daily_rows(saved, ["funding_daily"], days)
         self.assertEqual(kept["realized_pnl"].tolist(), [1.0, 2.0])
         self.assertTrue(drop_refreshed_daily_rows(saved, ["funding_daily"], days.iloc[0:0]).equals(saved))
+
+
+class TimeWeightedIndexTests(unittest.TestCase):
+    @staticmethod
+    def history(values, pnl):
+        times = pd.date_range("2026-01-01", periods=len(values), freq="D", tz="America/New_York")
+        return pd.DataFrame({"ts": times, "accountValue": values, "pnl": pnl})
+
+    def test_deposit_does_not_count_as_return(self):
+        index = time_weighted_index([self.history([0, 100, 110, 1110, 1221], [0, 0, 10, 10, 121])])
+        self.assertEqual(len(index), 5)
+        self.assertAlmostEqual(index.iloc[2], 1.10)
+        self.assertAlmostEqual(index.iloc[3], 1.10)
+        self.assertAlmostEqual(index.iloc[4], 1.21)
+
+    def test_withdrawal_does_not_count_as_loss(self):
+        index = time_weighted_index([self.history([100, 110, 60], [0, 10, 10])])
+        self.assertAlmostEqual(index.iloc[-1], 1.10)
+
+    def test_pnl_in_a_deposit_interval_uses_the_larger_balance(self):
+        index = time_weighted_index([self.history([100, 1110], [0, 10])])
+        self.assertAlmostEqual(index.iloc[-1], 1 + 10 / 1100)
+
+    def test_transfer_between_wallets_cancels(self):
+        one = self.history([100, 50, 55], [0, 0, 5])
+        two = self.history([100, 150, 150], [0, 0, 0])
+        self.assertAlmostEqual(time_weighted_index([one, two]).iloc[-1], 1 + 5 / 200)
+
+    def test_wallets_with_different_timestamps_are_aligned(self):
+        one = self.history([100, 110], [0, 10])
+        two = self.history([200, 200], [0, 0])
+        two["ts"] = two["ts"] + pd.Timedelta(hours=6)
+        self.assertAlmostEqual(time_weighted_index([one, two]).iloc[-1], 1 + 10 / 300)
+
+    def test_no_funded_history_returns_empty(self):
+        self.assertTrue(time_weighted_index([]).empty)
+        self.assertTrue(time_weighted_index([self.history([0, 0], [0, 0])]).empty)
+
+
+class InactivePeriodTests(unittest.TestCase):
+    def test_inactive_periods_finds_only_gaps_over_threshold(self):
+        days = pd.to_datetime(["2026-01-01", "2026-01-31", "2026-03-03", "2026-03-04"])
+        self.assertEqual(
+            inactive_periods(days),
+            [(pd.Timestamp("2026-02-01"), pd.Timestamp("2026-03-03"))],
+        )
+
+    def test_inactive_periods_handles_timezones_duplicates_and_no_data(self):
+        days = pd.DatetimeIndex(
+            ["2026-06-01 09:00", "2026-01-01 09:00", "2026-01-01 15:00"], tz="America/New_York"
+        )
+        self.assertEqual(
+            inactive_periods(days),
+            [(pd.Timestamp("2026-01-02"), pd.Timestamp("2026-06-01"))],
+        )
+        self.assertEqual(inactive_periods(pd.DatetimeIndex([])), [])
+
+    def test_visible_month_starts_skips_hidden_months_and_stays_in_range(self):
+        periods = [(pd.Timestamp("2025-08-26"), pd.Timestamp("2026-09-26"))]
+        months = visible_month_starts(pd.Timestamp("2025-07-15"), pd.Timestamp("2026-11-02"), periods)
+        self.assertEqual(
+            [month.strftime("%Y-%m") for month in months],
+            ["2025-08", "2026-10", "2026-11"],
+        )
+
+    def test_drop_inactive_weeks_keeps_weeks_touching_active_days(self):
+        weeks = pd.date_range("2026-01-05", periods=5, freq="7D")
+        returns = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0], index=weeks)
+        periods = [(pd.Timestamp("2026-01-12"), pd.Timestamp("2026-01-30"))]
+        kept = drop_inactive_weeks(returns, periods)
+        self.assertEqual(kept.tolist(), [1.0, 4.0, 5.0])
+        self.assertTrue(drop_inactive_weeks(returns, []).equals(returns))
 
 
 class TradeAnalyticsTests(unittest.TestCase):

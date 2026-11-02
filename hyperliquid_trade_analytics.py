@@ -475,6 +475,82 @@ def drop_refreshed_daily_rows(saved: pd.DataFrame, sources: list[str], days: pd.
     return saved.loc[~(saved["source"].isin(sources) & covered)].copy()
 
 
+def inactive_periods(
+    active_days: Any, min_gap_days: int = 30
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Return ``(start, end)`` day ranges with no activity for more than ``min_gap_days``.
+
+    ``start`` is the day after one active day and ``end`` is the next active day,
+    which is the half-open form a Plotly range break expects.
+    """
+    days = pd.DatetimeIndex(active_days)
+    if days.tz is not None:
+        days = days.tz_localize(None)
+    days = days.normalize().unique().sort_values()
+    return [
+        (previous + pd.Timedelta(days=1), current)
+        for previous, current in zip(days[:-1], days[1:])
+        if current - previous > pd.Timedelta(days=min_gap_days)
+    ]
+
+
+def visible_month_starts(
+    first: pd.Timestamp, last: pd.Timestamp, periods: list[tuple[pd.Timestamp, pd.Timestamp]]
+) -> list[pd.Timestamp]:
+    """Return month starts from ``first`` to ``last`` that are not in a hidden period."""
+    months = pd.date_range(first.normalize().replace(day=1), last, freq="MS")
+    return [
+        month for month in months
+        if month >= first and not any(start <= month < end for start, end in periods)
+    ]
+
+
+def drop_inactive_weeks(
+    weekly_returns: pd.Series, periods: list[tuple[pd.Timestamp, pd.Timestamp]]
+) -> pd.Series:
+    """Drop weekly returns, indexed by week start, that fall wholly inside a period."""
+    if not periods or weekly_returns.empty:
+        return weekly_returns
+    weeks = pd.DatetimeIndex(weekly_returns.index)
+    if weeks.tz is not None:
+        weeks = weeks.tz_localize(None)
+    inactive = np.zeros(len(weeks), dtype=bool)
+    for start, end in periods:
+        inactive |= (weeks >= start) & (weeks + pd.Timedelta(days=7) <= end)
+    return weekly_returns[~inactive]
+
+
+def time_weighted_index(histories: list[pd.DataFrame]) -> pd.Series:
+    """Build a growth-of-1 index that excludes deposits, withdrawals, and transfers.
+
+    Each history has ``ts``, ``accountValue``, and cumulative ``pnl`` columns. The
+    cash flow in an interval is the value change not explained by PnL. Inflows are
+    treated as arriving at the start of an interval and outflows as leaving at the
+    end, so PnL is measured against the larger balance. Wallets are summed first,
+    which cancels transfers between them.
+    """
+    frames = [
+        history.set_index("ts")[["accountValue", "pnl"]].groupby(level=0).last()
+        for history in histories
+        if not history.empty
+    ]
+    if not frames:
+        return pd.Series(dtype=float, name="index")
+    times = frames[0].index
+    for frame in frames[1:]:
+        times = times.union(frame.index)
+    combined = sum(frame.reindex(times).ffill().fillna(0.0) for frame in frames)
+    pnl_change = combined["pnl"].diff().fillna(0.0)
+    flow = combined["accountValue"].diff().fillna(0.0) - pnl_change
+    base = combined["accountValue"].shift(1).fillna(0.0) + flow.clip(lower=0.0)
+    if not (base > 0).any():
+        return pd.Series(dtype=float, name="index")
+    returns = (pnl_change / base.where(base > 0)).fillna(0.0).clip(lower=-1.0)
+    index = (1.0 + returns).cumprod().rename("index")
+    first_funded = int(np.argmax((base > 0).to_numpy()))
+    return index.iloc[max(first_funded - 1, 0):]
+
+
 def net_funding_apr_history(
     events: list[dict[str, Any]],
     timezone: str = "America/New_York",
