@@ -44,6 +44,7 @@ FUNDING_STRESS_PERCENTILE = 0.95
 MIN_ORDER_VALUE_USD = 10.0
 ENTRY_TIMEOUT_SECONDS = 5 * 60
 CHASE_INTERVAL_SECONDS = 10
+CANCEL_CONFIRM_ATTEMPTS = 5
 MONITOR_INTERVAL_SECONDS = 15
 
 
@@ -57,6 +58,7 @@ class Market:
     oracle_price: float
     size_decimals: int
     max_leverage: int
+    only_isolated: bool = False
 
 
 @dataclass(frozen=True)
@@ -261,6 +263,7 @@ def fetch_markets(dexes: list[str]) -> dict[str, Market]:
                 oracle_price=oracle,
                 size_decimals=size_decimals,
                 max_leverage=max_leverage,
+                only_isolated=bool(instrument.get("onlyIsolated")),
             )
     return markets
 
@@ -645,7 +648,7 @@ def plan_protection_ladder(
         )
         base_units, remainder = divmod(quantity_units, level_count)
         candidate_quantities = [
-            (base_units + (index < remainder)) * quantity_step
+            round((base_units + (index < remainder)) * quantity_step, position.market.size_decimals)
             for index in range(level_count)
         ]
         minimum_value_met = all(
@@ -682,7 +685,7 @@ def plan_protection_ladder(
         raise ValueError(f"ATR target levels for {position.coin} are not separated from mark by a price tick.")
     base_units, remainder = divmod(quantity_units, level_count)
     quantities = tuple(
-        (base_units + (index < remainder)) * quantity_step
+        round((base_units + (index < remainder)) * quantity_step, position.market.size_decimals)
         for index in range(level_count)
     )
     if any(
@@ -826,7 +829,7 @@ def size_trade(
         max(0.0, available_margin) * leverage / market.mark_price,
     )
     quantity_step = 10 ** -market.size_decimals
-    quantity = math.floor(raw_quantity / quantity_step + 1e-12) * quantity_step
+    quantity = round(math.floor(raw_quantity / quantity_step + 1e-12) * quantity_step, market.size_decimals)
     price_stop_distance = max(
         _price_tick(market.mark_price, market.size_decimals),
         stop_distance - funding_reserve,
@@ -1173,7 +1176,7 @@ def plan_position_actions(
                 target_quantity = max(0.0, current_quantity - requested_delta)
         else:
             target_quantity = 0.0
-        target_quantity = math.floor(target_quantity / quantity_step + 1e-12) * quantity_step
+        target_quantity = round(math.floor(target_quantity / quantity_step + 1e-12) * quantity_step, market.size_decimals)
         quantity_delta = target_quantity - current_quantity
 
         if quantity_delta > 0 and not block_reason:
@@ -1358,6 +1361,16 @@ def _filled_size(status: dict[str, Any]) -> tuple[float, float]:
     return 0.0, 0.0
 
 
+def _order_fill(status: dict[str, Any], size_decimals: int) -> tuple[str, float]:
+    """Return an order's state and filled quantity from an orderStatus response."""
+    details = status.get("order", {})
+    order = details.get("order", {})
+    state = str(details.get("status", "")).lower()
+    original = float(order.get("origSz") or 0)
+    filled = original if state == "filled" else original - float(order.get("sz", original))
+    return state, round(filled, size_decimals)
+
+
 def _place_entry(exchange: Any, wallet: str, plan: PlannedTrade, market: Market) -> tuple[float, float]:
     """Chase the planned entry with post-only limits and return filled size and average price."""
     deadline = time.monotonic() + ENTRY_TIMEOUT_SECONDS
@@ -1378,6 +1391,10 @@ def _place_entry(exchange: Any, wallet: str, plan: PlannedTrade, market: Market)
         status = _status_rows(response)[0]
         oid = _oid_from_status(status)
         if oid is None:
+            if filled_total > 0:
+                # Earlier fills still need exit protection from the caller.
+                print(f"{plan.coin}: entry stopped after a partial fill; order rejected: {status!r}")
+                break
             raise RuntimeError(f"ALO entry for {plan.coin} was rejected: {status!r}")
         if "filled" in status:
             size, average = _filled_size(status)
@@ -1386,24 +1403,23 @@ def _place_entry(exchange: Any, wallet: str, plan: PlannedTrade, market: Market)
                 weighted_entry += size * average
             break
         time.sleep(CHASE_INTERVAL_SECONDS)
-        current = _order_status(wallet, oid)
-        order = current.get("order", {})
-        state = str(order.get("status", "")).lower()
-        if state == "filled":
-            size = float(order.get("origSz", remaining))
-            average = float(order.get("avgPx") or price)
-            filled_total += size
-            weighted_entry += size * average
+        state, filled = _order_fill(_order_status(wallet, oid), market.size_decimals)
+        if state != "filled":
+            exchange.cancel(plan.coin, oid)
+            # The status endpoint can briefly report a cancelled order as open.
+            for _ in range(CANCEL_CONFIRM_ATTEMPTS):
+                state, filled = _order_fill(_order_status(wallet, oid), market.size_decimals)
+                if state not in {"", "open"}:
+                    break
+                time.sleep(1)
+        # Post-only orders fill as maker at their own limit price.
+        filled_total += filled
+        weighted_entry += filled * price
+        if state in {"", "open"}:
+            # Re-placing while this order may still rest could double the position.
+            print(f"{plan.coin}: could not confirm order {oid} was cancelled; stopping entry.")
             break
-        exchange.cancel(plan.coin, oid)
-        after_cancel = _order_status(wallet, oid).get("order", {})
-        partial = float(after_cancel.get("filledSz") or 0)
-        average = float(after_cancel.get("avgPx") or price)
-        if partial > 0:
-            filled_total += partial
-            weighted_entry += partial * average
-            break
-        remaining = plan.quantity - filled_total
+        remaining = round(plan.quantity - filled_total, market.size_decimals)
     if filled_total <= 0:
         raise RuntimeError(
             f"No entry fill for {plan.coin} within the five-minute ALO chase window; no taker order was sent."
@@ -2148,7 +2164,7 @@ def run_position_reconciliation(
                     leverage_result = exchange.update_leverage(
                         plan.leverage,
                         coin,
-                        is_cross=True,
+                        is_cross=not markets[coin].only_isolated,
                     )
                     if (
                         not isinstance(leverage_result, dict)
@@ -2264,7 +2280,11 @@ def run_live(wallet: str, private_key: str, dexes: list[str], plans: list[Planne
             continue
         try:
             baseline_quantity = _current_position_quantity(wallet, plan.dex, plan.coin)
-            leverage_result = exchange.update_leverage(plan.leverage, plan.coin, is_cross=True)
+            leverage_result = exchange.update_leverage(
+                plan.leverage,
+                plan.coin,
+                is_cross=not markets[plan.coin].only_isolated,
+            )
             if not isinstance(leverage_result, dict) or leverage_result.get("status") != "ok":
                 raise RuntimeError(
                     f"Could not confirm leverage {plan.leverage}x for {plan.coin}: {leverage_result!r}"

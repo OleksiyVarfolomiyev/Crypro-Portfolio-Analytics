@@ -13,6 +13,13 @@ def calculate_portfolio_risk_metrics(
     risk_free_daily: float,
     periods_per_year: int = 365,
 ) -> dict[str, float | int]:
+    """Return annualized performance, volatility, and value-at-risk statistics.
+
+    ``returns`` holds simple daily returns as fractions; non-numeric and missing
+    values are dropped. ``risk_free_daily`` is on the same daily scale. VaR values
+    are positive loss fractions, floored at zero when the quantile is a gain.
+    Ratios are NaN when their denominator is zero.
+    """
     if not isinstance(periods_per_year, int) or periods_per_year <= 0:
         raise ValueError("periods_per_year must be a positive integer.")
     if not np.isfinite(risk_free_daily):
@@ -25,12 +32,14 @@ def calculate_portfolio_risk_metrics(
     daily_mean = float(daily_returns.mean())
     daily_vol = float(daily_returns.std(ddof=1))
     excess = daily_returns - risk_free_daily
+    # Target semideviation: gains count as zero but stay in the denominator.
     downside_deviation = float(np.sqrt(np.square(np.minimum(excess, 0.0)).mean()))
     sharpe = (
         float(excess.mean()) / daily_vol * np.sqrt(periods_per_year)
         if daily_vol > 0
         else float("nan")
     )
+    # 252-day variants are for comparison with conventions from equity markets.
     sharpe_252_raw = (
         daily_mean / daily_vol * np.sqrt(252)
         if daily_vol > 0
@@ -47,8 +56,11 @@ def calculate_portfolio_risk_metrics(
         else float("nan")
     )
 
+    # Left-tail return quantiles: the 5% and 1% worst-day cutoffs.
     quantile_95 = float(daily_returns.quantile(0.05))
     quantile_99 = float(daily_returns.quantile(0.01))
+    # Parametric VaR assumes normal returns, which understates fat crypto tails.
+    # The zero-mean variant keeps a strong recent trend from shrinking the estimate.
     normal = NormalDist(mu=daily_mean, sigma=daily_vol)
     zero_mean_normal = NormalDist(mu=0.0, sigma=daily_vol)
     normal_var_95 = max(0.0, -normal.inv_cdf(0.05))
@@ -69,6 +81,7 @@ def calculate_portfolio_risk_metrics(
         "Normal VaR 99%": normal_var_99,
         "Normal VaR 99% (zero mean)": zero_mean_normal_var_99,
         "Daily Return Observations": int(len(daily_returns)),
+        # Few tail observations mean the 99% historical estimate is unreliable.
         "Historical VaR 99% Tail Observations": int((daily_returns <= quantile_99).sum()),
         "Largest Daily Loss": float(daily_returns.min()),
     }

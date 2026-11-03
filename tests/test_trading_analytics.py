@@ -2,6 +2,7 @@ import importlib
 import importlib.util
 import sys
 import unittest
+from types import SimpleNamespace
 import tempfile
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from hyperliquid_trade_execution import (
     collect_snapshot,
     fetch_open_orders,
     plan_position_protection,
+    _place_entry,
     plan_protection_ladder,
     plan_position_actions,
     fetch_markets,
@@ -595,6 +597,95 @@ class TradeAnalyticsTests(unittest.TestCase):
         self.assertAlmostEqual(sum(step.quantity for step in plan.target_steps), 9.0)
         self.assertTrue(all(step.quantity * step.price >= 10.0 for step in plan.stop_steps))
         self.assertTrue(all(step.quantity * step.price >= 10.0 for step in plan.target_steps))
+
+    def test_protection_ladder_quantities_are_exact_at_size_precision(self):
+        candles = make_candles(30)
+        for column in ("open", "high", "low", "close"):
+            candles[column] *= 0.0001
+        market = Market("USUAL", "", 0.01, 0.01, 1, 3)
+        position = Position(
+            wallet="0x" + "1" * 40,
+            coin="USUAL",
+            dex="",
+            quantity=-21449.8,
+            entry_price=0.01,
+            mark_price=0.01,
+            oracle_price=0.01,
+            margin_used=72.0,
+            market=market,
+            leverage=3,
+        )
+
+        plan = plan_protection_ladder(position, [], candles)
+
+        for step in (*plan.stop_steps, *plan.target_steps):
+            self.assertEqual(step.quantity, round(step.quantity, 1))
+        self.assertAlmostEqual(sum(step.quantity for step in plan.stop_steps), 21449.8)
+
+    def _run_entry(self, statuses, responses=None):
+        exchange = MagicMock()
+        exchange.order.side_effect = responses or [
+            {"response": {"data": {"statuses": [{"resting": {"oid": index}}]}}}
+            for index in range(1, 10)
+        ]
+        plan = SimpleNamespace(coin="USUAL", dex="", side="SHORT", quantity=21449.7)
+        market = Market("USUAL", "", 0.01, 0.01, 1, 3)
+        module = "hyperliquid_trade_execution"
+        with patch(f"{module}.post_only_price", return_value=0.01), \
+                patch(f"{module}.time.sleep"), \
+                patch(f"{module}._order_status", side_effect=statuses):
+            return exchange, _place_entry(exchange, "0x" + "1" * 40, plan, market)
+
+    @staticmethod
+    def _order_status_response(state, original, remaining):
+        return {
+            "status": "order",
+            "order": {"order": {"origSz": str(original), "sz": str(remaining)}, "status": state},
+        }
+
+    def test_entry_chase_places_only_the_unfilled_remainder_after_partial_fill(self):
+        status = self._order_status_response
+        exchange, (quantity, entry) = self._run_entry([
+            status("open", 21449.7, 16992.5),
+            status("canceled", 21449.7, 16992.5),
+            status("filled", 16992.5, 0),
+        ])
+
+        self.assertEqual([call.args[2] for call in exchange.order.call_args_list], [21449.7, 16992.5])
+        self.assertAlmostEqual(quantity, 21449.7)
+        self.assertAlmostEqual(entry, 0.01)
+
+    def test_entry_chase_does_not_replace_order_when_cancel_is_unconfirmed(self):
+        status = self._order_status_response
+        exchange, (quantity, _) = self._run_entry([status("open", 21449.7, 16992.5)] * 6)
+
+        self.assertEqual(exchange.order.call_count, 1)
+        self.assertAlmostEqual(quantity, 4457.2)
+
+    def test_entry_chase_waits_out_status_lag_after_cancel(self):
+        status = self._order_status_response
+        exchange, (quantity, _) = self._run_entry([
+            status("open", 21449.7, 16992.5),
+            status("open", 21449.7, 16992.5),
+            status("canceled", 21449.7, 16992.5),
+            status("filled", 16992.5, 0),
+        ])
+
+        self.assertEqual([call.args[2] for call in exchange.order.call_args_list], [21449.7, 16992.5])
+        self.assertAlmostEqual(quantity, 21449.7)
+
+    def test_entry_chase_returns_earlier_fills_when_a_reprice_is_rejected(self):
+        status = self._order_status_response
+        exchange, (quantity, _) = self._run_entry(
+            [status("open", 21449.7, 16992.5), status("canceled", 21449.7, 16992.5)],
+            [
+                {"response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}},
+                {"response": {"data": {"statuses": [{"error": "Post only would have matched"}]}}},
+            ],
+        )
+
+        self.assertEqual(exchange.order.call_count, 2)
+        self.assertAlmostEqual(quantity, 4457.2)
 
     def test_fetch_markets_does_not_duplicate_dex_prefix(self):
         response = [
