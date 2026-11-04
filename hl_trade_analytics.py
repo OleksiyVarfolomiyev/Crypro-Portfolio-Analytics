@@ -720,6 +720,39 @@ def expected_position_pnl(
     )
 
 
+def implied_unrealized_history(
+    pnl_history: pd.DataFrame,
+    fills: pd.DataFrame,
+    funding: pd.DataFrame,
+    timezone: str = "UTC",
+) -> pd.Series:
+    """Estimate end-of-day perp unrealized PnL from cumulative account PnL.
+
+    Hyperliquid's cumulative PnL includes open positions, so subtracting the
+    fee-net fill PnL and funding realized by each timestamp leaves unrealized
+    PnL. Values are only as frequent as ``pnl_history``, whose older points
+    can be days apart.
+    """
+    if pnl_history.empty:
+        return pd.Series(dtype=float, name="unrealized_pnl")
+    events = pd.concat([
+        fills[["ts", "closedPnl"]].rename(columns={"closedPnl": "realized"}),
+        funding[["ts", "fundingPnl"]].rename(columns={"fundingPnl": "realized"}),
+    ], ignore_index=True)
+    # merge_asof requires identical datetime precision, which pandas can infer differently.
+    events["ts"] = pd.to_datetime(events["ts"], utc=True).astype("datetime64[ns, UTC]")
+    events = events.sort_values("ts")
+    events["realized"] = pd.to_numeric(events["realized"], errors="coerce").fillna(0.0).cumsum()
+    history = pnl_history.assign(
+        ts=pd.to_datetime(pnl_history["ts"], utc=True).astype("datetime64[ns, UTC]")
+    ).sort_values("ts")
+    merged = pd.merge_asof(history, events, on="ts")
+    implied = (merged["pnl"] - merged["realized"].fillna(0.0)).set_axis(
+        merged["ts"].dt.tz_convert(timezone)
+    )
+    return implied.resample("1D").last().dropna().rename("unrealized_pnl")
+
+
 def expected_forward_return(closes: pd.Series, horizon_days: int = DEFAULT_HORIZON_DAYS) -> tuple[float, int]:
     """Return the mean historical forward return and its sample count.
 
@@ -739,7 +772,11 @@ def add_expected_pnl_columns(
     rows: list[dict[str, Any]],
     horizon_days: int = DEFAULT_HORIZON_DAYS,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Add historical price/funding PnL estimates to position rows.
+    """Add historical price/funding PnL and return estimates to position rows.
+
+    Returns are percentages of current notional (size times mark), signed from
+    the position's side, so a short shows a negative price return on an upward
+    historical drift.
 
     Candle and funding data are cached per market during the call. Rows with
     insufficient or invalid history are retained with ``NaN`` estimates, and
@@ -787,6 +824,13 @@ def add_expected_pnl_columns(
         )
         row[f"Expected PnL incl. funding ({horizon_days}d)"] = (
             expected.net_pnl if expected is not None else np.nan
+        )
+        notional = quantity * mark_price if expected is not None else 0.0
+        row[f"Expected Price Return ({horizon_days}d)"] = (
+            expected.price_pnl / notional * 100.0 if notional > 0 else np.nan
+        )
+        row[f"Expected Funding Return ({horizon_days}d)"] = (
+            expected.funding_pnl / notional * 100.0 if notional > 0 else np.nan
         )
         enriched.append(row)
     return enriched, warnings

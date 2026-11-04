@@ -1,7 +1,13 @@
+import sys
 import unittest
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# Modules live in the repository root and its execution/ and research/ folders.
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT), str(ROOT / "execution"), str(ROOT / "research")]
 
 from crypto_portfolio_risk import calculate_portfolio_risk_metrics
 

@@ -16,13 +16,13 @@ The two notebooks below contain the complete workflows, including price-history 
 
 | Notebook | What it does | Main data files |
 | --- | --- | --- |
-| [`crypto_portfolio_analytics.ipynb`](crypto_portfolio_analytics.ipynb) | Discovers live perp positions and spot balances from configured Hyperliquid wallets; fetches daily perp prices from Hyperliquid (including HIP-3 markets) and supported spot prices plus market data from CoinGecko; calculates returns and correlations; optimizes signed long/short constrained full-Kelly weights; fits BTC and available CoinGecko cross-sectional factors; compares portfolio results with BTC; writes metrics and factor outputs to CSV. | `data/crypto_daily_prices_usd.csv`, `data/crypto_daily_returns.csv`, `data/crypto_return_correlation.csv`, `data/crypto_kelly_full_weights.csv`, `data/crypto_kelly_weights.csv`, `data/crypto_portfolio_daily_returns.csv`, `data/crypto_portfolio_metrics.csv`, `data/crypto_market_data.csv`, `data/crypto_portfolio_factor_model.csv`, `data/crypto_portfolio_factor_fit.csv`, `data/crypto_factor_returns.csv` |
-| [`hyperliquid_account_analytics.ipynb`](hyperliquid_account_analytics.ipynb) | Analyzes one Hyperliquid account by reading current account and position data; saves account history locally; reports spot/perp balances, fee-net realized PnL with signed perp funding, unrealized PnL, risk metrics, PnL attribution, and charts against BTC. | `data/hyperliquid_account_history_<wallet>.csv` |
-| [`hyperliquid_multi_account_analytics.ipynb`](hyperliquid_multi_account_analytics.ipynb) | Consolidates account history, balances, positions, fills, funding, and PnL across configured Hyperliquid wallets. Displays combined account/risk summaries and charts, pooled PnL attribution, and per-wallet open positions. Position sizing uses a configurable fixed-fractional risk budget and ATR-based stop/take-profit levels. | `data/hyperliquid_account_history_<wallet>.csv` for each wallet |
-| [`hyperliquid_trade_analytics.ipynb`](hyperliquid_trade_analytics.ipynb) | Interactive, read-only view of ATR stop distance, historical adverse funding reserve, and expected five-day price/funding PnL for one perp position. | Public Hyperliquid daily candles and hourly funding history |
-| [`hyperliquid_backtest.ipynb`](hyperliquid_backtest.ipynb) | Interactive, read-only backtest for a list of coin/direction signals. Shows trade-level PnL, funding, fees, and exit reasons. | Public Hyperliquid daily candles and hourly funding history |
+| [`research/crypto_portfolio_analytics.ipynb`](research/crypto_portfolio_analytics.ipynb) | Discovers live perp positions and spot balances from configured Hyperliquid wallets; fetches daily perp prices from Hyperliquid (including HIP-3 markets) and supported spot prices plus market data from CoinGecko; calculates returns and correlations; optimizes signed long/short constrained full-Kelly weights; fits BTC and available CoinGecko cross-sectional factors; compares portfolio results with BTC; writes metrics and factor outputs to CSV. | `data/crypto_daily_prices_usd.csv`, `data/crypto_daily_returns.csv`, `data/crypto_return_correlation.csv`, `data/crypto_kelly_full_weights.csv`, `data/crypto_kelly_weights.csv`, `data/crypto_portfolio_daily_returns.csv`, `data/crypto_portfolio_metrics.csv`, `data/crypto_market_data.csv`, `data/crypto_portfolio_factor_model.csv`, `data/crypto_portfolio_factor_fit.csv`, `data/crypto_factor_returns.csv` |
+| [`hl_account_analytics.ipynb`](hl_account_analytics.ipynb) | Analyzes one Hyperliquid account by reading current account and position data; saves account history locally; reports spot/perp balances, fee-net realized PnL with signed perp funding, unrealized PnL, risk metrics, PnL attribution, and charts against BTC. | `data/hl_account_history_<wallet>.csv` |
+| [`hl_multi_account_analytics.ipynb`](hl_multi_account_analytics.ipynb) | Consolidates account history, balances, positions, fills, funding, and PnL across configured Hyperliquid wallets. Displays combined account/risk summaries and charts, pooled PnL attribution, and per-wallet open positions. Position sizing uses a configurable fixed-fractional risk budget and ATR-based stop/take-profit levels. | `data/hl_account_history_<wallet>.csv` for each wallet |
+| [`hl_trade_analytics.ipynb`](hl_trade_analytics.ipynb) | Interactive, read-only view of ATR stop distance, historical adverse funding reserve, and expected five-day price/funding PnL for one perp position. | Public Hyperliquid daily candles and hourly funding history |
+| [`hl_backtest.ipynb`](hl_backtest.ipynb) | Interactive, read-only backtest for a list of coin/direction signals. Shows trade-level PnL, funding, fees, and exit reasons. | Public Hyperliquid daily candles and hourly funding history |
 
-Implementation modules (`*_implementation.py`) provide code used by the portfolio and account reports; run the user-facing notebooks in the table above. The trade notebooks import shared helpers from `hyperliquid_trade_analytics.py` and the backtest engine from `hyperliquid_backtest.py`. All CSV and spreadsheet data files are stored in the `data/` subfolder. The account notebooks create this folder when needed and read/write their files there. Keep the existing files in `data/` between runs to preserve price and account history.
+Implementation modules (`*_implementation.py`) provide code used by the portfolio and account reports; run the user-facing notebooks in the table above. The trade notebooks import shared helpers from `hl_trade_analytics.py` and the backtest engine from `hl_backtest.py`. All CSV and spreadsheet data files are stored in the `data/` subfolder. The account notebooks create this folder when needed and read/write their files there. Keep the existing files in `data/` between runs to preserve price and account history.
 
 ## Setup
 
@@ -42,7 +42,7 @@ Open either notebook and run its cells from top to bottom. Each notebook is inde
 
 ## 1. Portfolio analytics notebook
 
-Open **crypto_portfolio_analytics.ipynb** and run all cells in order.
+Open **research/crypto_portfolio_analytics.ipynb** and run all cells in order.
 
 - Set `WALLET_ADDRESSES` in the notebook's setup cell. The refresh discovers nonzero perp positions and spot balances across those wallets using Hyperliquid's public API; it does not place trades.
 - CoinGecko's public API is used without an API key. It is rate-limited, so refreshes may need to be retried if the public service returns HTTP 429.
@@ -55,10 +55,10 @@ The discovered, priceable wallet assets form the modeled basket. CoinGecko cross
 
 ## 2. Hyperliquid account analytics notebook
 
-Open **hyperliquid_account_analytics.ipynb** and run all cells in order.
+Open **hl_account_analytics.ipynb** and run all cells in order.
 
 - The notebook queries the configured Hyperliquid account through the public API and fetches current spot balances, perp positions, fills, and BTC candles. No API secret is required for these public account-data requests.
-- It creates or updates `data/hyperliquid_account_history_<wallet>.csv` with new account snapshots, realized trade PnL, and perp funding history. Keep that wallet's CSV between runs to preserve the local history used by the charts and statistics. Daily funding and fill-PnL rows are rebuilt from Hyperliquid's data on each refresh, so a wrong saved row cannot persist.
+- It creates or updates `data/hl_account_history_<wallet>.csv` with new account snapshots, realized trade PnL, and perp funding history. Keep that wallet's CSV between runs to preserve the local history used by the charts and statistics. Daily funding and fill-PnL rows are rebuilt from Hyperliquid's data on each refresh, so a wrong saved row cannot persist.
 - By default, previously saved history is reused and only new observations are collected. Set `FETCH_FULL_HISTORY = True` in the account data cell to request the all-time history again.
 - The notebook reports account value, open-position metrics, fee-net spot/perp realized PnL with signed funding (Hyperliquid's `closedPnl` is before fees, so USDC fees on every fill are subtracted, and win/loss statistics are after fees), fees paid, unrealized PnL, VaR and historical volatility, and asset-level PnL attribution. It also plots account and BTC comparisons.
 - The open-positions table includes historical expected five-day price PnL, expected funding PnL, and their sum. These estimates use completed daily candles and historical hourly funding; fees, slippage, and future-rate uncertainty are not included in the expected values.
@@ -67,21 +67,21 @@ To analyze another account, update `ADDR` in the setup cell with that account’
 
 ## 3. Hyperliquid consolidated account analytics notebook
 
-Open **hyperliquid_multi_account_analytics.ipynb** and run its cells from top to bottom.
+Open **hl_multi_account_analytics.ipynb** and run its cells from top to bottom.
 
 - Set `WALLET_ADDRESSES` in the setup cell to the public Hyperliquid addresses to combine. The notebook reads each account through Hyperliquid's public API; no API secret is needed.
-- The notebooks use a separate `data/hyperliquid_account_history_<wallet>.csv` history file for each wallet. Preserve these files between runs to retain saved account history.
+- The notebooks use a separate `data/hl_account_history_<wallet>.csv` history file for each wallet. Preserve these files between runs to retain saved account history.
 - Combined account-value history and account/risk metrics use dates with coverage from every configured wallet. In the account charts, the oldest wallet's saved history is shown before shared coverage begins, then the combined account value is used. The daily account-vs-BTC comparison is a time-weighted return built from Hyperliquid's account value and PnL history, so deposits, withdrawals, and transfers do not move it. Weekly returns follow the same oldest-wallet-then-combined coverage; traded-volume/PnL charts already pool fills across wallets. Daily rollups and calendar-period cutoffs use US Eastern time. Time-axis charts collapse periods with no realized PnL or funding for more than 30 days and label what is hidden; the weekly-return histogram omits weeks wholly inside them, while statistics still include them.
 - The open-positions section groups same-side positions across wallets and shows them separately from an aggregate account summary. The aggregate summary includes cumulative open-position funding as a percentage of combined account equity and total position value. Reserve-adjusted available margin is combined margin collateral (USDC on unified accounts, matching the executor) less the reserve; the summary shows this capacity, margin used, remaining available margin in dollars and as a percentage of capacity, and position value as a percentage of equity. `MARGIN_RESERVE_PCT` defaults to 20%. Position rows include funding and fees since open as dollar amounts, plus fees since open as percentages of wallet equity and position value and position value as a percentage of wallet account value. They also show historical expected five-day price PnL, expected funding PnL, and expected PnL including funding. These expected values exclude fees and slippage. Fee ratios are shown for complete USDC-denominated fee history. Fixed-fractional sizing defaults to a risk budget of 5% of that available margin per asset, ATR(14) from completed daily candles, and a stop distance of 1.25 × ATR. The sizing table adds a directionally adverse 95th-percentile five-day funding reserve to the target-size and open-risk calculations; its displayed stop remains a price trigger and does not itself enforce a funding-adjusted net-loss threshold. Take-profit is placed the same distance in the favorable direction (1:1 risk/reward). If both long and short positions exist for an asset, each side shares the asset's risk budget equally. `Open - Target` compares a row with its own budget only; `Addable Risk ($)` and `Addable Value ($)` also apply the aggregate risk cap, and the summary shows that cap, risk used, and room. The room is one shared pool, so rows cannot all add their amounts. A separate chart shows `Net Funding APR (%) (simple, covered)` over time, rebuilt from Hyperliquid funding history across wallets, as daily and notional-weighted 7-day values.
 - Adjust `MARGIN_RESERVE_PCT`, `AGGREGATE_RISK_PCT`, `RISK_BUDGET_PCT`, `ATR_PERIOD`, and `ATR_STOP_MULTIPLE` in the setup cell to change the reserve and sizing assumptions. This is sizing analysis only; the notebook does not create, change, or submit orders.
 
 ## 4. Hyperliquid trade analytics notebook
 
-Open [`hyperliquid_trade_analytics.ipynb`](hyperliquid_trade_analytics.ipynb) and run its titled cells in order. Change the coin, DEX, side, and quantity in the configuration cell. The notebook reads completed daily candles and hourly funding history from public endpoints. It estimates the directionally adverse 95th-percentile five-day funding reserve from contiguous hourly windows and adds expected historical funding PnL separately from price PnL. Historical estimates are not guarantees and exclude fees, slippage, gaps, and funding-rate changes.
+Open [`hl_trade_analytics.ipynb`](hl_trade_analytics.ipynb) and run its titled cells in order. Change the coin, DEX, side, and quantity in the configuration cell. The notebook reads completed daily candles and hourly funding history from public endpoints. It estimates the directionally adverse 95th-percentile five-day funding reserve from contiguous hourly windows and adds expected historical funding PnL separately from price PnL. Historical estimates are not guarantees and exclude fees, slippage, gaps, and funding-rate changes.
 
 ## 5. Hyperliquid backtest notebook
 
-Open [`hyperliquid_backtest.ipynb`](hyperliquid_backtest.ipynb) and run its titled cells in order. Edit the signal rows and set your current maker/taker fee rates in basis points before running. With no dated signal rules, it simulates persistent long/short entries at daily opens whenever that market is flat, one position at a time per market. The backtest uses ATR(14), a 1.25×ATR stop, a 1:1 target, and a five-daily-bar time exit by default; leverage is capped at 4× on default-Dex markets and 3× on HIP-3 DEX markets. When stop and target both touch the same daily candle, it assumes the stop fills first. Funding PnL uses entry price as the hourly notional-price proxy. Each market is tested independently; overlapping positions across assets are not combined into a portfolio equity curve or checked against the live 20% aggregate-risk cap.
+Open [`hl_backtest.ipynb`](hl_backtest.ipynb) and run its titled cells in order. Edit the signal rows and set your current maker/taker fee rates in basis points before running. With no dated signal rules, it simulates persistent long/short entries at daily opens whenever that market is flat, one position at a time per market. The backtest uses ATR(14), a 1.25×ATR stop, a 1:1 target, and a five-daily-bar time exit by default; leverage is capped at 4× on default-Dex markets and 3× on HIP-3 DEX markets. When stop and target both touch the same daily candle, it assumes the stop fills first. Funding PnL uses entry price as the hourly notional-price proxy. Each market is tested independently; overlapping positions across assets are not combined into a portfolio equity curve or checked against the live 20% aggregate-risk cap.
 
 ## 6. Guarded trade execution
 
@@ -92,10 +92,10 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-trading.txt
 ```
 
-Create a local signals CSV with `coin,side,dex` columns; `trade_targets.example.csv` shows the format. Store the API-wallet private key directly in the macOS Keychain by running:
+Create a local signals CSV with `coin,side,dex` columns; `execution/trade_targets.example.csv` shows the format. Store the API-wallet private key directly in the macOS Keychain by running:
 
 ```bash
-.venv/bin/python hyperliquid_trade_execution.py --wallet 0xYOUR_MAIN_WALLET_ADDRESS --store-key
+.venv/bin/python execution/hl_trade_execution.py --wallet 0xYOUR_MAIN_WALLET_ADDRESS --store-key
 ```
 
 The script prompts for the API-wallet signing key with hidden input. The key is never written to the repository or included in command-line arguments. Do not send private keys, seed phrases, or API secrets in chat. Use a dedicated API wallet, enable only the access it needs, and avoid using a wallet holding funds beyond the intended trading allocation.
@@ -103,7 +103,7 @@ The script prompts for the API-wallet signing key with hidden input. The key is 
 To check every open position and add only missing reduce-only stop-loss/take-profit coverage, run:
 
 ```bash
-.venv/bin/python hyperliquid_trade_execution.py \
+.venv/bin/python execution/hl_trade_execution.py \
   --wallet 0xYOUR_MAIN_WALLET_ADDRESS \
   --protect-open
 ```
@@ -135,7 +135,7 @@ close,ARB,,,
 Run a dry check first:
 
 ```bash
-.venv/bin/python hyperliquid_trade_execution.py \
+.venv/bin/python execution/hl_trade_execution.py \
   --wallet 0xYOUR_MAIN_WALLET_ADDRESS \
   --risk-wallets 0xWALLET_ONE,0xWALLET_TWO \
   --actions position_actions.csv
@@ -146,7 +146,7 @@ Additions use the existing maker-only ALO entry approach. Reductions and closes 
 First run without `--live` to inspect the proposed sizing and current aggregate risk:
 
 ```bash
-.venv/bin/python hyperliquid_trade_execution.py \
+.venv/bin/python execution/hl_trade_execution.py \
   --wallet 0xYOUR_MAIN_WALLET_ADDRESS \
   --risk-wallets 0xWALLET_ONE,0xWALLET_TWO \
   --signals trade_targets.csv
@@ -171,6 +171,6 @@ The executor applies the limits to each action but does not choose positions; th
 - The Kelly weights are historical estimates based on the available price sample; they are not a guarantee of future performance.
 - Expected PnL values use historical mean forward returns/funding and can be unstable for short or changing market samples.
 - The factor model is a descriptive in-sample regression over the selected assets. Factor betas and contributions are estimates, not causal explanations or forecasts.
-- Hyperliquid account history is stored locally in per-wallet CSV files. Back up the relevant `data/hyperliquid_account_history_<wallet>.csv` files if you want to preserve those records.
+- Hyperliquid account history is stored locally in per-wallet CSV files. Back up the relevant `data/hl_account_history_<wallet>.csv` files if you want to preserve those records.
 - Multi-wallet daily account comparisons require overlapping saved history for all configured wallets; a short overlap can make drawdown and other historical statistics unrepresentative of the full account history.
 - Files in `data/` can contain account-level financial history and portfolio data. Avoid committing them to a public repository unless you intend to publish that data.

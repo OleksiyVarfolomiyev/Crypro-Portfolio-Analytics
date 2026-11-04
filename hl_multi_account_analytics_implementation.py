@@ -1,6 +1,6 @@
 """Consolidated Hyperliquid analytics implementation.
 
-Methods used by `hyperliquid_multi_account_analytics.ipynb`. It reuses the single-wallet
+Methods used by `hl_multi_account_analytics.ipynb`. It reuses the single-wallet
 implementation and combines data from each configured wallet.
 """
 
@@ -11,7 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import re
 
-from hyperliquid_account_analytics_implementation import (
+from hl_account_analytics_implementation import (
     ACCOUNTING_TIMEZONE,
     HISTORY_COLUMNS,
     HyperliquidAnalytics,
@@ -21,7 +21,9 @@ from hyperliquid_account_analytics_implementation import (
     build_pnl_attribution,
     calculate_account_metrics,
     display_interactive_table,
+    fetch_pnl_windows,
     fetch_portfolio_history,
+    post,
     fetch_user_funding,
     liquidation_stats,
     perp_pnl_breakdown,
@@ -32,6 +34,7 @@ from hyperliquid_account_analytics_implementation import (
     print_realized_stats,
     split_realized_fills,
     summarize_volume_pnl,
+    wallet_unrealized_history,
 )
 
 
@@ -43,7 +46,8 @@ from hyperliquid_account_analytics_implementation import (
 # combined live snapshot and realized/funding history.
 
 
-from hyperliquid_trade_analytics import (
+from hl_highlights import build_highlights,load_state,make_state,position_changes,save_state
+from hl_trade_analytics import (
     add_expected_pnl_columns,
     adverse_funding_cost_per_unit,
     consolidate_current_funding,
@@ -199,12 +203,15 @@ def _display_consolidated_positions(rows):
     frame['Fees / Equity (%)'] = (fees_usd.abs() / equity * 100).where(equity > 0)
     frame['Fees / Position (%)'] = (fees_usd.abs() / position_value * 100).where(position_value > 0)
     frame['Position / Account (%)'] = (position_value / equity * 100).where(equity > 0)
-    frame = frame.rename(columns={'Funding': 'Funding (since open)'})
-    columns=['Wallet','Coin','Dex','Side','Liq %','ROE','uPnL','Funding (since open)',
+    frame = frame.rename(columns={'Funding': 'Funding (since open)','Coin':'Ticker'})
+    # Split across two tables so each fits on screen; both repeat the identifying columns.
+    identifiers=['Wallet','Ticker','Side']
+    pnl_columns=identifiers+['Liq %','ROE','uPnL','Funding (since open)',
              'Funding (1h)','Funding APR',
              'Expected Price PnL (5d)','Expected Funding PnL (5d)',
              'Expected PnL incl. funding (5d)',
-             'Entry','Mark','Pos','Margin','Margin Type','Margin %','Fees',
+             'Expected Price Return (5d)','Expected Funding Return (5d)']
+    position_columns=identifiers+['Entry','Mark','Pos','Margin','Margin Type','Margin %','Fees',
              'Fees / Equity (%)','Fees / Position (%)','Position / Account (%)',
              'Liq Px','Lev.','Sz']
     usd=lambda value:f'-${abs(value):,.2f}' if value<0 else f'${value:,.2f}'
@@ -226,11 +233,12 @@ def _display_consolidated_positions(rows):
         if column in {'Fees','Fees / Equity (%)','Fees / Position (%)'}:
             return 'color:#c62828;'
         if column in {'uPnL','ROE','Funding (since open)','Expected Price PnL (5d)',
-                'Expected Funding PnL (5d)','Expected PnL incl. funding (5d)'} and pd.notna(value):
+                'Expected Funding PnL (5d)','Expected PnL incl. funding (5d)',
+                'Expected Price Return (5d)','Expected Funding Return (5d)'} and pd.notna(value):
             return 'color:#188038;' if value>0 else 'color:#c62828;' if value<0 else ''
         if column=='Fees': return 'color:#c62828;'
         return ''
-    display_interactive_table(frame,columns=columns,cell_style=style,formatters={
+    formatters={
         'Sz':lambda v:f'{v:,.2f}','Pos':lambda v:f'${v:,.0f}','Margin':lambda v:f'${v:,.0f}',
         'Liq %':lambda v:f'{v:.2f}%' if pd.notna(v) else 'n/a',
         'ROE':lambda v:f'{v:.2f}%','uPnL':usd,'Funding (since open)':usd,
@@ -242,10 +250,14 @@ def _display_consolidated_positions(rows):
         'Expected Price PnL (5d)':usd,
         'Expected Funding PnL (5d)':usd,
         'Expected PnL incl. funding (5d)':usd,
+        'Expected Price Return (5d)':lambda v:f'{v:.3f}%' if pd.notna(v) else 'n/a',
+        'Expected Funding Return (5d)':lambda v:f'{v:.3f}%' if pd.notna(v) else 'n/a',
         'Entry':lambda v:f'{v:,.8g}','Mark':lambda v:f'{v:,.8g}',
         'Liq Px':lambda v:f'{v:,.5g}' if pd.notna(v) else 'n/a','Lev.':lambda v:f'{v:.2f}x',
         'Margin %':lambda v:f'{v:.2f}%' if pd.notna(v) else 'n/a',
-    })
+    }
+    display_interactive_table(frame,columns=pnl_columns,cell_style=style,formatters=formatters)
+    display_interactive_table(frame,columns=position_columns,cell_style=style,formatters=formatters)
     print('Funding and fees are cumulative since the position was opened. Fee ratios are '
           'shown only for complete USDC-denominated fees; otherwise they are n/a.')
     if expected_pnl_warnings:
@@ -332,46 +344,38 @@ def _fetch_daily_atr(coin, period):
     return wilder_atr(candles, period_used), period_used
 
 
-def _display_stop_sizing(rows, risk_budget_pct, usable_collateral,
-                         atr_period, atr_stop_multiple, aggregate_risk_cap):
+def _aggregate_open_risk(rows, atr_period, atr_stop_multiple):
+    """Sum stop risk plus the adverse five-day funding reserve per asset and side."""
     if not rows:
         return 0.0
-    if not np.isfinite(risk_budget_pct) or risk_budget_pct <= 0:
-        raise ValueError('RISK_BUDGET_PCT must be a positive finite percentage.')
     if not np.isfinite(atr_stop_multiple) or atr_stop_multiple <= 0:
         raise ValueError('ATR_STOP_MULTIPLE must be a positive finite value.')
-    if not np.isfinite(usable_collateral) or usable_collateral <= 0:
-        raise ValueError('Usable collateral must be positive to calculate risk-based sizing.')
     grouped = {}
     for row in rows:
         key = (str(row['Coin']), str(row['Side']).upper())
         if key[1] not in {'LONG', 'SHORT'}:
             raise ValueError(f'Unsupported position side for {key[0]}: {key[1]}')
         grouped.setdefault(key, []).append(row)
-    sides_by_asset = {}
-    for coin, side in grouped:
-        sides_by_asset.setdefault(coin, set()).add(side)
-    output = []
+    open_risk_total = 0.0
     atr_by_asset = {}
     funding_by_asset = {}
+    short_history = set()
     for (coin, side), positions in sorted(grouped.items()):
         direction = 1 if side == 'LONG' else -1
         quantities = [abs(float(position['Sz'])) for position in positions]
-        entries = [float(position['Entry']) for position in positions]
         marks = [float(position['Mark']) for position in positions]
         oracles = [float(position.get('Oracle', position['Mark'])) for position in positions]
         total_quantity = sum(quantities)
-        if total_quantity <= 0 or not all(np.isfinite(value) for value in quantities + entries + marks + oracles):
-            raise ValueError(f'Cannot calculate position sizing for {coin} {side}: invalid size, entry, or mark.')
-        average_entry = sum(quantity * entry for quantity, entry in zip(quantities, entries)) / total_quantity
+        if total_quantity <= 0 or not all(np.isfinite(value) for value in quantities + marks + oracles):
+            raise ValueError(f'Cannot calculate open risk for {coin} {side}: invalid size or mark.')
         current_mark = sum(quantity * mark for quantity, mark in zip(quantities, marks)) / total_quantity
         current_oracle = sum(quantity * oracle for quantity, oracle in zip(quantities, oracles)) / total_quantity
         if coin not in atr_by_asset:
             atr_by_asset[coin] = _fetch_daily_atr(coin, atr_period)
         atr, atr_period_used = atr_by_asset[coin]
-        stop_distance = atr_stop_multiple * atr
-        take_profit_distance = stop_distance
-        stop = current_mark - direction * stop_distance
+        if atr_period_used < atr_period:
+            short_history.add(coin)
+        stop = current_mark - direction * atr_stop_multiple * atr
         dex = coin.split(':', 1)[0] if ':' in coin else ''
         base_coin = coin.split(':', 1)[-1]
         funding_key = (base_coin, dex)
@@ -383,92 +387,13 @@ def _display_stop_sizing(rows, risk_budget_pct, usable_collateral,
             funding_by_asset[funding_key], side, current_oracle,
             horizon_hours=5 * 24, percentile=0.95,
         )
-        asset_risk_budget = usable_collateral * risk_budget_pct / 100.0
-        side_count = len(sides_by_asset[coin])
-        side_risk_budget = asset_risk_budget / side_count
-        risk_per_unit = stop_distance + funding_reserve_per_unit
-        target_quantity = side_risk_budget / risk_per_unit
-        take_profit = current_mark + direction * take_profit_distance
-        mark_to_take_profit_pct = direction * (take_profit - current_mark) / current_mark * 100.0
-        open_price_risk = sum(
+        open_risk_total += sum(
             quantity * max(direction * (mark - stop), 0.0)
             for quantity, mark in zip(quantities, marks)
-        )
-        open_risk_including_funding = open_price_risk + total_quantity * funding_reserve_per_unit
-        size_difference = direction * (total_quantity - target_quantity)
-        size_difference_pct = (total_quantity - target_quantity) / target_quantity * 100.0
-        output.append({
-            'Asset': coin, 'Side': side, 'ATR (%)': atr / current_mark * 100.0,
-            'ATR Period Used': atr_period_used,
-            'ATR Stop Distance (%)': stop_distance / current_mark * 100.0,
-            'ATR Take Profit Distance (%)': take_profit_distance / current_mark * 100.0,
-            'Mark to Take Profit (%)': mark_to_take_profit_pct,
-            'Funding Reserve / unit': funding_reserve_per_unit,
-            'Avg Entry': average_entry, 'Mark': current_mark, 'Stop': stop,
-            'Take Profit': take_profit,
-            'Open - Target (coins)': size_difference,
-            'Open - Target (%)': size_difference_pct,
-            'Addable Risk ($)': max(side_risk_budget - open_risk_including_funding, 0.0),
-            'Addable Value ($)': current_mark / risk_per_unit,
-            'Open Risk (price only) ($)': open_price_risk,
-            'Open Risk incl. funding ($)': open_risk_including_funding,
-        })
-    frame = pd.DataFrame(output)
-    open_risk_total = frame['Open Risk incl. funding ($)'].sum()
-    aggregate_room = max(aggregate_risk_cap - open_risk_total, 0.0)
-    frame['Addable Risk ($)'] = frame['Addable Risk ($)'].clip(upper=aggregate_room)
-    frame['Addable Value ($)'] *= frame['Addable Risk ($)']
-    print(f'Fixed-fractional sizing: risk budget {risk_budget_pct:.2f}% of ${usable_collateral:,.2f} usable collateral '
-          f'per asset; target quantity uses {atr_stop_multiple:g} x daily ATR({atr_period}) '
-          'plus the directionally adverse 95th-percentile five-day funding reserve. '
-          'Opposing sides, when both open, split the asset budget equally.')
-    print(f'Aggregate risk: ${open_risk_total:,.2f} of ${aggregate_risk_cap:,.2f} cap; '
-          f'${aggregate_room:,.2f} room left. Addable Risk is the most one row could add within its '
-          'own budget and that room. The room is one shared pool, so rows cannot all add their '
-          'amounts. The executor also reserves fees, so its room is slightly smaller.')
-    short_history = frame.loc[frame['ATR Period Used'] < atr_period, 'Asset'].unique()
-    if len(short_history):
+        ) + total_quantity * funding_reserve_per_unit
+    if short_history:
         print(f'Limited daily history; ATR uses all completed candles available (shorter than '
-              f'{atr_period} days) for: {", ".join(short_history)}.')
-    print(f'ATR stop and take-profit distances currently both use {atr_stop_multiple:g} x daily '
-          'ATR from the current mark (1:1 price reward/risk before funding, fees, and slippage).')
-    print('ATR stop-distance colors: green <2%, orange 2-5%, red >5%; red mark means '
-          'the position is out of the money; stop prices are highlighted red. Open-risk '
-          'includes the funding reserve but excludes fees, slippage, and gaps; the stop '
-          'trigger itself remains a price level.')
-    def sizing_cell_style(row_index, column, value, row):
-        if column == 'Stop':
-            return 'color:#c62828;font-weight:600;'
-        if column == 'Mark':
-            out_of_money = (row['Side'] == 'LONG' and value < row['Avg Entry']) or (
-                row['Side'] == 'SHORT' and value > row['Avg Entry']
-            )
-            return 'color:#c62828;font-weight:600;' if out_of_money else ''
-        if column == 'ATR Stop Distance (%)':
-            if value < 2:
-                return 'color:#188038;font-weight:600;'
-            if value <= 5:
-                return 'color:#b06000;font-weight:600;'
-            return 'color:#c62828;font-weight:600;'
-        return ''
-    display_interactive_table(frame, formatters={
-        'ATR (%)':lambda value:f'{value:.2f}%',
-        'ATR Period Used':lambda value:f'{int(value)} days',
-        'ATR Stop Distance (%)':lambda value:f'{value:.2f}%',
-        'ATR Take Profit Distance (%)':lambda value:f'{value:.2f}%',
-        'Mark to Take Profit (%)':lambda value:f'{value:.2f}%',
-        'Avg Entry':lambda value:f'{value:,.8g}',
-        'Mark':lambda value:f'{value:,.8g}',
-        'Stop':lambda value:f'{value:,.5g}',
-        'Take Profit':lambda value:f'{value:,.5g}',
-        'Open - Target (coins)':lambda value:f'{value:,.6g}' if pd.notna(value) else 'n/a',
-        'Open - Target (%)':lambda value:f'{value:,.2f}%' if pd.notna(value) else 'n/a',
-        'Addable Risk ($)':lambda value:f'${value:,.2f}',
-        'Addable Value ($)':lambda value:f'${value:,.2f}',
-        'Funding Reserve / unit':lambda value:f'${value:,.6g}' if pd.notna(value) else 'n/a',
-        'Open Risk (price only) ($)':lambda value:f'${value:,.2f}' if pd.notna(value) else 'n/a',
-        'Open Risk incl. funding ($)':lambda value:f'${value:,.2f}' if pd.notna(value) else 'n/a',
-    }, cell_style=sizing_cell_style)
+              f'{atr_period} days) for: {", ".join(sorted(short_history))}.')
     return open_risk_total
 
 
@@ -488,6 +413,7 @@ class _MultiWalletDataMixin:
             account.fetch_data(refresh_full_history=refresh_full_history)
             self.wallet_analytics[wallet]=account
         self.data=_combine_wallet_data(self.wallet_analytics)
+        self._highlights_baseline_loaded=False
         self.collateral_equity=sum(
             fetch_collateral_equity(
                 wallet.lower(),
@@ -551,6 +477,14 @@ class _MultiWalletAccountMixin:
         data=self._require_data()
         chart_metrics=SimpleNamespace(**vars(self.account_metrics))
         chart_metrics.daily_account=data.chart_account_history
+        # Chart only: the risk statistics keep using observed live snapshots.
+        unrealized_by_wallet=pd.concat([
+            wallet_unrealized_history(wallet,account.data).rename(wallet)
+            for wallet,account in self.wallet_analytics.items()
+        ],axis=1).sort_index().ffill().fillna(0.0)
+        chart_metrics.daily_unrealized=self.account_metrics.daily_unrealized.combine_first(
+            unrealized_by_wallet.sum(axis=1).reindex(self.account_metrics.day_index)
+        )
         if data.oldest_wallet is not None:
             oldest_metrics=self.wallet_analytics[data.oldest_wallet].account_metrics
             early_returns=oldest_metrics.daily_return_pct.loc[
@@ -582,6 +516,63 @@ class _MultiWalletAccountMixin:
 # Dashboard call: `analytics.show_open_positions()`. Show per-wallet positions, consolidated
 # current funding rates and side-aware funding estimates grouped by asset/side, stop-based
 # sizing, and an aggregate account summary.
+
+
+class _MultiWalletHighlightsMixin:
+    def _positions_missing_stops(self,rows):
+        missing=[]
+        # Position rows identify a wallet by its last four characters.
+        orders={wallet[-4:]:[] for wallet in self.wallet_addresses}
+        for wallet in self.wallet_addresses:
+            for dex in {row['Dex'] for row in rows if row['Wallet']==wallet[-4:]}:
+                orders[wallet[-4:]].extend(post({'type':'frontendOpenOrders','user':wallet,'dex':dex}))
+        for row in rows:
+            stops=[
+                order for order in orders[row['Wallet']]
+                if order.get('coin')==row['Coin'] and order.get('reduceOnly')
+                and 'stop' in str(order.get('orderType','')).lower()
+            ]
+            # A position-level stop has size zero because it always closes the whole position.
+            covered=any(order.get('isPositionTpsl') for order in stops) or \
+                sum(float(order['sz']) for order in stops)>=abs(float(row['Sz']))*0.999
+            if not covered:
+                missing.append(f"{row['Coin']} ({row['Wallet']})")
+        return missing
+
+    def show_highlights(self):
+        data=self._require_data()
+        rows=self._load_positions()
+        now=pd.Timestamp.now(tz=ACCOUNTING_TIMEZONE)
+        # Keep the same baseline if this cell is rerun without fetching new data.
+        if not self._highlights_baseline_loaded:
+            self._highlights_baseline=load_state(self.data_dir)
+            self._highlights_baseline_loaded=True
+        baseline=self._highlights_baseline
+        windows=[fetch_pnl_windows(wallet) for wallet in self.wallet_addresses]
+        pnl_24h,cumulative_pnl=(sum(values) for values in zip(*windows))
+        margin_capacity=self.collateral_equity*(1-self.margin_reserve_pct/100)
+        well,attention=build_highlights(
+            now,baseline,rows,data.realized_df,data.funding_history_df,cumulative_pnl,pnl_24h,
+            data.current_account_value,
+            _aggregate_open_risk(rows,self.position_atr_period,self.position_atr_stop_multiple),
+            self.collateral_equity*self.aggregate_risk_pct/100,
+            margin_capacity-sum(row['Margin'] for row in rows),margin_capacity,
+            self._positions_missing_stops(rows),
+        )
+        if baseline is None:
+            print('No earlier run saved yet, so "Since last run" starts from the next run.')
+        else:
+            print(f"Last run: {pd.Timestamp(baseline['ts']).tz_convert(ACCOUNTING_TIMEZONE):%Y-%m-%d %H:%M %Z}.")
+            for change,names in position_changes(baseline,rows).items():
+                if names:
+                    print(f"{change}: {', '.join(names)}.")
+        for title,table in (('WHAT WENT WELL',well),('NEEDS ATTENTION',attention)):
+            print(f'=== {title} ===')
+            if table:
+                display_interactive_table(pd.DataFrame(table),columns=['Window','Update','Detail'])
+            else:
+                print('Nothing to report.')
+        save_state(self.data_dir,make_state(now,cumulative_pnl,rows))
 
 
 class _MultiWalletPositionsMixin:
@@ -637,11 +628,7 @@ class _MultiWalletPositionsMixin:
             raise ValueError('AGGREGATE_RISK_PCT must be a positive finite percentage.')
         available_margin=self.collateral_equity*(1-self.margin_reserve_pct/100)
         aggregate_risk_cap=self.collateral_equity*self.aggregate_risk_pct/100
-        open_risk=_display_stop_sizing(
-            rows,self.position_risk_budget_pct,
-            available_margin,self.position_atr_period,self.position_atr_stop_multiple,
-            aggregate_risk_cap,
-        )
+        open_risk=_aggregate_open_risk(rows,self.position_atr_period,self.position_atr_stop_multiple)
         position_value=sum(abs(row['Pos']) for row in rows)
         margin=sum(row['Margin'] for row in rows)
         funding=sum(row['Funding'] for row in rows)
@@ -771,11 +758,11 @@ class _MultiWalletVolumeMixin:
             print('No fill volume or realized PnL data is available.')
             return
         def style(row_index,column,value,row):
-            if column in {'Realized PnL ($)','Realized PnL / Volume (%)','PnL / $1k volume ($)'} and pd.notna(value):
+            if column in {'Realized PnL excl. funding (trading + fees) ($)','Realized PnL / Volume (%)','PnL / $1k volume ($)'} and pd.notna(value):
                 return 'color:#188038;' if value>0 else 'color:#c62828;' if value<0 else ''
             return ''
         display_interactive_table(summary,formatters={
-            'Volume ($)':lambda v:f'${v:,.2f}','Realized PnL ($)':lambda v:f'${v:,.2f}',
+            'Volume ($)':lambda v:f'${v:,.2f}','Realized PnL excl. funding (trading + fees) ($)':lambda v:f'${v:,.2f}',
             'Realized PnL / Volume (%)':lambda v:f'{v:.2f}%',
             'PnL / $1k volume ($)':lambda v:f'${v:,.2f}',
             'Daily Pearson r':lambda v:f'{v:.3f}','Daily Spearman r':lambda v:f'{v:.3f}',
@@ -826,6 +813,7 @@ class _MultiWalletAttributionMixin:
 
 
 class MultiWalletAnalytics(
+    _MultiWalletHighlightsMixin,
     _MultiWalletDataMixin,_MultiWalletAccountMixin,_MultiWalletPositionsMixin,
     _MultiWalletRealizedMixin,_MultiWalletVolumeMixin,_MultiWalletAttributionMixin,
 ):
@@ -844,6 +832,8 @@ class MultiWalletAnalytics(
         self.margin_reserve_pct=20.0
         self.aggregate_risk_pct=20.0
         self.data=None
+        self._highlights_baseline=None
+        self._highlights_baseline_loaded=False
         self.collateral_equity=None
         self.account_metrics=None
         self.positions=[]

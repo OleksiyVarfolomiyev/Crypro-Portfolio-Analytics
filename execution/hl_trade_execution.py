@@ -20,7 +20,10 @@ import numpy as np
 import pandas as pd
 import requests
 
-from hyperliquid_trade_analytics import (
+# The shared analytics module lives in the repository root, one level above this script.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hl_trade_analytics import (
     DEFAULT_HORIZON_DAYS,
     ExpectedPnl,
     adverse_funding_cost_per_unit,
@@ -44,7 +47,7 @@ FUNDING_STRESS_PERCENTILE = 0.95
 MIN_ORDER_VALUE_USD = 10.0
 ENTRY_TIMEOUT_SECONDS = 5 * 60
 CHASE_INTERVAL_SECONDS = 10
-CANCEL_CONFIRM_ATTEMPTS = 5
+CANCEL_CONFIRM_ATTEMPTS = 30
 MONITOR_INTERVAL_SECONDS = 15
 
 

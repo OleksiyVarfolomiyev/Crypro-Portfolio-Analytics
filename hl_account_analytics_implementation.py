@@ -11,10 +11,11 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
-from hyperliquid_trade_analytics import (
+from hl_trade_analytics import (
     MAX_RATE_LIMIT_RETRIES,
     _rate_limit_delay,
     add_expected_pnl_columns,
+    implied_unrealized_history,
     apply_fill_fees,
     drop_inactive_weeks,
     drop_refreshed_daily_rows,
@@ -249,6 +250,40 @@ def fetch_portfolio_history(user):
         ACCOUNTING_TIMEZONE
     )
     return history[['ts', 'accountValue', 'pnl']]
+
+
+def fetch_perp_pnl_history(user):
+    """Fetch the account's all-time cumulative perp PnL, including open positions."""
+    portfolio = post({'type': 'portfolio', 'user': user})
+    periods = {item[0]: item[1] for item in portfolio if isinstance(item, (list,
+                tuple)) and len(item) == 2 and isinstance(item[1], dict)}
+    pnl = pd.DataFrame(periods.get('perpAllTime', {}).get('pnlHistory', []), columns=['time', 'pnl'])
+    pnl['pnl'] = pd.to_numeric(pnl['pnl'], errors='coerce')
+    pnl['ts'] = pd.to_datetime(pnl['time'], unit='ms', utc=True)
+    return pnl.dropna(subset=['pnl'])[['ts', 'pnl']]
+
+
+def wallet_unrealized_history(user, data):
+    """Rebuild one wallet's daily perp unrealized PnL from its fills and funding."""
+    perp_fills, _ = split_realized_fills(data.realized_df)
+    return implied_unrealized_history(
+        fetch_perp_pnl_history(user),
+        perp_fills if not perp_fills.empty else pd.DataFrame(columns=['ts', 'closedPnl']),
+        data.funding_history_df if not data.funding_history_df.empty
+            else pd.DataFrame(columns=['ts', 'fundingPnl']),
+        ACCOUNTING_TIMEZONE,
+    )
+
+
+def fetch_pnl_windows(user):
+    """Return the account's PnL over the last day and in total, including open positions."""
+    portfolio = post({'type': 'portfolio', 'user': user})
+    periods = {item[0]: item[1] for item in portfolio if isinstance(item, (list,
+                tuple)) and len(item) == 2 and isinstance(item[1], dict)}
+    def latest(period):
+        history = periods.get(period, {}).get('pnlHistory', [])
+        return float(history[-1][1]) if history else 0.0
+    return latest('day'), latest('allTime')
 
 
 def fetch_perp_states(user):
@@ -677,6 +712,9 @@ def print_account_metrics(metrics, new_api_rows, fill_count, portfolio_value, re
         if column != 'Value' or not value:
             return ''
         text = str(value).strip()
+        if row['Metric'] == 'BTC beta':
+            # Green when the account moves less than BTC, including when it moves opposite.
+            return 'color:#188038;font-weight:600;' if text != 'n/a' and float(text) < 1 else ''
         if row['Metric'] == 'Portfolio value' or row['Metric'].startswith('1D historical VaR'):
             if re.search(r'\$\s*\d', text) and '$-' not in text:
                 return 'color:#188038;font-weight:600;'
@@ -752,7 +790,8 @@ def plot_account_dashboard(metrics):
                 name='Realized', mode='lines+markers', line={'color': '#457b9d'}), row=2, col=1)
     if not metrics.daily_unrealized.empty:
         fig.add_trace(go.Scatter(x=metrics.day_index, y=metrics.daily_unrealized.values,
-                name='Unrealized', mode='lines+markers', line={'color': '#e76f51'}), row=2, col=1)
+                name='Unrealized', mode='lines+markers', connectgaps=True,
+                line={'color': '#e76f51'}), row=2, col=1)
     if not metrics.cumulative_pnl.empty:
         fig.add_trace(go.Scatter(x=metrics.cumulative_pnl.index,
                 y=metrics.cumulative_pnl.values, name='Cumulative PnL', line={'color': '#8e44ad',
@@ -800,8 +839,13 @@ def plot_account_dashboard(metrics):
 
 class _AccountChartsMixin:
     def show_account_charts(self):
-        self._require_data()
-        plot_account_dashboard(self.account_metrics)
+        data = self._require_data()
+        chart_metrics = SimpleNamespace(**vars(self.account_metrics))
+        # Chart only: the risk statistics keep using observed live snapshots.
+        chart_metrics.daily_unrealized = self.account_metrics.daily_unrealized.combine_first(
+            wallet_unrealized_history(self.wallet_address, data).reindex(self.account_metrics.day_index)
+        )
+        plot_account_dashboard(chart_metrics)
 
 
 # ----------------------------------------------------------------------------
@@ -1127,6 +1171,7 @@ def display_positions(rows, account_value=float('nan')):
         'Funding / Equity (%)', 'Funding / Position (%)', 'Funding (1h)', 'Funding APR',
         'Expected Price PnL (5d)', 'Expected Funding PnL (5d)',
         'Expected PnL incl. funding (5d)',
+        'Expected Price Return (5d)', 'Expected Funding Return (5d)',
         'Entry', 'Mark', 'Pos', 'Margin', 'Margin Type', 'Margin %', 'Fees',
         'Fees / Equity (%)', 'Fees / Position (%)', 'Position / Account (%)',
         'Liq Px', 'Lev.', 'Sz']
@@ -1160,7 +1205,8 @@ def display_positions(rows, account_value=float('nan')):
             return 'color:#c62828;'
         if column in {'uPnL', 'ROE', 'Funding (since open)', 'Funding / Equity (%)',
                 'Funding / Position (%)', 'Expected Price PnL (5d)',
-                'Expected Funding PnL (5d)', 'Expected PnL incl. funding (5d)'} and isinstance(value, (int, float)):
+                'Expected Funding PnL (5d)', 'Expected PnL incl. funding (5d)',
+                'Expected Price Return (5d)', 'Expected Funding Return (5d)'} and isinstance(value, (int, float)):
             return 'color:#188038;' if value > 0 else 'color:#c62828;' if value < 0 else ''
         return ''
     display_interactive_table(frame, formatters={'Sz': lambda value: f'{value:,.2f}',
@@ -1175,6 +1221,8 @@ def display_positions(rows, account_value=float('nan')):
             'Expected Price PnL (5d)': usd,
             'Expected Funding PnL (5d)': usd,
             'Expected PnL incl. funding (5d)': usd,
+            'Expected Price Return (5d)': lambda value: f'{value:.3f}%' if pd.notna(value) else 'n/a',
+            'Expected Funding Return (5d)': lambda value: f'{value:.3f}%' if pd.notna(value) else 'n/a',
             'Fees / Equity (%)': lambda value: f'{value:.3f}%' if pd.notna(value) else 'n/a',
             'Fees / Position (%)': lambda value: f'{value:.3f}%' if pd.notna(value) else 'n/a',
             'Position / Account (%)': lambda value: f'{value:.2f}%' if pd.notna(value) else 'n/a',
@@ -1516,7 +1564,7 @@ def summarize_volume_pnl(daily_data):
         total_pnl = part['realized_pnl'].sum()
         pnl_ratio = total_pnl / total_volume if total_volume else float('nan')
         rows.append({'Market': labels.get(asset_type, asset_type.title()),
-                'Volume ($)': total_volume, 'Realized PnL ($)': total_pnl,
+                'Volume ($)': total_volume, 'Realized PnL excl. funding (trading + fees) ($)': total_pnl,
                 'Realized PnL / Volume (%)': pnl_ratio * 100,
                     'PnL / $1k volume ($)': pnl_ratio * 1000,
                 'Active days': len(part), 'Daily Pearson r': part['volume'].corr(part[ \
@@ -1537,13 +1585,13 @@ class _VolumeSummaryMixin:
             print("No fill volume or realized PnL data is available.")
             return
         def volume_style(row_index, column, value, row):
-            if column in {"Realized PnL ($)", "Realized PnL / Volume (%)",
+            if column in {"Realized PnL excl. funding (trading + fees) ($)", "Realized PnL / Volume (%)",
                 "PnL / $1k volume ($)"} and pd.notna(value):
                 return "color:#188038;" if value > 0 else "color:#c62828;"
             return ""
         display_interactive_table(volume_pnl_summary, formatters={
             "Volume ($)": lambda value: f"${value:,.2f}",
-            "Realized PnL ($)": lambda value: f"${value:,.2f}",
+            "Realized PnL excl. funding (trading + fees) ($)": lambda value: f"${value:,.2f}",
             "Realized PnL / Volume (%)": lambda value: f"{value:.2f}%",
             "PnL / $1k volume ($)": lambda value: f"${value:,.2f}",
             "Daily Pearson r": lambda value: f"{value:.3f}",
@@ -1696,7 +1744,7 @@ def collect_wallet_data(wallet_address, data_dir="data", refresh_full_history=Fa
         raise ValueError("wallet_address must be a 0x-prefixed 40-hex-character address")
     data_path = Path(data_dir)
     data_path.mkdir(parents=True, exist_ok=True)
-    csv_path = data_path / f"hyperliquid_account_history_{wallet_address.lower()}.csv"
+    csv_path = data_path / f"hl_account_history_{wallet_address.lower()}.csv"
     saved = load_saved_history(csv_path)
     history = fetch_all_time_history(wallet_address) if saved.empty or refresh_full_history else []
     history_rows_added = 0

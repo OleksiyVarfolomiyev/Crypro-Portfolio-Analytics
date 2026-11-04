@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
-from hyperliquid_trade_analytics import expected_forward_return
+from hl_trade_analytics import expected_forward_return
 from crypto_portfolio_risk import calculate_portfolio_risk_metrics
 from IPython.display import display
 

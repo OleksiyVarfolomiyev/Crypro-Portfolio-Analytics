@@ -10,10 +10,26 @@ import numpy as np
 import pandas as pd
 from unittest.mock import MagicMock, patch
 
-from hyperliquid_backtest import BacktestSettings, backtest_signal
-from hyperliquid_trade_analytics import (
+# Modules live in the repository root and its execution/ and research/ folders.
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT), str(ROOT / "execution"), str(ROOT / "research")]
+
+from hl_backtest import BacktestSettings, backtest_signal
+from hl_highlights import build_highlights, make_state, position_changes
+from hl_market_research import (
+    CHANGE,
+    FUNDING,
+    OPEN_INTEREST,
+    VOLUME,
+    fetch_perp_markets,
+    rank_markets,
+    select_view,
+    trending_markets,
+)
+from hl_trade_analytics import (
     adverse_funding_cost_per_unit,
     add_expected_pnl_columns,
+    implied_unrealized_history,
     apply_fill_fees,
     consolidate_current_funding,
     drop_inactive_weeks,
@@ -33,7 +49,7 @@ from hyperliquid_trade_analytics import (
     visible_month_starts,
     wilder_atr,
 )
-from hyperliquid_trade_execution import (
+from hl_trade_execution import (
     AccountSnapshot,
     Market,
     Position,
@@ -87,7 +103,7 @@ def load_account_implementation():
         if importlib.util.find_spec(name.split(".")[0]) is None
     }
     with patch.dict(sys.modules, stubs):
-        return importlib.import_module("hyperliquid_account_analytics_implementation")
+        return importlib.import_module("hl_account_analytics_implementation")
 
 
 class RealizedPnlTests(unittest.TestCase):
@@ -339,8 +355,8 @@ class TradeAnalyticsTests(unittest.TestCase):
         )
         successful = unittest.mock.Mock(status_code=200, ok=True, json=lambda: {"ok": True})
         with (
-            patch("hyperliquid_trade_analytics.requests.post", side_effect=[rate_limited, successful]),
-            patch("hyperliquid_trade_analytics.time.sleep") as sleep,
+            patch("hl_trade_analytics.requests.post", side_effect=[rate_limited, successful]),
+            patch("hl_trade_analytics.time.sleep") as sleep,
         ):
             self.assertEqual(post_info({"type": "meta"}), {"ok": True})
         sleep.assert_called_once_with(3.0)
@@ -348,8 +364,8 @@ class TradeAnalyticsTests(unittest.TestCase):
     def test_info_request_reports_rate_limit_after_retry_limit(self):
         rate_limited = unittest.mock.Mock(status_code=429, ok=False, headers={})
         with (
-            patch("hyperliquid_trade_analytics.requests.post", return_value=rate_limited),
-            patch("hyperliquid_trade_analytics.time.sleep"),
+            patch("hl_trade_analytics.requests.post", return_value=rate_limited),
+            patch("hl_trade_analytics.time.sleep"),
             self.assertRaisesRegex(RuntimeError, r"HTTP 429"),
         ):
             post_info({"type": "meta"})
@@ -387,7 +403,7 @@ class TradeAnalyticsTests(unittest.TestCase):
             [{"t": candle_time, "o": "100", "h": "102", "l": "99", "c": "101"}],
             [{"time": funding_time, "fundingRate": "0.0001"}],
         ]
-        with patch("hyperliquid_trade_analytics.post_info", side_effect=responses) as post:
+        with patch("hl_trade_analytics.post_info", side_effect=responses) as post:
             fetch_daily_candles("AAPL", dex="xyz")
             fetch_funding_history("AAPL", dex="xyz")
         self.assertEqual(post.call_args_list[0].args[0]["req"]["coin"], "xyz:AAPL")
@@ -415,14 +431,111 @@ class TradeAnalyticsTests(unittest.TestCase):
             "Oracle": 100.0,
         }
         with (
-            patch("hyperliquid_trade_analytics.fetch_daily_candles", return_value=make_candles()),
-            patch("hyperliquid_trade_analytics.fetch_funding_history", return_value=make_funding(rate=-0.00001)),
+            patch("hl_trade_analytics.fetch_daily_candles", return_value=make_candles()),
+            patch("hl_trade_analytics.fetch_funding_history", return_value=make_funding(rate=-0.00001)),
         ):
             enriched, warnings = add_expected_pnl_columns([row])
         self.assertFalse(warnings)
         self.assertIn("Expected Price PnL (5d)", enriched[0])
         self.assertIn("Expected Funding PnL (5d)", enriched[0])
         self.assertIn("Expected PnL incl. funding (5d)", enriched[0])
+        notional = abs(float(row["Sz"])) * float(row["Mark"])
+        self.assertAlmostEqual(
+            enriched[0]["Expected Price Return (5d)"],
+            enriched[0]["Expected Price PnL (5d)"] / notional * 100.0,
+        )
+        self.assertAlmostEqual(
+            enriched[0]["Expected Funding Return (5d)"],
+            enriched[0]["Expected Funding PnL (5d)"] / notional * 100.0,
+        )
+
+    def test_implied_unrealized_subtracts_realized_up_to_each_day(self):
+        pnl = pd.DataFrame({
+            "ts": pd.to_datetime(["2026-01-01 12:00", "2026-01-02 06:00", "2026-01-02 18:00"], utc=True),
+            "pnl": [10.0, 40.0, 30.0],
+        })
+        fills = pd.DataFrame({"ts": pd.to_datetime(["2026-01-01 13:00"], utc=True), "closedPnl": [25.0]})
+        funding = pd.DataFrame({"ts": pd.to_datetime(["2026-01-02 01:00"], utc=True), "fundingPnl": [-5.0]})
+        implied = implied_unrealized_history(pnl, fills, funding)
+        self.assertEqual(implied.tolist(), [10.0, 10.0])
+        mixed_precision = pnl.assign(ts=pnl["ts"].astype("datetime64[ms, UTC]"))
+        self.assertEqual(
+            implied_unrealized_history(mixed_precision, fills, funding).tolist(), [10.0, 10.0]
+        )
+
+    def test_market_research_matches_app_formulas_and_tabs(self):
+        def context(mid, previous="100", volume="1000"):
+            return {"midPx": mid, "prevDayPx": previous, "markPx": "110", "funding": "0.0001",
+                    "openInterest": "2", "dayNtlVlm": volume}
+        responses = {
+            "perpCategories": [["xyz:GOLD", "Commodities"], ["xyz:BTC", "crypto"]],
+            "perpDexs": [None, {"name": "xyz"}],
+        }
+        metas = {
+            "": ([{"name": "BTC"}, {"name": "OLD", "isDelisted": True}, {"name": "NOPX"}],
+                 [context("110"), context("1"), context(None)]),
+            "xyz": ([{"name": "xyz:GOLD"}, {"name": "xyz:BTC"}], [context("90"), context("95")]),
+        }
+        def post(payload):
+            if payload["type"] == "metaAndAssetCtxs":
+                meta, contexts = metas[payload["dex"]]
+                return [{"universe": meta}, contexts]
+            return responses[payload["type"]]
+        with patch("hl_market_research.post_info", side_effect=post):
+            markets = fetch_perp_markets()
+        btc = markets.set_index("Ticker").loc["BTC"]
+        self.assertAlmostEqual(btc[CHANGE], 10.0)
+        self.assertAlmostEqual(btc[FUNDING], 0.08)
+        self.assertAlmostEqual(btc[OPEN_INTEREST], 220.0)
+        self.assertEqual(select_view(markets, "crypto")["Ticker"].tolist(), ["BTC", "NOPX"])
+        self.assertEqual(select_view(markets, "hip3")["Ticker"].tolist(), ["xyz:GOLD", "xyz:BTC"])
+        self.assertEqual(select_view(markets, "tradfi")["Ticker"].tolist(), ["xyz:GOLD"])
+        self.assertEqual(rank_markets(markets, CHANGE, top=False)["Ticker"].tolist()[0], "xyz:GOLD")
+        self.assertNotIn("NOPX", rank_markets(markets, CHANGE, top=True)["Ticker"].tolist())
+
+    def test_trending_lists_biggest_loser_and_three_gainers_above_volume_floor(self):
+        markets = pd.DataFrame({
+            "Ticker": ["A", "B", "C", "D", "E", "THIN"],
+            CHANGE: [-9.0, -1.0, 1.0, 2.0, 3.0, 50.0],
+            VOLUME: [4e7, 4e7, 4e7, 4e7, 4e7, 2e7],
+        })
+        self.assertEqual(trending_markets(markets)["Ticker"].tolist(), ["E", "D", "C", "A"])
+
+    def test_highlights_split_good_news_from_items_needing_attention(self):
+        now = pd.Timestamp("2026-01-10 12:00", tz="UTC")
+        def position(coin, size, upnl, liquidation=80.0):
+            return {"Wallet": "w", "Coin": coin, "Side": "SHORT", "Sz": size, "uPnL": upnl, "Liq %": liquidation}
+        baseline = make_state(now - pd.Timedelta(hours=2), 100.0,
+                              [position("KEEP", -10, 5.0), position("GONE", -3, 1.0), position("CUT", -9, 2.0)])
+        positions = [position("KEEP", -10, 9.0, 20.0), position("CUT", -3, -4.0), position("NEW", -1, 0.0)]
+        fills = pd.DataFrame({
+            "ts": [now - pd.Timedelta(hours=1), now - pd.Timedelta(hours=1), now - pd.Timedelta(hours=1),
+                   now - pd.Timedelta(hours=30)],
+            "coin": ["GONE", "CUT", "NEW", "OLD"],
+            "closedPnl": [8.0, -3.0, -0.1, 50.0],
+            "grossPnl": [8.5, -2.5, 0.0, 50.5],
+        })
+        funding = pd.DataFrame({"ts": [now - pd.Timedelta(hours=1)], "fundingPnl": [-2.0]})
+        well, attention = build_highlights(
+            now, baseline, positions, fills, funding, 90.0, 12.0, 1000.0, 700.0, 600.0, 5.0, 100.0, ["NEW (w)"],
+        )
+        updates = lambda rows, window: {row["Update"] for row in rows if row["Window"] == window}
+        self.assertEqual(updates(well, "Last 24h"), {"PnL including open positions", "Closed at a profit"})
+        self.assertIn("Closed at a loss", updates(attention, "Since last run"))
+        self.assertIn("PnL including open positions", updates(attention, "Since last run"))
+        self.assertIn("Funding paid", updates(attention, "Last 24h"))
+        self.assertIn("Biggest open-position gains", updates(well, "Since last run"))
+        self.assertIn("Biggest open-position losses", updates(attention, "Since last run"))
+        self.assertEqual(updates(attention, "Now"), {
+            "Aggregate risk over cap", "Positions missing full stop coverage",
+            "Available margin low", "Within 25% of liquidation",
+        })
+        self.assertFalse(any("NEW" in row["Detail"] for row in attention if row["Update"] == "Closed at a loss"))
+        self.assertFalse(any("OLD" in row["Detail"] for row in well if row["Window"] == "Since last run"))
+        changes = position_changes(baseline, positions)
+        self.assertEqual(changes["Opened"], ["NEW short (w)"])
+        self.assertEqual(changes["Closed"], ["GONE short (w)"])
+        self.assertEqual(changes["Resized"], ["CUT short (w)"])
 
     def test_size_respects_zero_risk_headroom_and_hip3_leverage_cap(self):
         candles = make_candles()
@@ -456,7 +569,7 @@ class TradeAnalyticsTests(unittest.TestCase):
                 [{"px": "102", "sz": "5", "n": 1}],
             ]
         }
-        with patch("hyperliquid_trade_execution.post_info", return_value=book):
+        with patch("hl_trade_execution.post_info", return_value=book):
             buy_price = post_only_price("BTC", "", "LONG", 3)
             sell_price = post_only_price("BTC", "", "SHORT", 3)
         self.assertLess(buy_price, 102)
@@ -630,7 +743,7 @@ class TradeAnalyticsTests(unittest.TestCase):
         ]
         plan = SimpleNamespace(coin="USUAL", dex="", side="SHORT", quantity=21449.7)
         market = Market("USUAL", "", 0.01, 0.01, 1, 3)
-        module = "hyperliquid_trade_execution"
+        module = "hl_trade_execution"
         with patch(f"{module}.post_only_price", return_value=0.01), \
                 patch(f"{module}.time.sleep"), \
                 patch(f"{module}._order_status", side_effect=statuses):
@@ -657,7 +770,7 @@ class TradeAnalyticsTests(unittest.TestCase):
 
     def test_entry_chase_does_not_replace_order_when_cancel_is_unconfirmed(self):
         status = self._order_status_response
-        exchange, (quantity, _) = self._run_entry([status("open", 21449.7, 16992.5)] * 6)
+        exchange, (quantity, _) = self._run_entry([status("open", 21449.7, 16992.5)] * 31)
 
         self.assertEqual(exchange.order.call_count, 1)
         self.assertAlmostEqual(quantity, 4457.2)
@@ -692,7 +805,7 @@ class TradeAnalyticsTests(unittest.TestCase):
             {"universe": [{"name": "xyz:AAPL", "szDecimals": 2, "maxLeverage": 3}]},
             [{"markPx": "100", "oraclePx": "99"}],
         ]
-        with patch("hyperliquid_trade_execution.post_info", return_value=response):
+        with patch("hl_trade_execution.post_info", return_value=response):
             markets = fetch_markets(["xyz"])
         self.assertIn("xyz:AAPL", markets)
         self.assertEqual(markets["xyz:AAPL"].dex, "xyz")
@@ -705,8 +818,8 @@ class TradeAnalyticsTests(unittest.TestCase):
         responses = [[default_order], [xyz_order]]
 
         with (
-            patch("hyperliquid_trade_execution.get_dexes", return_value=["", "xyz"]),
-            patch("hyperliquid_trade_execution.post_info", side_effect=responses) as post_info_mock,
+            patch("hl_trade_execution.get_dexes", return_value=["", "xyz"]),
+            patch("hl_trade_execution.post_info", side_effect=responses) as post_info_mock,
         ):
             orders = fetch_open_orders(wallet)
 
@@ -818,11 +931,11 @@ class TradeAnalyticsTests(unittest.TestCase):
         )
         with (
             patch(
-                "hyperliquid_trade_execution.fetch_daily_candles",
+                "hl_trade_execution.fetch_daily_candles",
                 side_effect=[make_candles(), ValueError("ATR(14) requires more history")],
             ),
             patch(
-                "hyperliquid_trade_execution.fetch_funding_history",
+                "hl_trade_execution.fetch_funding_history",
                 return_value=make_funding(),
             ),
         ):
@@ -916,9 +1029,9 @@ class TradeAnalyticsTests(unittest.TestCase):
             ]
         }
         with (
-            patch("hyperliquid_trade_execution.fetch_user_state", return_value=state),
-            patch("hyperliquid_trade_execution.parse_fee_rates", return_value=(0.0001, 0.0004)),
-            patch("hyperliquid_trade_analytics.post_info", side_effect=[abstraction, balances]),
+            patch("hl_trade_execution.fetch_user_state", return_value=state),
+            patch("hl_trade_execution.parse_fee_rates", return_value=(0.0001, 0.0004)),
+            patch("hl_trade_analytics.post_info", side_effect=[abstraction, balances]),
         ):
             return collect_snapshot([wallet], [""], {})
 
@@ -935,7 +1048,7 @@ class TradeAnalyticsTests(unittest.TestCase):
 
     def test_unified_account_rejects_invalid_usdc_balance(self):
         responses = ["unifiedAccount", {"balances": [{"coin": "USDC", "total": "bad"}]}]
-        with patch("hyperliquid_trade_analytics.post_info", side_effect=responses):
+        with patch("hl_trade_analytics.post_info", side_effect=responses):
             with self.assertRaises(ValueError):
                 fetch_collateral_equity("0x" + "1" * 40, 400)
 
@@ -953,8 +1066,8 @@ class TradeAnalyticsTests(unittest.TestCase):
         )
         action = PositionAction("open_target", "BTC", "", "LONG")
         with (
-            patch("hyperliquid_trade_execution.fetch_daily_candles", return_value=make_candles()),
-            patch("hyperliquid_trade_execution.fetch_funding_history", return_value=make_funding()),
+            patch("hl_trade_execution.fetch_daily_candles", return_value=make_candles()),
+            patch("hl_trade_execution.fetch_funding_history", return_value=make_funding()),
         ):
             [plan] = plan_position_actions([action], {"BTC": market}, snapshot, [])
         self.assertFalse(plan.block_reason)
@@ -989,13 +1102,13 @@ class TradeAnalyticsTests(unittest.TestCase):
         action = PositionAction("target", "BTC", "", "")
         add_action = PositionAction("adjust_margin", "BTC", "", "", margin_usd=1)
         with (
-            patch("hyperliquid_trade_execution.fetch_daily_candles", return_value=make_candles()),
-            patch("hyperliquid_trade_execution.fetch_funding_history", return_value=make_funding()),
+            patch("hl_trade_execution.fetch_daily_candles", return_value=make_candles()),
+            patch("hl_trade_execution.fetch_funding_history", return_value=make_funding()),
         ):
             [plan] = plan_position_actions([action], {"BTC": market}, snapshot, [])
         with (
-            patch("hyperliquid_trade_execution.fetch_daily_candles", return_value=make_candles()),
-            patch("hyperliquid_trade_execution.fetch_funding_history", return_value=make_funding()),
+            patch("hl_trade_execution.fetch_daily_candles", return_value=make_candles()),
+            patch("hl_trade_execution.fetch_funding_history", return_value=make_funding()),
         ):
             [add_plan] = plan_position_actions([add_action], {"BTC": market}, snapshot, [])
         self.assertFalse(plan.block_reason)
@@ -1030,8 +1143,8 @@ class TradeAnalyticsTests(unittest.TestCase):
         )
         action = PositionAction("adjust_margin", "BTC", "", "", margin_usd=-100)
         with (
-            patch("hyperliquid_trade_execution.fetch_daily_candles", return_value=make_candles()),
-            patch("hyperliquid_trade_execution.fetch_funding_history", return_value=make_funding()),
+            patch("hl_trade_execution.fetch_daily_candles", return_value=make_candles()),
+            patch("hl_trade_execution.fetch_funding_history", return_value=make_funding()),
         ):
             [plan] = plan_position_actions([action], {"BTC": market}, snapshot, [])
         self.assertFalse(plan.block_reason)
@@ -1068,8 +1181,8 @@ class TradeAnalyticsTests(unittest.TestCase):
         )
         action = PositionAction("close", "BTC", "", "")
         with (
-            patch("hyperliquid_trade_execution.fetch_daily_candles", return_value=make_candles()),
-            patch("hyperliquid_trade_execution.fetch_funding_history", return_value=make_funding()),
+            patch("hl_trade_execution.fetch_daily_candles", return_value=make_candles()),
+            patch("hl_trade_execution.fetch_funding_history", return_value=make_funding()),
         ):
             [plan] = plan_position_actions([action], {"BTC": market}, snapshot, [])
         self.assertIn("no open position", plan.block_reason)

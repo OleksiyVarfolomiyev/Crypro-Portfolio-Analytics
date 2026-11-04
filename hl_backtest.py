@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from hyperliquid_trade_analytics import (
+from hl_trade_analytics import (
     DEFAULT_HORIZON_DAYS,
     adverse_funding_cost_per_unit,
     fetch_daily_candles,
