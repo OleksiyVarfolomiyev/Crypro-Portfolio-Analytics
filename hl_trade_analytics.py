@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import json
 import math
+import os
+from pathlib import Path
 import time
 from typing import Any
 
@@ -17,6 +20,10 @@ INFO_URL = "https://api.hyperliquid.xyz/info"
 MAX_RATE_LIMIT_RETRIES = 4
 DEFAULT_HORIZON_DAYS = 5
 FUNDING_INTERVAL_HOURS = 1
+# Completed candles and past funding never change, so each is downloaded only once.
+CACHE_DIR = None if os.environ.get("HL_DISABLE_CACHE") else Path(__file__).resolve().parent / "data" / "api_cache"
+# A full 500-row funding page costs about 45 of the API's 1,200 weight per minute.
+FULL_PAGE_PAUSE_SECONDS = 2.5
 FUNDING_TIMESTAMP_TOLERANCE = pd.Timedelta(seconds=2)
 
 
@@ -84,6 +91,57 @@ def normalize_market_symbol(coin: str, dex: str = "") -> tuple[str, str]:
     return (f"{dex}:{coin}" if dex else coin), dex
 
 
+def read_cache_json(name: str) -> Any:
+    """Return a cached JSON document, or ``None`` when absent, unreadable, or disabled."""
+    if CACHE_DIR is None:
+        return None
+    try:
+        return json.loads((CACHE_DIR / name).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def write_cache_json(name: str, document: Any) -> None:
+    """Replace a cached JSON document in one step, so a crash can't leave a partial file."""
+    if CACHE_DIR is None:
+        return
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = CACHE_DIR / f"{name}.tmp"
+    temporary.write_text(json.dumps(document))
+    temporary.replace(CACHE_DIR / name)
+
+
+def _read_market_cache(name: str) -> tuple[pd.DataFrame, pd.Timestamp] | None:
+    """Return cached rows and the earliest date they are known to cover."""
+    document = read_cache_json(name)
+    if not isinstance(document, dict) or "covered_from" not in document or "rows" not in document:
+        return None
+    rows = pd.DataFrame(document["rows"])
+    if not rows.empty:
+        rows["time"] = pd.to_datetime(rows["time"], unit="ms", utc=True)
+    return rows, pd.Timestamp(document["covered_from"])
+
+
+def _write_market_cache(name: str, rows: pd.DataFrame, covered_from: pd.Timestamp) -> None:
+    stored = rows.copy()
+    if not stored.empty:
+        stored["time"] = stored["time"].astype("datetime64[ms, UTC]").astype("int64")
+    write_cache_json(name, {"covered_from": covered_from.isoformat(), "rows": stored.to_dict("records")})
+
+
+def _cache_name(kind: str, market_coin: str, dex: str) -> str:
+    return f"{kind}_{dex or 'main'}_{market_coin.replace(':', '_')}.json"
+
+
+def _merge_rows(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Combine downloaded and cached rows by time, keeping the newest copy of each."""
+    frames = [frame for frame in frames if not frame.empty]
+    if not frames:
+        return pd.DataFrame()
+    merged = pd.concat(frames, ignore_index=True)
+    return merged.sort_values("time").drop_duplicates("time", keep="last").reset_index(drop=True)
+
+
 def fetch_daily_candles(
     coin: str,
     dex: str = "",
@@ -94,6 +152,7 @@ def fetch_daily_candles(
 
     The returned frame has UTC ``time`` values and ``open``, ``high``, ``low``,
     and ``close`` columns. The still-forming current daily candle is excluded.
+    Candles already saved locally are not downloaded again.
     """
     if not coin or lookback_days <= 0:
         raise ValueError("coin must be non-empty and lookback_days must be positive.")
@@ -103,6 +162,39 @@ def fetch_daily_candles(
     end = end.tz_convert("UTC")
     start = end - pd.Timedelta(days=lookback_days)
     market_coin, dex = normalize_market_symbol(coin, dex)
+    if CACHE_DIR is None or end_time is not None:
+        return _download_daily_candles(coin, market_coin, dex, start, end)
+    name = _cache_name("candles", market_coin, dex)
+    cached = _read_market_cache(name)
+    if cached is None or cached[0].empty:
+        rows, covered_from = _download_daily_candles(coin, market_coin, dex, start, end), start
+    else:
+        rows, covered_from = cached
+        frames = [rows]
+        if start < covered_from:
+            frames.append(_download_daily_candles(coin, market_coin, dex, start, covered_from, allow_empty=True))
+            covered_from = start
+        # The last completed candle is yesterday's; anything older means new candles exist.
+        if rows["time"].max() < end.normalize() - pd.Timedelta(days=1):
+            frames.append(_download_daily_candles(coin, market_coin, dex, rows["time"].max(), end, allow_empty=True))
+        rows = _merge_rows(frames)
+    _write_market_cache(name, rows, covered_from)
+    window = rows.loc[(rows["time"] >= start.floor("D")) & (rows["time"] < end.normalize())].reset_index(drop=True)
+    if window.empty:
+        raise ValueError(f"No completed daily OHLC candles are available for {coin}.")
+    return window
+
+
+def _download_daily_candles(
+    coin: str,
+    market_coin: str,
+    dex: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    allow_empty: bool = False,
+) -> pd.DataFrame:
+    """Download completed daily candles for one time range."""
+    columns = ["time", "open", "high", "low", "close"]
     payload: dict[str, Any] = {
         "type": "candleSnapshot",
         "req": {
@@ -119,6 +211,8 @@ def fetch_daily_candles(
         raise ValueError(f"Hyperliquid returned invalid daily candles for {coin}.")
     frame = pd.DataFrame(response)
     required = {"t", "o", "h", "l", "c"}
+    if frame.empty and allow_empty:
+        return pd.DataFrame(columns=columns)
     if frame.empty or not required.issubset(frame.columns):
         raise ValueError(f"No usable daily OHLC candles were returned for {coin}.")
     frame["time"] = pd.to_datetime(pd.to_numeric(frame["t"], errors="coerce"), unit="ms", utc=True)
@@ -128,9 +222,9 @@ def fetch_daily_candles(
     frame = frame.loc[frame["time"] < end.normalize()].copy()
     frame = frame.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close"})
     frame = frame.sort_values("time").drop_duplicates("time", keep="last").reset_index(drop=True)
-    if frame.empty:
+    if frame.empty and not allow_empty:
         raise ValueError(f"No completed daily OHLC candles are available for {coin}.")
-    return frame[["time", "open", "high", "low", "close"]]
+    return frame[columns]
 
 
 def fetch_mark_and_oracle(coin: str, dex: str = "") -> tuple[float, float]:
@@ -175,7 +269,8 @@ def fetch_funding_history(
 
     Results are paginated as needed and returned in ascending time order with
     UTC ``time`` and numeric ``fundingRate`` columns. An empty result is
-    returned only when ``allow_empty`` is true.
+    returned only when ``allow_empty`` is true. Hours already saved locally are
+    not downloaded again, and nothing is requested until the next hourly payment.
     """
     if not coin or lookback_days <= 0:
         raise ValueError("coin must be non-empty and lookback_days must be positive.")
@@ -195,6 +290,39 @@ def fetch_funding_history(
         raise ValueError("Funding-history start_time must precede end_time.")
 
     market_coin, dex = normalize_market_symbol(coin, dex)
+    if CACHE_DIR is None or end_time is not None:
+        rows = _download_funding(coin, market_coin, dex, start, end)
+    else:
+        name = _cache_name("funding", market_coin, dex)
+        cached = _read_market_cache(name)
+        if cached is None:
+            rows, covered_from = _download_funding(coin, market_coin, dex, start, end), start
+        else:
+            rows, covered_from = cached
+            frames = [rows]
+            if start < covered_from:
+                frames.append(_download_funding(coin, market_coin, dex, start, covered_from))
+                covered_from = start
+            if rows.empty:
+                frames.append(_download_funding(coin, market_coin, dex, covered_from, end))
+            elif end - rows["time"].max() >= pd.Timedelta(hours=FUNDING_INTERVAL_HOURS):
+                frames.append(_download_funding(
+                    coin, market_coin, dex, rows["time"].max() + pd.Timedelta(milliseconds=1), end
+                ))
+            rows = _merge_rows(frames)
+        _write_market_cache(name, rows, covered_from)
+        rows = rows.loc[rows["time"] >= start].reset_index(drop=True) if not rows.empty else rows
+    if rows.empty and allow_empty:
+        return pd.DataFrame(columns=["time", "fundingRate"])
+    if rows.empty:
+        raise ValueError(f"No usable hourly funding history was returned for {coin}.")
+    return rows
+
+
+def _download_funding(
+    coin: str, market_coin: str, dex: str, start: pd.Timestamp, end: pd.Timestamp
+) -> pd.DataFrame:
+    """Download hourly funding for one time range, returning an empty frame when there is none."""
     cursor_ms = int(start.timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
     rows: list[dict[str, Any]] = []
@@ -222,11 +350,12 @@ def fetch_funding_history(
         cursor_ms = next_cursor
         if len(batch) < 500:
             break
+        time.sleep(FULL_PAGE_PAUSE_SECONDS)
 
     frame = pd.DataFrame(rows)
-    if frame.empty and allow_empty:
+    if frame.empty:
         return pd.DataFrame(columns=["time", "fundingRate"])
-    if frame.empty or not {"time", "fundingRate"}.issubset(frame.columns):
+    if not {"time", "fundingRate"}.issubset(frame.columns):
         raise ValueError(f"No usable hourly funding history was returned for {coin}.")
     frame["time"] = pd.to_datetime(pd.to_numeric(frame["time"], errors="coerce"), unit="ms", utc=True)
     frame["fundingRate"] = pd.to_numeric(frame["fundingRate"], errors="coerce")

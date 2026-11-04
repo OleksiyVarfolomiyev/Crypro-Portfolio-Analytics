@@ -1,6 +1,6 @@
 """Crypto Portfolio Analytics implementation.
 
-Implementation for the matching report calls in `crypto_portfolio_analytics.ipynb`. Run
+Implementation for the matching report calls in `portfolio_analytics.ipynb`. Run
 the dashboard notebook to execute these methods in order.
 """
 
@@ -13,8 +13,17 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
-from hl_trade_analytics import expected_forward_return
-from crypto_portfolio_risk import calculate_portfolio_risk_metrics
+from hl_trade_analytics import expected_forward_return, fetch_funding_history, post_info
+from factor_model import (
+    alpha_verdict,
+    btc_momentum_factor,
+    btc_realized_vol,
+    fit_factor_regression,
+    independent_factors,
+    split_in_half,
+)
+from portfolio_risk import calculate_portfolio_risk_metrics
+from hl_market_research import asset_class
 from IPython.display import display
 
 
@@ -243,8 +252,8 @@ class _MarketDataMixin:
 
         data_dir = self.data_dir
         data_dir.mkdir(parents=True, exist_ok=True)
-        price_file = data_dir / 'crypto_daily_prices_usd.csv'
-        market_file = data_dir / 'crypto_market_data.csv'
+        price_file = data_dir / 'daily_prices_usd.csv'
+        market_file = data_dir / 'market_data.csv'
         coin_ids.setdefault(self.benchmark, 'bitcoin')
         requested_assets = list(dict.fromkeys(
             [ticker for ticker in self.assets if ticker in coin_ids] + [self.benchmark]
@@ -327,11 +336,14 @@ class _MarketDataMixin:
         for ticker, dex in self.perp_asset_dex.items():
             if ticker not in self.assets:
                 continue
+            # Saved closes stay valid, so only request days from the last saved one onward.
+            saved=pd.to_numeric(prices[ticker],errors='coerce').dropna() if ticker in prices else pd.Series(dtype=float)
+            candle_start=saved.index.max()-pd.Timedelta(days=1) if not saved.empty else public_earliest
             payload = {
                 'type':'candleSnapshot',
                 'req':{
                     'coin':ticker,'interval':'1d',
-                    'startTime':int(public_earliest.timestamp()*1000),
+                    'startTime':int(candle_start.timestamp()*1000),
                     'endTime':int(end_date.timestamp()*1000),
                 },
             }
@@ -423,7 +435,7 @@ class _MarketDataMixin:
 
 class _PriceHistoryMixin(_TableStyleMixin):
     def load_price_history(self):
-        price_file=self.data_dir/'crypto_daily_prices_usd.csv'
+        price_file=self.data_dir/'daily_prices_usd.csv'
         if not price_file.exists():
             raise FileNotFoundError(f'Missing saved price file: {price_file.resolve()}')
         if not self.assets:
@@ -467,18 +479,29 @@ class _ReturnAnalysisMixin(_TableStyleMixin):
 
 class _CorrelationPlotMixin(_TableStyleMixin):
     def plot_correlations(self):
-        corr=self.correlation
-        fig=go.Figure(go.Heatmap(
-            z=corr.to_numpy(),x=corr.columns.tolist(),y=corr.index.tolist(),
-            zmin=-1,zmax=1,colorscale='RdBu',reversescale=True,
-            text=np.round(corr.to_numpy(),2),texttemplate='%{text:.2f}',
-            hovertemplate='%{y} vs %{x}: %{z:.3f}<extra></extra>',
-            showscale=False,
-        ))
-        fig.update_layout(title='Daily return correlations',template='plotly_white',
-                          width=850,height=700)
-        fig.update_yaxes(autorange='reversed')
-        fig.show()
+        categories=dict(post_info({'type':'perpCategories'}))
+        groups={'Crypto':[],'Tradfi':[],'HIP-3':[]}
+        for ticker in self.assets:
+            groups[asset_class(self.perp_asset_dex.get(ticker),categories.get(ticker))].append(ticker)
+        for name,tickers in groups.items():
+            if len(tickers)<2:
+                print(f'{name} correlations need at least two assets; held: {", ".join(tickers) or "none"}.')
+                continue
+            # Each group uses its own shared dates, so short histories elsewhere don't shrink it.
+            sample=self.returns[tickers].dropna()
+            corr=sample.corr(method='pearson')
+            size=min(800,max(350,70*len(tickers)+150))
+            fig=go.Figure(go.Heatmap(
+                z=corr.to_numpy(),x=corr.columns.tolist(),y=corr.index.tolist(),
+                zmin=-1,zmax=1,colorscale='RdBu',reversescale=True,
+                text=np.round(corr.to_numpy(),2),texttemplate='%{text:.2f}',
+                hovertemplate='%{y} vs %{x}: %{z:.3f}<extra></extra>',
+                showscale=False,
+            ))
+            fig.update_layout(title=f'{name} daily return correlations ({len(sample)} days)',
+                              template='plotly_white',width=size+100,height=size)
+            fig.update_yaxes(autorange='reversed')
+            fig.show()
 
 
 # ----------------------------------------------------------------------------
@@ -741,12 +764,13 @@ class _PerformanceMixin(_TableStyleMixin):
 
 
 # ----------------------------------------------------------------------------
-# CoinGecko factor model
+# Factor model
 # ----------------------------------------------------------------------------
 #
-# Dashboard call: `analysis.fit_factor_model()`. Fit excess returns against BTC and
-# available CoinGecko cross-sectional factors; Hyperliquid-only assets remain in the modeled
-# portfolio but are excluded from factors that require CoinGecko market-cap or volume
+# Dashboard calls: `analysis.fit_factor_model()` and `analysis.test_alpha_out_of_sample()`.
+# Fit excess returns against BTC, BTC momentum, BTC realized volatility, a Hyperliquid funding
+# spread, and available CoinGecko cross-sectional factors; Hyperliquid-only assets remain in the
+# modeled portfolio but are excluded from factors that require CoinGecko market-cap or volume
 # history.
 
 
@@ -773,9 +797,30 @@ def _normalize_daily_index(data):
     return normalized.groupby(level=0,sort=True).last()
 
 
+CORE_FACTORS=['BTC market excess','BTC momentum','BTC realized vol','Funding (low - high)']
+STATE_FACTORS=('BTC realized vol',)
+
+
 class _FactorModelMixin(_TableStyleMixin):
+    def _funding_signal(self):
+        """Return each held perp's lagged trailing 7-day average daily funding."""
+        start=self.common_returns.index.min()-pd.Timedelta(days=10)
+        daily={}
+        for ticker in self.assets:
+            if ticker not in self.perp_asset_dex:
+                continue
+            history=fetch_funding_history(
+                ticker.split(':')[-1],self.perp_asset_dex[ticker],start_time=start,allow_empty=True
+            )
+            if not history.empty:
+                daily[ticker]=history.set_index('time')['fundingRate'].resample('1D').sum()
+        daily=pd.DataFrame(daily)
+        signal=daily.rolling(7,min_periods=3).mean().shift(1)
+        signal.index=pd.to_datetime(signal.index,utc=True).normalize()
+        return signal
+
     def fit_factor_model(self):
-        market_file=self.data_dir/'crypto_market_data.csv'
+        market_file=self.data_dir/'market_data.csv'
         if not market_file.exists():
             raise FileNotFoundError(f'Missing {market_file}. Run the CoinGecko refresh cell first.')
         market=pd.read_csv(market_file,parse_dates=['date'])
@@ -797,12 +842,26 @@ class _FactorModelMixin(_TableStyleMixin):
         alt_assets=[asset for asset in market_assets if asset!='BTC']
         factors=pd.DataFrame(index=self.common_returns.index)
         factors['BTC market excess']=self.common_returns['BTC']-self.risk_free_daily
+        btc_history=self.returns['BTC'].dropna()
+        factors['BTC momentum']=btc_momentum_factor(btc_history,self.risk_free_daily).reindex(factors.index)
+        factors['BTC realized vol']=btc_realized_vol(
+            btc_history,periods_per_year=self.trading_days_per_year
+        ).reindex(factors.index)
+        funding_signal=self._funding_signal()
+        funding_assets=list(funding_signal.columns)
+        # Price-only spread, matching the portfolio returns, which also exclude funding payments.
+        funding_spread=_long_short_factor(
+            funding_signal.reindex(_normalize_daily_index(self.common_returns).index),
+            _normalize_daily_index(self.common_returns)[funding_assets],long_low=True,
+        ) if len(funding_assets)>=4 else None
         if alt_assets:
             lagged_caps=market_caps[alt_assets].shift(1)
             alt_weights=lagged_caps.div(lagged_caps.sum(axis=1),axis=0)
             alt_return=(self.common_returns[alt_assets]*alt_weights).sum(axis=1,min_count=len(alt_assets))
             factors['Alt market - BTC']=alt_return-self.common_returns['BTC']
         factor_notes=[]
+        if funding_spread is None:
+            factor_notes.append(f'Funding factor omitted: {len(funding_assets)} perps have funding history; at least 4 are needed.')
         missing_market_assets=[asset for asset in self.assets if asset not in market_assets]
         if missing_market_assets:
             factor_notes.append(
@@ -828,17 +887,20 @@ class _FactorModelMixin(_TableStyleMixin):
             )
         factor_note=' '.join(factor_notes) or None
         factors=_normalize_daily_index(factors)
+        if funding_spread is not None:
+            factors['Funding (low - high)']=funding_spread
         portfolio_excess=_normalize_daily_index(
             (self.portfolio_daily_returns-self.risk_free_daily).rename('Portfolio excess')
         )
+        core_factors=[name for name in CORE_FACTORS if name in factors]
         model_data=pd.concat([portfolio_excess,factors],axis=1).replace([np.inf,-np.inf],np.nan).dropna()
-        if len(model_data)<60 and len(factors.columns)>1:
+        if len(model_data)<60 and len(factors.columns)>len(core_factors):
             full_factor_observations=len(model_data)
-            factors=factors[['BTC market excess']]
+            factors=factors[core_factors]
             model_data=pd.concat([portfolio_excess,factors],axis=1).replace([np.inf,-np.inf],np.nan).dropna()
             factor_notes.append(
-                f'Cross-sectional factor model had only {full_factor_observations} complete observations; '
-                'using the BTC-only model to retain the available portfolio history.'
+                f'CoinGecko cross-sectional factors left only {full_factor_observations} complete observations; '
+                'omitting them to retain the available portfolio history.'
             )
             factor_note=' '.join(factor_notes)
         if len(model_data)<30:
@@ -846,41 +908,31 @@ class _FactorModelMixin(_TableStyleMixin):
                 f'Factor model has only {len(model_data)} complete aligned daily observations; at least 30 are required.'
             )
         names=list(factors.columns)
-        y=model_data['Portfolio excess'].to_numpy(dtype=float)
-        X=np.column_stack([np.ones(len(model_data)),model_data[names].to_numpy(dtype=float)])
-        coefficients,_,rank,_=np.linalg.lstsq(X,y,rcond=None)
-        if rank<X.shape[1]:
-            raise ValueError('Factor model is rank-deficient; check factor correlations or history coverage.')
-        residuals=y-X@coefficients
-        r_squared=1.0-(residuals@residuals)/np.sum((y-y.mean())**2)
-        adjusted=1.0-(1.0-r_squared)*(len(y)-1)/(len(y)-X.shape[1])
-        scores=X*residuals[:,None]
-        meat=scores.T@scores
-        lags=min(7,len(y)-1)
-        for lag in range(1,lags+1):
-            weight=1.0-lag/(lags+1.0)
-            cross=scores[lag:].T@scores[:-lag]
-            meat+=weight*(cross+cross.T)
-        bread=np.linalg.pinv(X.T@X)
-        covariance=bread@meat@bread
-        standard_errors=np.sqrt(np.maximum(np.diag(covariance),0.0))
-        t_stats=np.divide(coefficients,standard_errors,out=np.full_like(coefficients,np.nan),where=standard_errors>0)
+        state_factors=tuple(name for name in names if name in STATE_FACTORS)
+        fit_result=fit_factor_regression(model_data['Portfolio excess'],model_data[names],state_factors)
+        annual_alpha=fit_result.alpha*self.trading_days_per_year
         annual_premiums=model_data[names].mean()*self.trading_days_per_year
-        annual_contributions=pd.Series(coefficients[1:],index=names)*annual_premiums
+        # A state factor is a condition, not a return, so it has no premium or contribution.
+        annual_premiums.loc[list(state_factors)]=np.nan
+        annual_contributions=fit_result.betas*annual_premiums
         summary=pd.DataFrame({
-            'Beta':coefficients[1:],'HAC t-stat':t_stats[1:],
+            'Beta':fit_result.betas,'HAC t-stat':fit_result.t_stats,
             'Factor premium (%/yr)':annual_premiums,
             'Portfolio contribution (%/yr)':annual_contributions,
         },index=names)
-        summary.loc['Alpha']=[np.nan,t_stats[0],np.nan,coefficients[0]*self.trading_days_per_year]
+        summary.loc['Alpha']=[np.nan,fit_result.alpha_t_stat,np.nan,annual_alpha]
         fit=pd.Series({
-            'Observations':len(model_data),'R-squared':r_squared,'Adjusted R-squared':adjusted,
-            'Annual alpha':coefficients[0]*self.trading_days_per_year,
-            'BTC beta (factor model)':coefficients[1],'BTC beta (single factor)':self.beta,
+            'Observations':fit_result.observations,'R-squared':fit_result.r_squared,
+            'Adjusted R-squared':fit_result.adjusted_r_squared,
+            'Annual alpha':annual_alpha,
+            'BTC beta (factor model)':fit_result.betas['BTC market excess'],'BTC beta (single factor)':self.beta,
         },name='Factor model fit')
-        print(f'Factor model: R²={r_squared:.1%} | adjusted R²={adjusted:.1%} | '
-              f'annual alpha={coefficients[0]*self.trading_days_per_year:.2%} | n={len(model_data)} days')
+        print(f'Factor model: R²={fit_result.r_squared:.1%} | adjusted R²={fit_result.adjusted_r_squared:.1%} | '
+              f'annual alpha={annual_alpha:.2%} | n={fit_result.observations} days')
         print(f'Single-factor BTC beta={self.beta:.3f} | factor-model BTC beta={summary.loc["BTC market excess","Beta"]:.3f}')
+        print('BTC realized vol beta is the daily return per one standard deviation of lagged 30-day volatility; '
+              'alpha is at average volatility. Funding (low - high) is long low-funding and short high-funding '
+              'held perps, by lagged 7-day average funding. Returns exclude funding payments and trading costs.')
         if factor_note:
             print(factor_note)
         self.show_table(summary,{
@@ -892,6 +944,63 @@ class _FactorModelMixin(_TableStyleMixin):
         self.factor_returns=factors
         self.factor_model_summary=summary
         self.factor_model_fit=fit
+        self.factor_model_dates=model_data.index
+
+    def _weighted_excess_returns(self,fit_dates):
+        """Fit Kelly weights on ``fit_dates`` only and return excess returns for every date."""
+        returns=_normalize_daily_index(self.common_returns)[self.assets]
+        weights=_optimize_full_kelly(
+            returns.loc[fit_dates].to_numpy(dtype=float),self.min_weight,self.max_weight,self.risk_free_daily
+        )
+        portfolio=returns.to_numpy(dtype=float)@weights+(1.0-weights.sum())*self.risk_free_daily
+        return pd.Series(portfolio-self.risk_free_daily,index=returns.index)
+
+    def test_alpha_out_of_sample(self):
+        factors=self.factor_returns
+        names=list(factors.columns)
+        state_factors=tuple(name for name in names if name in STATE_FACTORS)
+        dates=self.factor_model_dates
+        first,second=split_in_half(dates)
+        runs=[
+            ('In-sample','Full sample','Full sample',dates,dates),
+            ('In-sample','Full sample','First half',dates,first),
+            ('In-sample','Full sample','Second half',dates,second),
+            ('In-sample','First half','First half',first,first),
+            ('In-sample','Second half','Second half',second,second),
+            ('Out-of-sample','First half','Second half',first,second),
+            ('Out-of-sample','Second half','First half',second,first),
+        ]
+        rows=[]
+        for kind,fit_label,test_label,fit_dates,test_dates in runs:
+            usable=independent_factors(factors.loc[test_dates])
+            result=fit_factor_regression(
+                self._weighted_excess_returns(fit_dates).loc[test_dates],factors.loc[test_dates,usable],
+                tuple(name for name in state_factors if name in usable),
+            )
+            rows.append({
+                'Test':kind,'Weights fit on':fit_label,'Evaluated on':test_label,
+                'Days':result.observations,'Annual alpha':result.alpha*self.trading_days_per_year,
+                'Alpha t-stat':result.alpha_t_stat,'R-squared':result.r_squared,
+                **{f'{name} beta':result.betas.get(name,np.nan) for name in names},
+                'Factors dropped':', '.join(name for name in names if name not in usable),
+            })
+        table=pd.DataFrame(rows)
+        print(f'First half: {first.min():%Y-%m-%d} to {first.max():%Y-%m-%d} ({len(first)} days). '
+              f'Second half: {second.min():%Y-%m-%d} to {second.max():%Y-%m-%d} ({len(second)} days).')
+        print('Only the out-of-sample rows test the alpha: their weights never saw the dates they are '
+              'evaluated on. Every in-sample row reuses dates the weights were fit on.')
+        self.show_table(table.set_index(['Test','Weights fit on','Evaluated on']),{
+            'Annual alpha':'{:.2%}','Alpha t-stat':'{:.2f}','R-squared':'{:.1%}',
+            **{f'{name} beta':'{:.3f}' for name in names},
+        })
+        forward=table.iloc[-2]
+        print(f"Forward test (fit on first half, evaluated on second): alpha "
+              f"{alpha_verdict(forward['Annual alpha'],forward['Alpha t-stat'])}.")
+        print('A factor is dropped from a window when it duplicates another there, such as BTC momentum '
+              'when BTC stays on one side of its 30-day trend throughout.')
+        print(f'Each half has about {len(first)} days and {len(names)} factors, and the weights cover '
+              f'{len(self.assets)} assets, so treat these estimates as very noisy.')
+        self.alpha_split_results=table
 
 
 # ----------------------------------------------------------------------------
@@ -906,19 +1015,20 @@ class _OutputMixin:
     def save_outputs(self):
         data=self.data_dir
         data.mkdir(parents=True,exist_ok=True)
-        self.correlation.to_csv(data/'crypto_return_correlation.csv')
-        self.full_portfolio.to_csv(data/'crypto_kelly_full_weights.csv',header=True)
-        self.full_portfolio.to_csv(data/'crypto_kelly_weights.csv',header=True)
-        self.performance_metrics.to_csv(data/'crypto_portfolio_metrics.csv')
-        self.portfolio_daily_returns.to_csv(data/'crypto_portfolio_daily_returns.csv',header=True)
-        self.prices.to_csv(data/'crypto_daily_prices_usd.csv')
+        self.correlation.to_csv(data/'return_correlation.csv')
+        self.full_portfolio.to_csv(data/'kelly_full_weights.csv',header=True)
+        self.full_portfolio.to_csv(data/'kelly_weights.csv',header=True)
+        self.performance_metrics.to_csv(data/'portfolio_metrics.csv')
+        self.portfolio_daily_returns.to_csv(data/'portfolio_daily_returns.csv',header=True)
+        self.prices.to_csv(data/'daily_prices_usd.csv')
         self.market_data.sort_index().rename_axis('date').reset_index().to_csv(
-            data/'crypto_market_data.csv',index=False,date_format='%Y-%m-%dT%H:%M:%SZ'
+            data/'market_data.csv',index=False,date_format='%Y-%m-%dT%H:%M:%SZ'
         )
-        self.common_returns.to_csv(data/'crypto_daily_returns.csv')
-        self.factor_model_summary.to_csv(data/'crypto_portfolio_factor_model.csv')
-        self.factor_model_fit.to_csv(data/'crypto_portfolio_factor_fit.csv')
-        self.factor_returns.to_csv(data/'crypto_factor_returns.csv')
+        self.common_returns.to_csv(data/'daily_returns.csv')
+        self.factor_model_summary.to_csv(data/'portfolio_factor_model.csv')
+        self.factor_model_fit.to_csv(data/'portfolio_factor_fit.csv')
+        self.factor_returns.to_csv(data/'factor_returns.csv')
+        self.alpha_split_results.to_csv(data/'alpha_split_results.csv',index=False)
         print('Saved portfolio, factor, market, and return outputs to data/.')
 
 
@@ -926,11 +1036,11 @@ class _OutputMixin:
 # Analytics object
 # ----------------------------------------------------------------------------
 #
-# The report notebook creates one `CryptoPortfolioAnalytics` instance and calls the named
+# The report notebook creates one `PortfolioAnalytics` instance and calls the named
 # methods above.
 
 
-class CryptoPortfolioAnalytics(
+class PortfolioAnalytics(
     _MarketDataMixin, _PriceHistoryMixin, _ReturnAnalysisMixin, _CorrelationPlotMixin,
     _KellyMixin, _PerformanceMixin,
     _FactorModelMixin, _OutputMixin, _TableStyleMixin,

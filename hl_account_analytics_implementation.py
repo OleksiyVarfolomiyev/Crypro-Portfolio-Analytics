@@ -15,6 +15,8 @@ from hl_trade_analytics import (
     MAX_RATE_LIMIT_RETRIES,
     _rate_limit_delay,
     add_expected_pnl_columns,
+    read_cache_json,
+    write_cache_json,
     implied_unrealized_history,
     apply_fill_fees,
     drop_inactive_weeks,
@@ -315,6 +317,21 @@ def fetch_user_fills(user, max_pages=5):
 
 
 def fetch_user_funding(user, start_ms=0):
+    """Return signed USDC funding transfers, downloading only events not saved yet."""
+    name = f'user_funding_{user.lower()}.json'
+    events = read_cache_json(name) or []
+    now_ms = int(pd.Timestamp.now(tz='UTC').timestamp() * 1000)
+    latest = max((int(event['time']) for event in events), default=None)
+    # Funding is paid hourly, so nothing new can exist within an hour of the last payment.
+    if latest is None or now_ms - latest >= 3_600_000:
+        fresh = _download_user_funding(user, 0 if latest is None else latest + 1)
+        if fresh:
+            events = events + fresh
+            write_cache_json(name, events)
+    return [event for event in events if int(event['time']) >= int(start_ms)]
+
+
+def _download_user_funding(user, start_ms):
     'Fetch signed USDC funding transfers, paging ' \
         'through 500-event responses.'
     end_ms = int(pd.Timestamp.now(tz='UTC').timestamp() * 1000)
@@ -1079,10 +1096,10 @@ def current_position_fees(coin, current_size, fills, fills_complete, return_usd=
     return result('n/a (entry outside available fills)')
 
 
-def fetch_position_rows(user=None, fills=None, fills_complete=False):
+def fetch_position_rows(user=None, fills=None, fills_complete=False, states=None):
     'Return all open positions across the main ' \
         'perp DEX and HIP-3 DEXes.'
-    states = fetch_perp_states(user)
+    states = fetch_perp_states(user) if states is None else states
     positions = [(dex, item) for dex,
         state in states.items() for item in state.get('assetPositions', [])]
     market_contexts = fetch_market_contexts({dex for dex, _ in positions})
@@ -1827,7 +1844,8 @@ class _AnalyticsCore:
         if not self._positions_loaded:
             _, self.positions = fetch_position_rows(
                 self.wallet_address, data.realized_df,
-                    fills_complete=len(data.realized_fills) < 10000
+                    fills_complete=len(data.realized_fills) < 10000,
+                    states=data.current_states,
             )
             self._positions_loaded = True
         return self.positions

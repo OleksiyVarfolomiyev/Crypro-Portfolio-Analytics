@@ -1,5 +1,6 @@
 import importlib
 import importlib.util
+import os
 import sys
 import unittest
 from types import SimpleNamespace
@@ -10,13 +11,18 @@ import numpy as np
 import pandas as pd
 from unittest.mock import MagicMock, patch
 
+# Tests mock the API, so saved responses must not be read or written.
+os.environ["HL_DISABLE_CACHE"] = "1"
+
 # Modules live in the repository root and its execution/ and research/ folders.
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "execution"), str(ROOT / "research")]
 
+import hl_trade_analytics
 from hl_backtest import BacktestSettings, backtest_signal
 from hl_highlights import build_highlights, make_state, position_changes
 from hl_market_research import (
+    asset_class,
     CHANGE,
     FUNDING,
     OPEN_INTEREST,
@@ -536,6 +542,53 @@ class TradeAnalyticsTests(unittest.TestCase):
         self.assertEqual(changes["Opened"], ["NEW short (w)"])
         self.assertEqual(changes["Closed"], ["GONE short (w)"])
         self.assertEqual(changes["Resized"], ["CUT short (w)"])
+
+    def test_asset_class_gives_each_market_one_group(self):
+        self.assertEqual(asset_class("", None), "Crypto")
+        self.assertEqual(asset_class(None, None), "Crypto")
+        self.assertEqual(asset_class("xyz", "Stocks"), "Tradfi")
+        self.assertEqual(asset_class("flx", "crypto"), "HIP-3")
+        self.assertEqual(asset_class("xyz", None), "HIP-3")
+
+    def test_cached_candles_and_funding_download_only_what_is_new(self):
+        now = pd.Timestamp.now(tz="UTC").floor("h")
+        today = now.normalize()
+        def candle(day):
+            return {"t": int(day.timestamp() * 1000), "o": "1", "h": "2", "l": "1", "c": "1.5"}
+        def post(payload):
+            calls.append(payload)
+            if payload["type"] == "candleSnapshot":
+                low, high = payload["req"]["startTime"], payload["req"]["endTime"]
+                days = pd.date_range(today - pd.Timedelta(days=60), today, freq="D")
+                return [candle(day) for day in days if low <= day.timestamp() * 1000 <= high]
+            hours = pd.date_range(now - pd.Timedelta(days=40), now, freq="h")
+            return [
+                {"coin": "BTC", "fundingRate": "0.0001", "premium": "0", "time": int(hour.timestamp() * 1000)}
+                for hour in hours if payload["startTime"] <= hour.timestamp() * 1000 <= payload["endTime"]
+            ]
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            hl_trade_analytics, "CACHE_DIR", Path(directory)
+        ), patch("hl_trade_analytics.post_info", side_effect=post):
+            calls = []
+            first = hl_trade_analytics.fetch_daily_candles("BTC", lookback_days=20)
+            self.assertEqual(len(calls), 1)
+            pd.testing.assert_frame_equal(first, hl_trade_analytics.fetch_daily_candles("BTC", lookback_days=20))
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(first["time"].max(), today - pd.Timedelta(days=1))
+            self.assertLess(len(hl_trade_analytics.fetch_daily_candles("BTC", lookback_days=10)), len(first))
+            self.assertEqual(len(calls), 1)
+            longer = hl_trade_analytics.fetch_daily_candles("BTC", lookback_days=40)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[-1]["req"]["startTime"] < calls[0]["req"]["startTime"], True)
+            self.assertGreater(len(longer), len(first))
+
+            calls.clear()
+            funding = hl_trade_analytics.fetch_funding_history("BTC", lookback_days=5)
+            self.assertEqual(len(calls), 1)
+            again = hl_trade_analytics.fetch_funding_history("BTC", lookback_days=5)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(again), len(funding))
+            self.assertTrue(pd.api.types.is_datetime64_any_dtype(again["time"]))
 
     def test_size_respects_zero_risk_headroom_and_hip3_leverage_cap(self):
         candles = make_candles()

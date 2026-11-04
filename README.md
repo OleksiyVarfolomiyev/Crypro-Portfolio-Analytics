@@ -1,4 +1,4 @@
-# Cryptocurrency Portfolio Analytics
+# Trading Desk
 
 This repository contains Jupyter notebooks for portfolio analytics, Hyperliquid account analysis, trade analytics, and backtesting, plus a separate guarded trade-execution script:
 
@@ -16,7 +16,7 @@ The two notebooks below contain the complete workflows, including price-history 
 
 | Notebook | What it does | Main data files |
 | --- | --- | --- |
-| [`research/crypto_portfolio_analytics.ipynb`](research/crypto_portfolio_analytics.ipynb) | Discovers live perp positions and spot balances from configured Hyperliquid wallets; fetches daily perp prices from Hyperliquid (including HIP-3 markets) and supported spot prices plus market data from CoinGecko; calculates returns and correlations; optimizes signed long/short constrained full-Kelly weights; fits BTC and available CoinGecko cross-sectional factors; compares portfolio results with BTC; writes metrics and factor outputs to CSV. | `data/crypto_daily_prices_usd.csv`, `data/crypto_daily_returns.csv`, `data/crypto_return_correlation.csv`, `data/crypto_kelly_full_weights.csv`, `data/crypto_kelly_weights.csv`, `data/crypto_portfolio_daily_returns.csv`, `data/crypto_portfolio_metrics.csv`, `data/crypto_market_data.csv`, `data/crypto_portfolio_factor_model.csv`, `data/crypto_portfolio_factor_fit.csv`, `data/crypto_factor_returns.csv` |
+| [`research/portfolio_analytics.ipynb`](research/portfolio_analytics.ipynb) | Discovers live perp positions and spot balances from configured Hyperliquid wallets; fetches daily perp prices from Hyperliquid (including HIP-3 markets) and supported spot prices plus market data from CoinGecko; calculates returns and correlations; optimizes signed long/short constrained full-Kelly weights; fits BTC and available CoinGecko cross-sectional factors; compares portfolio results with BTC; writes metrics and factor outputs to CSV. | `data/daily_prices_usd.csv`, `data/daily_returns.csv`, `data/return_correlation.csv`, `data/kelly_full_weights.csv`, `data/kelly_weights.csv`, `data/portfolio_daily_returns.csv`, `data/portfolio_metrics.csv`, `data/market_data.csv`, `data/portfolio_factor_model.csv`, `data/portfolio_factor_fit.csv`, `data/factor_returns.csv` |
 | [`hl_account_analytics.ipynb`](hl_account_analytics.ipynb) | Analyzes one Hyperliquid account by reading current account and position data; saves account history locally; reports spot/perp balances, fee-net realized PnL with signed perp funding, unrealized PnL, risk metrics, PnL attribution, and charts against BTC. | `data/hl_account_history_<wallet>.csv` |
 | [`hl_multi_account_analytics.ipynb`](hl_multi_account_analytics.ipynb) | Consolidates account history, balances, positions, fills, funding, and PnL across configured Hyperliquid wallets. Displays combined account/risk summaries and charts, pooled PnL attribution, and per-wallet open positions. Position sizing uses a configurable fixed-fractional risk budget and ATR-based stop/take-profit levels. | `data/hl_account_history_<wallet>.csv` for each wallet |
 | [`hl_trade_analytics.ipynb`](hl_trade_analytics.ipynb) | Interactive, read-only view of ATR stop distance, historical adverse funding reserve, and expected five-day price/funding PnL for one perp position. | Public Hyperliquid daily candles and hourly funding history |
@@ -42,7 +42,7 @@ Open either notebook and run its cells from top to bottom. Each notebook is inde
 
 ## 1. Portfolio analytics notebook
 
-Open **research/crypto_portfolio_analytics.ipynb** and run all cells in order.
+Open **research/portfolio_analytics.ipynb** and run all cells in order.
 
 - Set `WALLET_ADDRESSES` in the notebook's setup cell. The refresh discovers nonzero perp positions and spot balances across those wallets using Hyperliquid's public API; it does not place trades.
 - CoinGecko's public API is used without an API key. It is rate-limited, so refreshes may need to be retried if the public service returns HTTP 429.
@@ -167,6 +167,8 @@ The caps limit estimated loss (stop distance, adverse funding, and fees), not ma
 The executor applies the limits to each action but does not choose positions; that ordering is applied when writing the actions CSV.
 
 ## Notes
+
+- Completed daily candles, past market funding, and wallet funding events are saved in `data/api_cache/` (not committed) and downloaded only once. Delete that folder to force a full download. Live balances, positions, orders, and fills are always read fresh.
 
 - The Kelly weights are historical estimates based on the available price sample; they are not a guarantee of future performance.
 - Expected PnL values use historical mean forward returns/funding and can be unstable for short or changing market samples.

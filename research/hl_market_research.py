@@ -22,6 +22,13 @@ TABLE_COLUMNS = ["Ticker", CHANGE, FUNDING, VOLUME, OPEN_INTEREST]
 VIEW_LABELS = {"crypto": "Crypto", "tradfi": "Tradfi", "hip3": "HIP-3", "trending": "Trending"}
 
 
+def asset_class(dex: str | None, category: str | None) -> str:
+    """Name a market's single class: Crypto, Tradfi, or HIP-3 for other HIP-3 markets."""
+    if not dex:
+        return "Crypto"
+    return "Tradfi" if str(category or "").lower() in TRADFI_CATEGORIES else "HIP-3"
+
+
 def _number(value: object) -> float:
     """Convert an API value to a float, using ``NaN`` for missing or invalid values."""
     number = pd.to_numeric(value, errors="coerce")
