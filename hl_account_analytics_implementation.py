@@ -507,6 +507,7 @@ def normalize_fills(fills):
     rows = [{'time': int(fill['time']), 'coin': fill.get('coin', ''),
             'assetType': 'spot' if str(fill.get('coin', '')).startswith('@') else 'perp',
             'dir': fill.get('dir', ''), 'side': fill.get('side', ''),
+            'crossed': bool(fill.get('crossed')),
             'size': abs(as_float(fill.get('sz'))),
             'notional': abs(as_float(fill.get('px')) * as_float(fill.get('sz'))),
             'closedPnl': as_float(fill.get('closedPnl')), 'fee': as_float(fill.get('fee'),
@@ -2058,6 +2059,64 @@ def volume_total_blank_cells(summary):
     return {(len(summary) - 1, column) for column in ('Daily Pearson r', 'Daily Spearman r')}
 
 
+def summarize_execution(fills, days=30, now=None):
+    """Summarize recent perp notional and fees by opening/closing and maker/taker."""
+    columns = ['Fills', 'Type', 'Count', 'Notional ($)', 'Share (%)', 'Fees ($)', 'Fees (bps)']
+    now = now or pd.Timestamp.now(tz='UTC')
+    if fills.empty:
+        return pd.DataFrame(columns=columns)
+    recent = fills.loc[(fills['assetType'] == 'perp')
+        & (pd.to_datetime(fills['ts'], utc=True) >= now - pd.Timedelta(days=days))].copy()
+    if recent.empty:
+        return pd.DataFrame(columns=columns)
+    recent['usdc_fee'] = recent['fee'].where(recent['feeToken'] == 'USDC', 0.0).fillna(0.0)
+    opening = recent['dir'].fillna('').astype(str).str.contains('Open')
+    total_notional = recent['notional'].sum()
+    def row(label, kind, part):
+        notional = part['notional'].sum()
+        return {'Fills': label, 'Type': kind, 'Count': len(part), 'Notional ($)': notional,
+            'Share (%)': notional / total_notional * 100 if total_notional else float('nan'),
+            'Fees ($)': part['usdc_fee'].sum(),
+            'Fees (bps)': part['usdc_fee'].sum() / notional * 1e4 if notional else float('nan')}
+    rows = [
+        row(label, kind, recent.loc[(opening == is_opening) & (recent['crossed'] == crossed)])
+        for label, is_opening in (('Opening', True), ('Closing', False))
+        for kind, crossed in (('Maker', False), ('Taker', True))
+    ]
+    rows.append(row('Net/total', '', recent))
+    return pd.DataFrame(rows, columns=columns)
+
+
+def taker_fee_excess(summary):
+    """Estimate fees saved had taker fills paid the maker rate seen in the same summary."""
+    fills = summary.loc[summary['Fills'] != 'Net/total']
+    maker, taker = fills.loc[fills['Type'] == 'Maker'], fills.loc[fills['Type'] == 'Taker']
+    if not maker['Notional ($)'].sum() or not taker['Notional ($)'].sum():
+        return float('nan')
+    maker_rate = maker['Fees ($)'].sum() / maker['Notional ($)'].sum()
+    return taker['Fees ($)'].sum() - taker['Notional ($)'].sum() * maker_rate
+
+
+class _ExecutionQualityMixin:
+    def show_execution_quality(self, days=30):
+        data = self._require_data()
+        summary = summarize_execution(data.realized_df, days)
+        if summary.empty:
+            print(f'No perp fills in the last {days} days.')
+            return
+        display_interactive_table(summary, formatters={
+            'Notional ($)': lambda value: f'${value:,.2f}',
+            'Share (%)': lambda value: f'{value:.1f}%',
+            'Fees ($)': lambda value: f'${value:,.2f}',
+            'Fees (bps)': lambda value: f'{value:.2f}',
+        }, cell_style=lambda *cell: 'color:#c62828;' if cell[1] in {'Fees ($)', 'Fees (bps)'} else '',
+            bold_last=True, title=f'EXECUTION QUALITY: LAST {days} DAYS')
+        excess = taker_fee_excess(summary)
+        if pd.notna(excess):
+            print(f'Taking liquidity cost about ${excess:,.2f} more in fees than the maker rate would have. '
+                  'This ignores missed fills and worse prices from waiting, and stop-losses must stay taker.')
+
+
 class _VolumeSummaryMixin:
     def show_volume_summary(self):
         data = self._require_data()
@@ -2372,6 +2431,6 @@ class _AnalyticsCore:
 class HyperliquidAnalytics(
     _HighlightsMixin, _AccountPnLMixin, _AccountChartsMixin, _AccountVsBTCMixin,
     _VolumeChartMixin, _OpenPositionsMixin, _RealizedPnLMixin,
-    _VolumeSummaryMixin, _PnLAttributionMixin, _AnalyticsCore,
+    _VolumeSummaryMixin, _ExecutionQualityMixin, _PnLAttributionMixin, _AnalyticsCore,
 ):
     """Public facade used by the dashboard notebook."""

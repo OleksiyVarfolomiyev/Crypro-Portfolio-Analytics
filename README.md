@@ -144,7 +144,7 @@ Run a dry check first:
   --actions position_actions.csv
 ```
 
-Additions use the existing maker-only ALO entry approach. Reductions and closes use reduce-only market orders, and never reverse a position. After a size change, the executor cancels and recreates the recognized reduce-only SL/TP orders to match the actual remaining position. The exchange cannot atomically resize the position and its exit orders, so a brief unprotected interval is possible; the CLI warns before live confirmation. Use one action per market in a CSV and review every refreshed quantity and order level.
+Additions use the existing maker-only ALO entry approach; a resting entry keeps its queue position and is only replaced when its target price changes. Reductions and closes use reduce-only market orders, and never reverse a position. After a size change, the executor cancels and recreates the recognized reduce-only SL/TP orders to match the actual remaining position. The exchange cannot atomically resize the position and its exit orders, so a brief unprotected interval is possible; the CLI warns before live confirmation. Use one action per market in a CSV and review every refreshed quantity and order level.
 
 First run without `--live` to inspect the proposed sizing and current aggregate risk:
 
@@ -168,6 +168,19 @@ The caps limit estimated loss (stop distance, adverse funding, and fees), not ma
 - Remaining room goes to in-the-money positions with the lowest unrealized PnL percentage first.
 
 The executor applies the limits to each action but does not choose positions; that ordering is applied when writing the actions CSV.
+
+## Kill switch
+
+To see what would be shut down (read-only; no key is loaded):
+
+```bash
+.venv/bin/python execution/hl_trade_execution.py --kill-switch \
+  --wallet 0xWALLET_ONE --risk-wallets 0xWALLET_ONE,0xWALLET_TWO
+```
+
+Add `--live` and type `SHUT IT ALL DOWN` to execute. It first halts new entries, including entry loops already running on this machine, then for each wallet cancels entry orders and market-closes every perp position with reduce-only IOC orders, retrying with up to 10% slippage. A position's stop and take-profit are cancelled only once it is confirmed flat, so a failed close keeps its protection. It sweeps a second time, re-reads the exchange, and exits with status 2 and a list of anything still open.
+
+It needs each wallet's API key in the keychain and runs from `.venv` or the `py314` environment; both have the trading packages. It does not touch spot balances, vaults, or staking, and it cannot stop orders placed elsewhere, such as the Hyperliquid app. Live entries and position actions stay blocked until `--clear-kill-switch`; `--protect-open` still works.
 
 ## Notes
 

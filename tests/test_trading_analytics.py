@@ -1,4 +1,5 @@
 import importlib
+import itertools
 import importlib.util
 import os
 import sys
@@ -359,6 +360,26 @@ class RealizedPnlTests(unittest.TestCase):
         self.assertAlmostEqual(spot.loc[self.account.OTHER_NON_PERP_LABEL, "Realized"], 51.0)
         self.assertAlmostEqual(spot.loc["Net/total", "Realized"], 73.0)
         self.assertAlmostEqual(net, 23.0)
+
+    def test_execution_summary_splits_maker_taker_and_estimates_excess(self):
+        now = pd.Timestamp("2026-06-30 12:00", tz="UTC")
+        recent = now - pd.Timedelta(days=1)
+        fills = pd.DataFrame([
+            {"assetType": "perp", "ts": recent, "dir": "Open Long", "crossed": False,
+             "notional": 1_000.0, "fee": 0.15, "feeToken": "USDC"},
+            {"assetType": "perp", "ts": recent, "dir": "Close Long", "crossed": True,
+             "notional": 1_000.0, "fee": 0.45, "feeToken": "USDC"},
+            {"assetType": "perp", "ts": now - pd.Timedelta(days=60), "dir": "Open Long", "crossed": True,
+             "notional": 9_000.0, "fee": 4.05, "feeToken": "USDC"},
+            {"assetType": "spot", "ts": recent, "dir": "Buy", "crossed": True,
+             "notional": 9_000.0, "fee": 4.05, "feeToken": "USDC"},
+        ])
+        summary = self.account.summarize_execution(fills, days=30, now=now)
+        total = summary.iloc[-1]
+        self.assertEqual(total["Count"], 2)
+        self.assertAlmostEqual(total["Notional ($)"], 2_000.0)
+        self.assertAlmostEqual(total["Fees (bps)"], 3.0)
+        self.assertAlmostEqual(self.account.taker_fee_excess(summary), 0.30)
 
     def test_highlights_state_is_kept_per_file(self):
         with tempfile.TemporaryDirectory() as data_dir:
@@ -991,7 +1012,7 @@ class TradeAnalyticsTests(unittest.TestCase):
             self.assertEqual(step.quantity, round(step.quantity, 1))
         self.assertAlmostEqual(sum(step.quantity for step in plan.stop_steps), 21449.8)
 
-    def _run_entry(self, statuses, responses=None):
+    def _run_entry(self, statuses, responses=None, prices=None):
         exchange = MagicMock()
         exchange.order.side_effect = responses or [
             {"response": {"data": {"statuses": [{"resting": {"oid": index}}]}}}
@@ -1000,7 +1021,9 @@ class TradeAnalyticsTests(unittest.TestCase):
         plan = SimpleNamespace(coin="USUAL", dex="", side="SHORT", quantity=21449.7)
         market = Market("USUAL", "", 0.01, 0.01, 1, 3)
         module = "hl_trade_execution"
-        with patch(f"{module}.post_only_price", return_value=0.01), \
+        # A moving price forces a reprice on each check unless a test passes fixed prices.
+        prices = prices or (0.01 + step * 1e-9 for step in itertools.count())
+        with patch(f"{module}.post_only_price", side_effect=prices), \
                 patch(f"{module}.time.sleep"), \
                 patch(f"{module}._order_status", side_effect=statuses):
             return exchange, _place_entry(exchange, "0x" + "1" * 40, plan, market)
@@ -1021,6 +1044,18 @@ class TradeAnalyticsTests(unittest.TestCase):
         ])
 
         self.assertEqual([call.args[2] for call in exchange.order.call_args_list], [21449.7, 16992.5])
+        self.assertAlmostEqual(quantity, 21449.7)
+        self.assertAlmostEqual(entry, 0.01)
+
+    def test_entry_chase_keeps_queue_position_while_price_is_unchanged(self):
+        status = self._order_status_response
+        exchange, (quantity, entry) = self._run_entry(
+            [status("open", 21449.7, 21449.7), status("open", 21449.7, 16992.5), status("filled", 21449.7, 0)],
+            prices=itertools.repeat(0.01),
+        )
+
+        self.assertEqual(exchange.order.call_count, 1)
+        exchange.cancel.assert_not_called()
         self.assertAlmostEqual(quantity, 21449.7)
         self.assertAlmostEqual(entry, 0.01)
 
@@ -1461,6 +1496,149 @@ class TradeAnalyticsTests(unittest.TestCase):
         self.assertTrue(trades)
         self.assertEqual(trades[0]["exit_reason"], "stop")
         self.assertLess(trades[0]["net_pnl"], 0)
+
+
+class RestingEntryTests(unittest.TestCase):
+    def _plan(self):
+        return SimpleNamespace(coin="BTC", dex="", side="LONG", quantity=1.0)
+
+    def _run(self, states, prices):
+        import hl_trade_execution as execution
+        clock = iter(range(0, 100_000, 10))
+        with (
+            patch.object(execution.time, "sleep"),
+            patch.object(execution.time, "monotonic", side_effect=lambda: next(clock)),
+            patch.object(execution, "_order_status", return_value={}),
+            patch.object(execution, "_order_fill", side_effect=[(state, 0.0) for state in states]) as fill,
+            patch.object(execution, "post_only_price", side_effect=prices) as price,
+        ):
+            state, _ = execution._rest_entry("w", 1, self._plan(), SimpleNamespace(size_decimals=3), 100.0, 1_000)
+        return state, fill.call_count, price.call_count
+
+    def test_order_keeps_resting_until_price_changes(self):
+        self.assertEqual(self._run(["open", "open", "open"], [100.0, 100.0, 101.0]), ("open", 3, 3))
+
+    def test_filled_order_stops_waiting_without_repricing(self):
+        self.assertEqual(self._run(["open", "filled"], [100.0]), ("filled", 2, 1))
+
+    def test_book_error_hands_order_back_for_cancel(self):
+        state, _, _ = self._run(["open"], ValueError("no book"))
+        self.assertEqual(state, "open")
+
+
+class KillSwitchTests(unittest.TestCase):
+    def setUp(self):
+        import hl_trade_execution as execution
+        self.execution = execution
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.flag = Path(directory.name) / "KILL_SWITCH"
+        for patcher in (
+            patch.object(execution, "KILL_SWITCH_FILE", self.flag),
+            patch.object(execution.time, "sleep"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _order(coin, oid, reduce_only):
+        return {"coin": coin, "oid": oid, "reduceOnly": reduce_only}
+
+    def _sweep(self, positions, orders, exchange=None):
+        exchange = exchange or MagicMock()
+        with (
+            patch.object(self.execution, "_open_positions", side_effect=positions),
+            patch.object(self.execution, "fetch_open_orders", side_effect=orders),
+        ):
+            return exchange, self.execution._kill_switch_sweep(exchange, "w", [""])
+
+    def test_entries_cancel_before_close_and_stops_cancel_only_after_flat(self):
+        btc = {"coin": "BTC", "size": 1.0, "value": 100.0}
+        entry, stop = self._order("ETH", 1, False), self._order("BTC", 2, True)
+        exchange, left = self._sweep(
+            [[btc], [], []],
+            [[entry, stop], [stop], []],
+        )
+        names = [call[0] for call in exchange.method_calls]
+        self.assertEqual(names, ["cancel", "market_close", "cancel"])
+        self.assertEqual(exchange.cancel.call_args_list[0].args, ("ETH", 1))
+        self.assertEqual(exchange.cancel.call_args_list[1].args, ("BTC", 2))
+        self.assertEqual(left, [])
+
+    def test_failed_close_retries_wider_keeps_stop_and_reports_position(self):
+        xyz = {"coin": "xyz:NET", "size": -2.0, "value": 50.0}
+        stop = self._order("xyz:NET", 3, True)
+        exchange = MagicMock()
+        exchange.market_close.side_effect = RuntimeError("no liquidity")
+        exchange, left = self._sweep([[xyz]] * 4, [[stop]] * 3, exchange)
+        self.assertEqual(
+            [call.kwargs["slippage"] for call in exchange.market_close.call_args_list],
+            [0.05, 0.05, 0.10],
+        )
+        exchange.cancel.assert_not_called()
+        self.assertTrue(any("position still open" in line for line in left))
+        self.assertTrue(any("no liquidity" in line for line in left))
+
+    def test_failed_wallet_does_not_stop_the_other_and_is_reported_not_flat(self):
+        def sweep(exchange, wallet, dexes):
+            if wallet == "bad":
+                raise RuntimeError("read failed")
+            return []
+        with (
+            patch.object(self.execution, "_load_key_from_keychain", return_value="key"),
+            patch.object(self.execution, "build_exchange", return_value=MagicMock()),
+            patch.object(self.execution, "_kill_switch_sweep", side_effect=sweep) as swept,
+        ):
+            clean = self.execution.run_kill_switch(["bad", "good"], [""])
+        self.assertFalse(clean)
+        self.assertTrue(self.flag.exists())
+        self.assertEqual(sorted(call.args[1] for call in swept.call_args_list), ["bad", "bad", "good", "good"])
+
+    def test_missing_key_is_not_reported_flat(self):
+        with (
+            patch.object(self.execution, "_load_key_from_keychain", side_effect=RuntimeError("no key")),
+            patch.object(self.execution, "_kill_switch_sweep") as swept,
+        ):
+            self.assertFalse(self.execution.run_kill_switch(["w"], [""]))
+        swept.assert_not_called()
+
+    def _main(self, args, typed=None):
+        with (
+            patch.object(self.execution, "get_dexes", return_value=[""]),
+            patch.object(self.execution, "print_kill_switch_plan"),
+            patch.object(self.execution, "run_kill_switch", return_value=True) as run,
+            patch("builtins.input", return_value=typed or ""),
+        ):
+            return self.execution.main(["--wallet", "0x" + "1" * 40, *args]), run
+
+    def test_kill_switch_needs_live_and_the_exact_phrase(self):
+        code, run = self._main(["--kill-switch"])
+        self.assertEqual(code, 0)
+        run.assert_not_called()
+        self.assertFalse(self.flag.exists())
+        _, run = self._main(["--kill-switch", "--live"], typed="yes")
+        run.assert_not_called()
+        code, run = self._main(["--kill-switch", "--live"], typed="SHUT IT ALL DOWN")
+        self.assertEqual(code, 0)
+        run.assert_called_once()
+
+    def test_engaged_switch_blocks_live_entries_until_cleared(self):
+        self.flag.write_text("engaged")
+        signals = self.flag.with_name("signals.csv")
+        signals.write_text("coin,side,dex\nBTC,LONG,\n")
+        code, _ = self._main(["--signals", str(signals), "--live"])
+        self.assertEqual(code, 2)
+        code, _ = self._main(["--clear-kill-switch"])
+        self.assertEqual(code, 0)
+        self.assertFalse(self.flag.exists())
+
+    def test_engaged_switch_stops_a_running_entry_chase(self):
+        self.flag.write_text("engaged")
+        exchange = MagicMock()
+        plan = SimpleNamespace(coin="BTC", dex="", side="LONG", quantity=1.0)
+        with self.assertRaises(RuntimeError):
+            self.execution._place_entry(exchange, "w", plan, SimpleNamespace(size_decimals=3))
+        exchange.order.assert_not_called()
 
 
 if __name__ == "__main__":

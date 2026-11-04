@@ -49,6 +49,13 @@ ENTRY_TIMEOUT_SECONDS = 5 * 60
 CHASE_INTERVAL_SECONDS = 10
 CANCEL_CONFIRM_ATTEMPTS = 30
 MONITOR_INTERVAL_SECONDS = 15
+KILL_SWITCH_FILE = Path(__file__).resolve().parent / "KILL_SWITCH"
+KILL_SWITCH_PHRASE = "SHUT IT ALL DOWN"
+# Reduce-only IOC limits; a wider last attempt reaches thin books before giving up.
+KILL_CLOSE_SLIPPAGES = (0.05, 0.05, 0.10)
+KILL_RETRY_SECONDS = 2
+# Longer than one entry-chase check, so another running entry loop has seen the halt.
+KILL_SETTLE_SECONDS = CHASE_INTERVAL_SECONDS + 2
 
 
 @dataclass(frozen=True)
@@ -1374,13 +1381,36 @@ def _order_fill(status: dict[str, Any], size_decimals: int) -> tuple[str, float]
     return state, round(filled, size_decimals)
 
 
+def kill_switch_engaged() -> bool:
+    """Return whether the kill switch has halted new entries on this machine."""
+    return KILL_SWITCH_FILE.exists()
+
+
+def _rest_entry(
+    wallet: str, oid: int, plan: PlannedTrade, market: Market, price: float, deadline: float
+) -> tuple[str, float]:
+    """Wait on a resting entry, keeping queue priority until its target price changes."""
+    while True:
+        time.sleep(CHASE_INTERVAL_SECONDS)
+        state, filled = _order_fill(_order_status(wallet, oid), market.size_decimals)
+        if state != "open" or time.monotonic() >= deadline or kill_switch_engaged():
+            return state, filled
+        try:
+            if post_only_price(plan.coin, plan.dex, plan.side, market.size_decimals) != price:
+                return state, filled
+        except (ValueError, requests.RequestException) as exc:
+            # A bad book read must not leave the order unmanaged; the caller cancels it.
+            print(f"{plan.coin}: could not refresh the entry price ({exc}); cancelling the resting order.")
+            return state, filled
+
+
 def _place_entry(exchange: Any, wallet: str, plan: PlannedTrade, market: Market) -> tuple[float, float]:
     """Chase the planned entry with post-only limits and return filled size and average price."""
     deadline = time.monotonic() + ENTRY_TIMEOUT_SECONDS
     filled_total = 0.0
     weighted_entry = 0.0
     remaining = plan.quantity
-    while remaining > 0 and time.monotonic() < deadline:
+    while remaining > 0 and time.monotonic() < deadline and not kill_switch_engaged():
         price = post_only_price(plan.coin, plan.dex, plan.side, market.size_decimals)
         is_buy = plan.side == "LONG"
         response = exchange.order(
@@ -1405,8 +1435,7 @@ def _place_entry(exchange: Any, wallet: str, plan: PlannedTrade, market: Market)
                 filled_total += size
                 weighted_entry += size * average
             break
-        time.sleep(CHASE_INTERVAL_SECONDS)
-        state, filled = _order_fill(_order_status(wallet, oid), market.size_decimals)
+        state, filled = _rest_entry(wallet, oid, plan, market, price, deadline)
         if state != "filled":
             exchange.cancel(plan.coin, oid)
             # The status endpoint can briefly report a cancelled order as open.
@@ -2336,6 +2365,119 @@ def run_live(wallet: str, private_key: str, dexes: list[str], plans: list[Planne
         raise RuntimeError("Some live orders did not complete successfully: " + "; ".join(failures))
 
 
+def _open_positions(wallet: str, dexes: list[str]) -> list[dict[str, Any]]:
+    """Return a wallet's open perp positions across the given DEXes."""
+    positions = []
+    for dex in dexes:
+        for item in fetch_user_state(wallet, dex)["assetPositions"]:
+            position = item.get("position", {})
+            size = float(position.get("szi") or 0)
+            if size:
+                positions.append({
+                    "coin": position["coin"],
+                    "size": size,
+                    "value": abs(float(position.get("positionValue") or 0)),
+                })
+    return positions
+
+
+def print_kill_switch_plan(wallets: list[str], dexes: list[str]) -> None:
+    """Show what the kill switch would close and cancel for each wallet."""
+    for wallet in wallets:
+        positions = _open_positions(wallet, dexes)
+        orders = fetch_open_orders(wallet, dexes)
+        protection = sum(_is_reduce_only(order) for order in orders)
+        print(
+            f"{wallet}: close {len(positions)} positions "
+            f"(${sum(item['value'] for item in positions):,.2f} notional); "
+            f"cancel {len(orders) - protection} entry and {protection} reduce-only orders."
+        )
+        for item in sorted(positions, key=lambda row: -row["value"]):
+            side = "LONG" if item["size"] > 0 else "SHORT"
+            print(f"  {item['coin']} {side} {abs(item['size']):g} (${item['value']:,.2f})")
+    print("Spot balances, vaults, and staking are not touched.")
+
+
+def _cancel_orders(exchange: Any, orders: list[dict[str, Any]], problems: list[str]) -> None:
+    """Cancel each order, recording failures so the remaining orders are still attempted."""
+    for order in orders:
+        try:
+            exchange.cancel(order["coin"], int(order["oid"]))
+        except Exception as exc:  # An emergency stop must continue past any single failure.
+            problems.append(f"{order.get('coin')} order {order.get('oid')}: cancel failed: {exc}")
+
+
+def _kill_switch_sweep(exchange: Any, wallet: str, dexes: list[str]) -> list[str]:
+    """Cancel entries, close positions, and clear protection; return what is still open."""
+    problems: list[str] = []
+    _cancel_orders(
+        exchange,
+        [order for order in fetch_open_orders(wallet, dexes) if not _is_reduce_only(order)],
+        problems,
+    )
+    for attempt, slippage in enumerate(KILL_CLOSE_SLIPPAGES):
+        positions = _open_positions(wallet, dexes)
+        if not positions:
+            break
+        if attempt:
+            time.sleep(KILL_RETRY_SECONDS)
+        for item in positions:
+            try:
+                exchange.market_close(item["coin"], slippage=slippage)
+            except Exception as exc:  # An emergency stop must continue past any single failure.
+                problems.append(f"{item['coin']}: close attempt failed: {exc}")
+    time.sleep(KILL_RETRY_SECONDS)
+    remaining = _open_positions(wallet, dexes)
+    open_coins = {item["coin"] for item in remaining}
+    # Stops stay on anything still open: they are its only protection if the close failed.
+    _cancel_orders(
+        exchange,
+        [order for order in fetch_open_orders(wallet, dexes) if order.get("coin") not in open_coins],
+        problems,
+    )
+    leftover = [f"{item['coin']}: position still open ({item['size']:g})" for item in remaining]
+    leftover += [
+        f"{order.get('coin')}: order {order.get('oid')} still open"
+        for order in fetch_open_orders(wallet, dexes)
+        if order.get("coin") not in open_coins
+    ]
+    return problems + leftover if leftover else []
+
+
+def run_kill_switch(wallets: list[str], dexes: list[str]) -> bool:
+    """Halt new entries, then flatten every wallet; return whether all are confirmed flat."""
+    KILL_SWITCH_FILE.write_text(f"Engaged {pd.Timestamp.now(tz='UTC').isoformat()}\n")
+    print(f"New entries are halted until --clear-kill-switch ({KILL_SWITCH_FILE}).")
+    exchanges: dict[str, Any] = {}
+    problems: dict[str, list[str]] = {}
+    for wallet in wallets:
+        try:
+            exchanges[wallet] = build_exchange(wallet, _load_key_from_keychain(wallet), dexes)
+        except Exception as exc:  # One unusable key must not stop the other wallets.
+            problems[wallet] = [f"could not load a signing key: {exc}"]
+    # The second sweep catches anything an already-running entry loop filled meanwhile.
+    for sweep in range(2):
+        if sweep:
+            time.sleep(KILL_SETTLE_SECONDS)
+        for wallet, exchange in exchanges.items():
+            try:
+                problems[wallet] = _kill_switch_sweep(exchange, wallet, dexes)
+            except Exception as exc:  # A failed read means the wallet cannot be called flat.
+                problems[wallet] = [f"could not confirm state: {exc}"]
+    clean = True
+    for wallet in wallets:
+        if problems.get(wallet):
+            clean = False
+            print(f"{wallet}: NOT FLAT")
+            for problem in problems[wallet]:
+                print(f"  {problem}")
+        else:
+            print(f"{wallet}: confirmed flat, no open orders.")
+    if not clean:
+        print("ACT NOW: close what is listed above in the Hyperliquid app, or run the kill switch again.")
+    return clean
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse command-line options and run the selected planning or execution workflow."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -2352,6 +2494,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Inspect open positions and add only missing reduce-only stop/target orders.",
     )
+    parser.add_argument(
+        "--kill-switch",
+        action="store_true",
+        help="Show (or with --live, execute) closing every perp position and cancelling every order "
+        "for --wallet and --risk-wallets, and halt new entries.",
+    )
+    parser.add_argument(
+        "--clear-kill-switch",
+        action="store_true",
+        help="Allow new entries again after the kill switch.",
+    )
     parser.add_argument("--store-key", action="store_true", help="Prompt locally and store the API-wallet key in Keychain.")
     parser.add_argument("--live", action="store_true", help="Allow live orders after typing the confirmation phrase.")
     args = parser.parse_args(argv)
@@ -2360,6 +2513,25 @@ def main(argv: list[str] | None = None) -> int:
             store_key(args.wallet)
             return 0
         _validate_address(args.wallet, "--wallet main-wallet address")
+        if args.clear_kill_switch:
+            KILL_SWITCH_FILE.unlink(missing_ok=True)
+            print("Kill switch cleared; new entries are allowed again.")
+            return 0
+        if args.kill_switch:
+            wallets = read_target_wallets(args.wallet, args.risk_wallets)
+            dexes = get_dexes([])
+            print_kill_switch_plan(wallets, dexes)
+            if not args.live:
+                print("Dry run only. No signing key was loaded and no order was sent.")
+                return 0
+            confirmation = input(f"Type {KILL_SWITCH_PHRASE} to market-close everything now: ").strip()
+            if confirmation != KILL_SWITCH_PHRASE:
+                print("Confirmation did not match; no order was sent.")
+                return 0
+            return 0 if run_kill_switch(wallets, dexes) else 2
+        if args.live and not args.protect_open and kill_switch_engaged():
+            print("Kill switch is engaged; no order was sent. Use --clear-kill-switch to trade again.")
+            return 2
         if args.protect_open:
             if args.signals is not None or args.actions is not None:
                 parser.error("--protect-open cannot be combined with --signals or --actions.")

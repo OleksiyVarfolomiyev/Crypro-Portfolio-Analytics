@@ -13,6 +13,7 @@ from hl_account_analytics_implementation import (
     ACCOUNTING_TIMEZONE,
     HISTORY_COLUMNS,
     HyperliquidAnalytics,
+    _ExecutionQualityMixin,
     _HighlightsMixin,
     _OpenPositionsMixin,
     breakdown_style,
@@ -349,7 +350,7 @@ class _MultiWalletAttributionMixin:
 class MultiWalletAnalytics(
     _HighlightsMixin,
     _MultiWalletDataMixin,_MultiWalletAccountMixin,_OpenPositionsMixin,
-    _MultiWalletRealizedMixin,_MultiWalletVolumeMixin,_MultiWalletAttributionMixin,
+    _MultiWalletRealizedMixin,_MultiWalletVolumeMixin,_ExecutionQualityMixin,_MultiWalletAttributionMixin,
 ):
     def __init__(self,wallet_addresses,data_dir='data'):
         self.wallet_addresses=list(dict.fromkeys(wallet_addresses))
