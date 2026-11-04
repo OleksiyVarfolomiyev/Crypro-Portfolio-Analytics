@@ -1,114 +1,114 @@
 {
- "ts": "2026-11-03T20:12:19.360939-05:00",
- "cumulative_pnl": 62.25139100000004,
+ "ts": "2026-11-03T23:31:35.689453-05:00",
+ "cumulative_pnl": 107.32023299999997,
  "positions": {
   "c248|AVAX|SHORT": {
    "size": 13.33,
-   "upnl": 5.084062
+   "upnl": 4.561526
   },
   "c248|IMX|SHORT": {
-   "size": 4400.1,
-   "upnl": 30.740667
+   "size": 2933.4,
+   "upnl": 21.60847
   },
   "c248|GRASS|SHORT": {
    "size": 201.0,
-   "upnl": 9.58368
+   "upnl": 11.78865
   },
   "c248|USUAL|SHORT": {
    "size": 59705.3,
-   "upnl": 0.867161
+   "upnl": 3.255373
   },
   "c248|TRUMP|SHORT": {
-   "size": 44.4,
-   "upnl": 5.69652
+   "size": 22.2,
+   "upnl": 3.18348
   },
   "c248|INIT|SHORT": {
    "size": 490.0,
-   "upnl": 27.6801
+   "upnl": 24.4118
   },
   "c248|XPL|SHORT": {
    "size": 13343.0,
-   "upnl": 2.00145
+   "upnl": 7.672225
   },
   "c248|FOGO|SHORT": {
-   "size": 52944.0,
-   "upnl": 15.565536
+   "size": 35296.0,
+   "upnl": 13.906624
   },
   "c248|LIT|SHORT": {
    "size": 4.0,
-   "upnl": -0.1564
+   "upnl": 0.1492
   },
   "c248|CASHCAT|SHORT": {
    "size": 682.0,
-   "upnl": -3.60778
+   "upnl": -2.672758
   },
   "c248|USELESS|SHORT": {
    "size": 1960.0,
-   "upnl": 14.67648
+   "upnl": 8.73768
   },
   "07f2|INJ|SHORT": {
-   "size": 104.4,
-   "upnl": 15.43032
+   "size": 69.6,
+   "upnl": 9.55608
   },
   "07f2|TRX|SHORT": {
    "size": 1484.0,
-   "upnl": -14.33544
+   "upnl": -11.73844
   },
   "07f2|RUNE|SHORT": {
    "size": 1141.3,
-   "upnl": 7.484913
+   "upnl": 5.738724
   },
   "07f2|ZRO|SHORT": {
    "size": 21.3,
-   "upnl": -3.95988
+   "upnl": -3.38052
   },
   "07f2|ADA|SHORT": {
-   "size": 1086.0,
-   "upnl": 7.077636
+   "size": 724.0,
+   "upnl": 5.333823
   },
   "07f2|RSR|SHORT": {
    "size": 94784.0,
-   "upnl": -2.111237
+   "upnl": -2.679941
   },
   "07f2|PENGU|SHORT": {
    "size": 79644.0,
-   "upnl": 26.31664
+   "upnl": 27.90952
   },
   "07f2|TRUMP|SHORT": {
-   "size": 145.8,
-   "upnl": 33.864692
+   "size": 72.9,
+   "upnl": 18.062296
   },
   "07f2|MELANIA|SHORT": {
-   "size": 5674.8,
-   "upnl": 14.811228
+   "size": 1891.6,
+   "upnl": 12.598056
   },
   "07f2|AERO|LONG": {
    "size": 60.0,
-   "upnl": -12.843941
+   "upnl": -13.143941
   },
   "07f2|xyz:GOLD|LONG": {
    "size": 0.0537,
-   "upnl": 1.42305
+   "upnl": 1.79358
   },
   "07f2|xyz:GOOGL|LONG": {
    "size": 0.565,
-   "upnl": -37.454109
+   "upnl": -38.945709
   },
   "07f2|xyz:RIVN|SHORT": {
    "size": 6.37,
-   "upnl": 0.5096
+   "upnl": 1.19119
   },
   "07f2|xyz:SHAZ|SHORT": {
-   "size": 36.6,
-   "upnl": 32.1348
+   "size": 24.4,
+   "upnl": 29.158
   },
   "07f2|xyz:NET|LONG": {
    "size": 0.16,
-   "upnl": -10.325145
+   "upnl": -11.261145
   },
   "07f2|xyz:RELIANCE|SHORT": {
    "size": 4.2,
-   "upnl": -1.2888
+   "upnl": -1.6374
   }
  }
 }

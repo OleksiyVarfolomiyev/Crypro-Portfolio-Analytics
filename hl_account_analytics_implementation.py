@@ -15,7 +15,17 @@ from hl_trade_analytics import (
     MAX_RATE_LIMIT_RETRIES,
     _rate_limit_delay,
     add_expected_pnl_columns,
+    adverse_funding_cost_per_unit,
+    consolidate_current_funding,
+    fetch_collateral_equity,
+    fetch_daily_candles,
+    fetch_funding_history,
+    is_unified_account,
+    net_funding_apr_history,
     read_cache_json,
+    summarize_current_funding,
+    true_range,
+    wilder_atr,
     write_cache_json,
     implied_unrealized_history,
     apply_fill_fees,
@@ -25,10 +35,20 @@ from hl_trade_analytics import (
     time_weighted_index,
     visible_month_starts,
 )
+from hl_highlights import (
+    STATE_FILE_NAME,
+    build_highlights,
+    load_state,
+    make_state,
+    position_changes,
+    save_state,
+)
 from IPython.display import HTML, display
 from plotly.subplots import make_subplots
 API = "https://api.hyperliquid.xyz/info"
 ACCOUNTING_TIMEZONE = "America/New_York"
+ACCOUNT_VALUE_GAP_WARNING_PCT = 2.0
+PORTFOLIO_HISTORY_COLUMNS = ["ts", "accountValue", "pnl"]
 HISTORY_COLUMNS = [
     "ts", "accountValue", "source", "asset", "balance", "open_position_value",
     "unrealized_pnl", "realized_pnl",
@@ -36,9 +56,10 @@ HISTORY_COLUMNS = [
 
 
 def display_interactive_table(frame, formatters=None, cell_style=None, bold_last=False,
-    columns=None, blank_missing_cells=None):
+    columns=None, blank_missing_cells=None, html_columns=(), title=None):
     'Display a self-contained HTML table with text' \
-        ' filtering and sortable columns.'
+        ' filtering and sortable columns. Cells in html_columns are trusted' \
+        ' markup and are not escaped.'
     formatters = formatters or {}
     table_id = f'interactive-{uuid.uuid4().hex}'
     headers = list(columns) if columns is not None else list(frame.columns)
@@ -68,13 +89,18 @@ def display_interactive_table(frame, formatters=None, cell_style=None, bold_last
             weight = 'font-weight:700;' if bold_last and row_index == len(frame) - 1 else ''
             sort_attribute = html.escape(sort_value, quote=True)
             style_attribute = html.escape(style + weight, quote=True)
-            cells.append(f"<td data-sort='{sort_attribute}' style='{style_attribute}'>{html.escape(str(visible))}</td>")
+            content = str(visible) if column in html_columns else html.escape(str(visible))
+            cells.append(f"<td data-sort='{sort_attribute}' style='{style_attribute}'>{content}</td>")
         body_rows.append('<tr>' + ''.join(cells) + '</tr>')
+    caption_html = (
+        "<caption style='caption-side:top;text-align:left;font-weight:600;padding:0.35em 0.55em;"
+        f"color:#f9fafb;background:#000;'>{html.escape(str(title))}</caption>"
+    ) if title else ''
     markup = f"""<div id="{table_id}" class="interactive-table-wrap">
       <input class="interactive-table-filter" type="search" placeholder="Filter \
 rows..." aria-label="Filter table rows">
       <table \
-class="interactive-table"><thead><tr>{header_html}</tr></thead>\
+class="interactive-table">{caption_html}<thead><tr>{header_html}</tr></thead>\
 <tbody>{''.join(body_rows)}</tbody></table>
     </div>
     <style>
@@ -228,8 +254,7 @@ def load_saved_history(csv_path):
 
 
 def fetch_all_time_history(user):
-    "Fetch the account's allTime API history for " \
-        'an initial/full refresh.'
+    """Fetch the account's allTime API account-value history."""
     portfolio = post({'type': 'portfolio', 'user': user})
     periods = {item[0]: item[1] for item in portfolio if isinstance(item, (list,
                 tuple)) and len(item) == 2 and isinstance(item[1], dict)}
@@ -239,14 +264,22 @@ def fetch_all_time_history(user):
     return history
 
 
-def fetch_portfolio_history(user):
-    """Fetch the account's all-time value and cumulative PnL history."""
+def _fetch_portfolio_periods(user):
+    """Fetch every portfolio period for a wallet in one request."""
     portfolio = post({'type': 'portfolio', 'user': user})
-    periods = {item[0]: item[1] for item in portfolio if isinstance(item, (list,
+    return {item[0]: item[1] for item in portfolio if isinstance(item, (list,
                 tuple)) and len(item) == 2 and isinstance(item[1], dict)}
-    all_time = periods.get('allTime', {})
-    values = pd.DataFrame(all_time.get('accountValueHistory', []), columns=['time', 'accountValue'])
-    pnl = pd.DataFrame(all_time.get('pnlHistory', []), columns=['time', 'pnl'])
+
+
+def fetch_portfolio_history(user, period='allTime'):
+    """Fetch the account's value and cumulative PnL history for a portfolio period."""
+    return _period_history(_fetch_portfolio_periods(user), period)
+
+
+def _period_history(periods, period):
+    selected = periods.get(period, {})
+    values = pd.DataFrame(selected.get('accountValueHistory', []), columns=['time', 'accountValue'])
+    pnl = pd.DataFrame(selected.get('pnlHistory', []), columns=['time', 'pnl'])
     history = values.merge(pnl, on='time').astype({'accountValue': float, 'pnl': float})
     history['ts'] = pd.to_datetime(history['time'], unit='ms', utc=True).dt.tz_convert(
         ACCOUNTING_TIMEZONE
@@ -254,12 +287,83 @@ def fetch_portfolio_history(user):
     return history[['ts', 'accountValue', 'pnl']]
 
 
-def fetch_perp_pnl_history(user):
-    """Fetch the account's all-time cumulative perp PnL, including open positions."""
+def _pnl_at(history, ts):
+    """Interpolate a history's cumulative PnL at a timestamp."""
+    return np.interp(ts.value, history['ts'].astype('int64').to_numpy(), history['pnl'].to_numpy())
+
+
+def stitch_portfolio_periods(periods):
+    """Combine portfolio periods coarsest first, keeping one cumulative PnL baseline."""
+    stitched = pd.DataFrame(columns=PORTFOLIO_HISTORY_COLUMNS)
+    # Older points are about a week apart in allTime; month and week are near daily or finer.
+    for name in ('allTime', 'month', 'week', 'day'):
+        part = _period_history(periods, name)
+        if part.empty:
+            continue
+        if not stitched.empty:
+            start = part['ts'].iloc[0]
+            part = part.assign(pnl=part['pnl'] - part['pnl'].iloc[0] + _pnl_at(stitched, start))
+            stitched = stitched.loc[stitched['ts'] < start]
+        stitched = pd.concat([stitched, part], ignore_index=True) if not stitched.empty else part
+    return stitched.reset_index(drop=True)
+
+
+def merge_portfolio_history(saved, fresh):
+    """Keep saved points, adding fresh points before and after them on the saved PnL baseline."""
+    if saved.empty or fresh.empty:
+        return fresh if saved.empty else saved
+    first, last = saved.iloc[0], saved.iloc[-1]
+    earlier = fresh.loc[fresh['ts'] < first['ts']]
+    later = fresh.loc[fresh['ts'] > last['ts']]
+    parts = [
+        earlier.assign(pnl=earlier['pnl'] + first['pnl'] - _pnl_at(fresh, first['ts'])),
+        saved,
+        later.assign(pnl=later['pnl'] + last['pnl'] - _pnl_at(fresh, last['ts'])),
+    ]
+    return pd.concat([part for part in parts if not part.empty], ignore_index=True)
+
+
+def update_portfolio_history(user, data_dir):
+    """Merge new Hyperliquid value and PnL points into the wallet's saved history file."""
+    path = Path(data_dir) / f'hl_portfolio_history_{user.lower()}.csv'
+    saved = pd.DataFrame(columns=PORTFOLIO_HISTORY_COLUMNS)
+    if path.exists():
+        saved = pd.read_csv(path)
+        saved['ts'] = pd.to_datetime(saved['ts'], utc=True).dt.tz_convert(ACCOUNTING_TIMEZONE)
+    history = merge_portfolio_history(saved, stitch_portfolio_periods(_fetch_portfolio_periods(user)))
+    history.to_csv(path, index=False)
+    return history
+
+
+def index_period_returns(index):
+    """Return daily, weekly, and monthly percentage returns from a growth index.
+
+    A daily return needs points on consecutive days, so multi-day gaps are left out
+    rather than treated as one day. Weekly and monthly returns span gaps.
+    """
+    if index.empty:
+        empty = pd.Series(dtype=float)
+        return empty, empty, empty
+    local = index.copy()
+    local.index = pd.to_datetime(local.index, utc=True).tz_convert(ACCOUNTING_TIMEZONE)
+    daily_index = local.resample('1D').last().dropna()
+    days = daily_index.index.tz_localize(None).to_series(index=daily_index.index)
+    daily = (daily_index.pct_change() * 100).loc[days.diff().eq(pd.Timedelta(days=1))]
+    def calendar_returns(frequency):
+        closes = local.groupby(local.index.tz_localize(None).to_period(frequency)).last()
+        returns = closes.pct_change()
+        returns.iloc[0] = closes.iloc[0] / local.iloc[0] - 1
+        returns.index = returns.index.to_timestamp()
+        return returns * 100
+    return daily, calendar_returns('W-SUN'), calendar_returns('M')
+
+
+def fetch_perp_pnl_history(user, period='perpAllTime'):
+    """Fetch the account's cumulative perp PnL for a period, including open positions."""
     portfolio = post({'type': 'portfolio', 'user': user})
     periods = {item[0]: item[1] for item in portfolio if isinstance(item, (list,
                 tuple)) and len(item) == 2 and isinstance(item[1], dict)}
-    pnl = pd.DataFrame(periods.get('perpAllTime', {}).get('pnlHistory', []), columns=['time', 'pnl'])
+    pnl = pd.DataFrame(periods.get(period, {}).get('pnlHistory', []), columns=['time', 'pnl'])
     pnl['pnl'] = pd.to_numeric(pnl['pnl'], errors='coerce')
     pnl['ts'] = pd.to_datetime(pnl['time'], unit='ms', utc=True)
     return pnl.dropna(subset=['pnl'])[['ts', 'pnl']]
@@ -431,9 +535,13 @@ def make_api_history_rows(history, saved):
     return frame
 
 
+def live_account_value(spot_balance, perp_equity, unified):
+    """Return account value; a unified account's spot balance already holds its perp equity."""
+    return spot_balance if unified else spot_balance + perp_equity
+
+
 def make_live_snapshot(account_value, balance, position_value, unrealized_pnl):
-    'Build one current snapshot using the live ' \
-        'balance + open-position uPnL formula.'
+    """Build one snapshot of the current account value, balance, and open positions."""
     return pd.DataFrame([{'ts': pd.Timestamp.now(tz=ACCOUNTING_TIMEZONE),
                 'accountValue': account_value, 'source': 'live_snapshot', 'balance': balance,
                 'open_position_value': position_value, 'unrealized_pnl': unrealized_pnl,
@@ -515,7 +623,7 @@ def historical_volatility(pnl_observations, account_value, annualization_days=36
         'annualized_pct': daily_vol_pct * annualization_days ** 0.5, 'n': count}
 
 
-def calculate_account_metrics(chart_df, current_account_value, unrealized_pnl_total):
+def calculate_account_metrics(chart_df, current_account_value, unrealized_pnl_total, account_index):
     'Build daily PnL/return series and risk ' \
         'metrics from saved account history.'
     account_series = chart_df.loc[chart_df['source'] == 'portfolio_allTime'].set_index( \
@@ -552,29 +660,15 @@ def calculate_account_metrics(chart_df, current_account_value, unrealized_pnl_to
     net_change = daily_realized.add(daily_unrealized.ffill().diff().fillna(0),
         fill_value=0).dropna()
     net_avg_day = net_change.mean() if not net_change.empty else float('nan')
-    equity_for_returns = daily_account.reindex(net_change.index).ffill()
-    daily_return_pct = (net_change / equity_for_returns.shift(1) * 100).replace([float('inf'),
-            -float('inf')], float('nan')).dropna()
+    daily_return_pct, weekly_return_pct, monthly_return_pct = index_period_returns(account_index)
     avg_daily_return_pct = daily_return_pct.mean() if not daily_return_pct.empty else float('nan')
     max_daily_gain_pct = daily_return_pct.max() if not daily_return_pct.empty else float('nan')
     max_daily_loss_pct = daily_return_pct.min() if not daily_return_pct.empty else float('nan')
-    monthly_return_pct = ((1 + daily_return_pct / 100).groupby(daily_return_pct.index. \
-        to_period('M')).prod() - 1) * 100
-    monthly_return_pct.index = monthly_return_pct.index.to_timestamp()
-    weekly_return_pct = ((1 + daily_return_pct / 100).groupby(daily_return_pct.index. \
-        to_period('W-SUN')).prod() - 1) * 100
-    weekly_return_pct.index = weekly_return_pct.index.to_timestamp()
     cumulative_pnl = daily_realized.cumsum() + daily_unrealized.ffill().fillna(0)
     pnl_dd_usd = (cumulative_pnl - cumulative_pnl.cummax()).min() if not cumulative_pnl. \
         empty else float('nan')
-    if not daily_account.empty:
-        account_peak = daily_account.cummax()
-        account_dd_usd = (daily_account - account_peak).min()
-        positive = daily_account > 0
-        account_dd_pct = (daily_account[positive] / account_peak[positive] - 1).min() * \
-            100 if positive.any() else float('nan')
-    else:
-        account_dd_usd = account_dd_pct = float('nan')
+    account_dd_pct = (account_index / account_index.cummax() - 1).min() * 100 \
+        if not account_index.empty else float('nan')
     live_account = chart_df.loc[chart_df['source'] == 'live_snapshot'].set_index('ts')[ \
         'accountValue'].dropna()
     live_account.index = pd.to_datetime(live_account.index, utc=True).tz_convert(
@@ -624,8 +718,7 @@ def calculate_account_metrics(chart_df, current_account_value, unrealized_pnl_to
                 btc_close = btc_df.assign(close=btc_df['c'].astype(float)).set_index( \
                     'day')['close'].sort_index()
                 btc_returns = btc_close.pct_change()
-                equity = daily_account.reindex(net_change.index).ffill()
-                portfolio_returns = net_change / equity.shift(1)
+                portfolio_returns = daily_return_pct / 100
                 compare = pd.concat([portfolio_returns.rename('pnl'),
                         btc_returns.reindex(portfolio_returns.index).rename('btc')],
                             axis=1).dropna()
@@ -648,7 +741,7 @@ def calculate_account_metrics(chart_df, current_account_value, unrealized_pnl_to
             'max_daily_gain_pct': max_daily_gain_pct, 'max_daily_loss_pct': max_daily_loss_pct,
             'monthly_return_pct': monthly_return_pct, 'weekly_return_pct': weekly_return_pct,
             'cumulative_pnl': cumulative_pnl, 'pnl_dd_usd': pnl_dd_usd,
-            'account_dd_usd': account_dd_usd, 'account_dd_pct': account_dd_pct,
+            'account_index': account_index, 'account_dd_pct': account_dd_pct,
             'live_account': live_account, 'btc_df': btc_df, 'alpha_annual': alpha_annual,
             'beta': beta, 'sharpe_annual': sharpe_annual, 'btc_sample_n': btc_sample_n,
             'current_account_value': current_account_value,
@@ -656,69 +749,94 @@ def calculate_account_metrics(chart_df, current_account_value, unrealized_pnl_to
             'var_95': var_95, 'var_99': var_99, 'historical_volatility': hist_vol})
 
 
-def fetch_latest_portfolio_value(user=None):
-    'Return the last allTime accountValueHistory ' \
-        'value, or NaN if absent.'
-    response = post({'type': 'portfolio', 'user': user})
-    periods = {item[0]: item[1] for item in response if isinstance(item, (list,
-                tuple)) and len(item) == 2}
-    history = periods.get('allTime', {}).get('accountValueHistory', [])
-    return float(history[-1][1]) if history else float('nan')
+def account_history_gap_warning(history_value, live_value):
+    """Describe a gap between the latest saved history value and the live value, if material."""
+    if not (pd.notna(history_value) and pd.notna(live_value)) or live_value <= 0:
+        return None
+    gap_pct = abs(history_value / live_value - 1) * 100
+    if gap_pct <= ACCOUNT_VALUE_GAP_WARNING_PCT:
+        return None
+    return (f'Warning: latest account history value ${history_value:,.2f} differs from the live '
+            f'value ${live_value:,.2f} by {gap_pct:.1f}%. A recent deposit or withdrawal can cause '
+            'this until the history catches up; otherwise check the account value inputs.')
 
 
-def print_account_metrics(metrics, new_api_rows, fill_count, portfolio_value, realized_1d=None):
+def rolling_24h_metrics(wallets, fills, funding_events, now=None):
+    """Return flow-excluded account return, realized PnL, and uPnL change over the last 24 hours."""
+    now = now or pd.Timestamp.now(tz='UTC')
+    cutoff = now - pd.Timedelta(hours=24)
+    def funding_since(start):
+        if funding_events.empty:
+            return 0.0
+        times = pd.to_datetime(funding_events['ts'], utc=True)
+        return float(funding_events.loc[times >= start, 'fundingPnl'].sum())
+    def fill_pnl_since(start, perp_only=False):
+        if fills.empty:
+            return 0.0
+        selected = pd.to_datetime(fills['ts'], utc=True) >= start
+        if perp_only:
+            selected &= fills['assetType'] == 'perp'
+        return float(fills.loc[selected, 'closedPnl'].sum())
+    account_index = time_weighted_index([fetch_portfolio_history(wallet, 'day') for wallet in wallets])
+    account_return_pct = (account_index.iloc[-1] / account_index.iloc[0] - 1) * 100 \
+        if len(account_index) > 1 else float('nan')
+    # Perp PnL includes open positions, so removing realized perp PnL leaves the uPnL change.
+    perp_histories = [fetch_perp_pnl_history(wallet, 'perpDay') for wallet in wallets]
+    perp_histories = [history for history in perp_histories if not history.empty]
+    unrealized_change = float('nan')
+    if perp_histories:
+        start = min(history['ts'].iloc[0] for history in perp_histories)
+        perp_pnl = sum(history['pnl'].iloc[-1] - history['pnl'].iloc[0] for history in perp_histories)
+        unrealized_change = perp_pnl - fill_pnl_since(start, perp_only=True) - funding_since(start)
+    return SimpleNamespace(
+        account_return_pct=account_return_pct,
+        realized=fill_pnl_since(cutoff) + funding_since(cutoff),
+        unrealized_change=unrealized_change,
+    )
+
+
+def print_account_metrics(metrics, new_api_rows, fill_count, rolling_24h):
     'Display account performance and risk measures' \
         ' as an interactive table.'
     account = metrics.daily_account
-    account_value = float(account.iloc[-1]) if not account.empty else float('nan')
-    account_change_pct = account.pct_change().iloc[-1] * 100 if len(account) > 1 else float('nan')
-    realized_today = (
-        float(realized_1d) if realized_1d is not None
-        else float(metrics.daily_realized.iloc[-1]) if not metrics.daily_realized.empty else 0.0
-    )
-    realized_pct = realized_today / account_value * 100 if pd.notna(account_value) and \
+    account_value = metrics.current_account_value
+    history_value = float(account.iloc[-1]) if not account.empty else float('nan')
+    realized_pct = rolling_24h.realized / account_value * 100 if pd.notna(account_value) and \
         account_value else float('nan')
-    valid_unrealized = metrics.daily_unrealized.dropna()
-    u_change_today = valid_unrealized.diff().iloc[-1] if len(valid_unrealized) > 1 else float('nan')
     unrealized_pct = metrics.unrealized_pnl_total / account_value * 100 if pd.notna( \
         account_value) and account_value else float('nan')
     def money(value):
         return f'${value:,.2f}' if pd.notna(value) else 'n/a'
     def percent(value):
         return f'{value:.2f}%' if pd.notna(value) else 'n/a'
-    portfolio_value_text = (
-        f'${portfolio_value:,.2f}'
-        if isinstance(portfolio_value, (int, float)) and pd.notna(portfolio_value)
-        else 'n/a' if isinstance(portfolio_value, (int, float)) else str(portfolio_value)
-    )
-    account_history = metrics.daily_account
+    index = metrics.account_index
     drawdown_sample = (
-        f'{len(account_history):,} daily observations '
-        f'({account_history.index.min().date()} to {account_history.index.max().date()})'
-        if not account_history.empty else 'n/a'
+        f'{len(index):,} history points ({index.index.min().date()} to {index.index.max().date()})'
+        if not index.empty else 'n/a'
     )
     rows = [('Account value',
-            f'${account_value:,.2f}' if pd.notna(account_value) else 'n/a'), ('Portfolio value',
-            portfolio_value_text), ('Account 1D (ET)', percent(account_change_pct)), ('Realized today (ET)',
-            money(realized_today)), ('Realized today (% of account value)', percent(realized_pct)),
+            f'${account_value:,.2f}' if pd.notna(account_value) else 'n/a'),
+        ('Account 24H', percent(rolling_24h.account_return_pct)), ('Realized 24H',
+            money(rolling_24h.realized)), ('Realized 24H (% of account value)', percent(realized_pct)),
         ('Unrealized PnL', money(metrics.unrealized_pnl_total)),
         ('Unrealized PnL (% of account value)', percent(unrealized_pct)),
-        ('Unrealized 1D change (ET)', money(u_change_today)), ('Average realized PnL / day',
+        ('Unrealized 24H change', money(rolling_24h.unrealized_change)), ('Average realized PnL / day',
             money(metrics.realized_avg_day)), ('Average unrealized PnL change / day',
             money(metrics.u_avg_day)), ('--- RISK ---', ''), ('BTC alpha / year',
             percent(metrics.alpha_annual)), ('BTC beta',
             f'{metrics.beta:.2f}' if pd.notna(metrics.beta) else 'n/a'), ('Annualized Sharpe',
             f'{metrics.sharpe_annual:.2f}' if pd.notna(metrics.sharpe_annual) else 'n/a'),
         ('Matched BTC observations', str(metrics.btc_sample_n)), ('Average daily account PnL',
-            money(metrics.net_avg_day)), ('Average daily account return',
+            money(metrics.net_avg_day)), ('Daily return observations',
+            str(len(metrics.daily_return_pct))), ('Average daily account return',
             percent(metrics.avg_daily_return_pct)), ('Maximum daily gain',
             percent(metrics.max_daily_gain_pct)), ('Maximum daily loss',
             percent(metrics.max_daily_loss_pct)), ('Account maximum drawdown',
-            f'{money(metrics.account_dd_usd)} ({percent(metrics.account_dd_pct)})'),
+            percent(metrics.account_dd_pct)),
         ('Account drawdown sample', drawdown_sample),
-        ('PnL maximum drawdown', money(metrics.pnl_dd_usd)), ('1D historical VaR 95%',
+        ('PnL maximum drawdown', money(metrics.pnl_dd_usd)), ('24H historical VaR 95%',
             f"{money(metrics.var_95['usd'])} ({percent(metrics.var_95['pct'])}; n={metrics.var_95['n']})"),
-        ('1D historical VaR 99%',
+        ('24H historical VaR 99%',
             f"{money(metrics.var_99['usd'])} ({percent(metrics.var_99['pct'])}; n={metrics.var_99['n']})"),
         ('Historical volatility',
             f"{percent(metrics.historical_volatility['daily_pct'])}/day; {percent(metrics.historical_volatility['annualized_pct'])}/year (n={metrics.historical_volatility['n']})"),
@@ -732,7 +850,7 @@ def print_account_metrics(metrics, new_api_rows, fill_count, portfolio_value, re
         if row['Metric'] == 'BTC beta':
             # Green when the account moves less than BTC, including when it moves opposite.
             return 'color:#188038;font-weight:600;' if text != 'n/a' and float(text) < 1 else ''
-        if row['Metric'] == 'Portfolio value' or row['Metric'].startswith('1D historical VaR'):
+        if row['Metric'].startswith('24H historical VaR'):
             if re.search(r'\$\s*\d', text) and '$-' not in text:
                 return 'color:#188038;font-weight:600;'
         if text.startswith('-') or '$-' in text or '(-' in text:
@@ -745,18 +863,18 @@ def print_account_metrics(metrics, new_api_rows, fill_count, portfolio_value, re
             return ''
         return ''
     print('=== ACCOUNT / PNL AND RISK ===')
+    gap_warning = account_history_gap_warning(history_value, account_value)
+    if gap_warning:
+        print(gap_warning)
     display_interactive_table(table, cell_style=sign_style)
 
 
 class _AccountPnLMixin:
     def show_account_pnl(self):
         data = self._require_data()
-        try:
-            portfolio_value = fetch_latest_portfolio_value(self.wallet_address)
-        except requests.exceptions.RequestException as exc:
-            portfolio_value = f'n/a (API error: {type(exc).__name__})'
         print_account_metrics(
-            self.account_metrics, data.history_rows_added, len(data.realized_fills), portfolio_value
+            self.account_metrics, data.history_rows_added, len(data.realized_fills),
+            rolling_24h_metrics(self.wallet_addresses, data.realized_df, data.funding_df),
         )
 
 
@@ -929,8 +1047,7 @@ def plot_value_added_index(metrics, chart_df, account_index):
 class _AccountVsBTCMixin:
     def show_account_vs_btc(self):
         data = self._require_data()
-        account_index = time_weighted_index([fetch_portfolio_history(self.wallet_address)])
-        plot_value_added_index(self.account_metrics, data.chart_df, account_index)
+        plot_value_added_index(self.account_metrics, data.chart_df, self.account_metrics.account_index)
 
 
 # ----------------------------------------------------------------------------
@@ -1147,142 +1264,465 @@ def fetch_position_rows(user=None, fills=None, fills_complete=False, states=None
     return (states, rows)
 
 
-def summarize_positions(rows, user=None):
-    'Calculate total perp exposure, PnL, and ' \
-        'account-wide margin statistics.'
-    position_value = sum((abs(row['Pos']) for row in rows))
-    unrealized_pnl = sum((row['uPnL'] for row in rows))
-    margin_used = sum((row['Margin'] for row in rows))
-    funding = sum((row['Funding'] for row in rows))
-    balance, priced, excluded = spot_balance_usd(user)
-    return SimpleNamespace(position_value=position_value, unrealized_pnl=unrealized_pnl,
-        margin_used=margin_used, funding=funding, balance=balance,
-        current_account_value=balance + unrealized_pnl,
-        roe=unrealized_pnl / margin_used * 100 if margin_used else 0.0,
-        leverage=position_value / margin_used if margin_used else float('nan'),
-        margin_pct=margin_used / balance * 100 if balance else float('nan'), priced_spot=priced,
-        unpriced_spot=excluded)
+def _positions_total_row(frame):
+    """Sum dollar columns and recompute ratios for the position tables' Net/total row."""
+    position_value = frame['Pos'].abs().sum()
+    margin = frame['Margin'].sum()
+    equity = frame.drop_duplicates('Wallet')['Account value'].sum()
+    price_pnl, funding_pnl = frame['Expected Price PnL (5d)'], frame['Expected Funding PnL (5d)']
+    def expected_return(pnl):
+        notional = frame.loc[pnl.notna(), 'Pos'].abs().sum()
+        return pnl.sum() / notional * 100 if notional else float('nan')
+    # A partial fee total would understate fees, so any unknown fee blanks the total.
+    fees = -frame['Fees USD'].abs().sum() if frame['Fees USD'].notna().all() else float('nan')
+    return {
+        'Ticker': 'Net/total', 'uPnL': frame['uPnL'].sum(),
+        'ROE': frame['uPnL'].sum() / margin * 100 if margin else float('nan'),
+        'Funding (since open)': frame['Funding (since open)'].sum(),
+        'Expected Price PnL (5d)': price_pnl.sum(),
+        'Expected Funding PnL (5d)': funding_pnl.sum(),
+        'Expected PnL incl. funding (5d)': frame['Expected PnL incl. funding (5d)'].sum(),
+        'Expected Price Return (5d)': expected_return(price_pnl),
+        'Expected Funding Return (5d)': expected_return(funding_pnl),
+        'Pos': position_value, 'Margin': margin,
+        'Fees': f'-${abs(fees):,.2f}' if pd.notna(fees) else 'n/a',
+        'Fees / Position (%)': abs(fees) / position_value * 100 if position_value else float('nan'),
+        'Position / Account (%)': position_value / equity * 100 if equity > 0 else float('nan'),
+        'Lev.': position_value / margin if margin else float('nan'),
+    }
 
 
-def display_positions(rows, account_value=float('nan')):
-    """Render the position table, sorted by absolute notional value."""
+def display_positions(rows,show_wallet=False):
+    """Render position tables, sorted by absolute notional value."""
     if not rows:
         print('No open positions.')
         return
     rows, expected_pnl_warnings = add_expected_pnl_columns(rows)
-    frame = pd.DataFrame(rows).sort_values('Pos', key=lambda values: values.abs(),
-        ascending=False).reset_index(drop=True)
+    frame=pd.DataFrame(rows).sort_values('Pos',key=lambda values:values.abs(),ascending=False).reset_index(drop=True)
     position_value = pd.to_numeric(frame['Pos'], errors='coerce').abs()
-    equity = pd.to_numeric(frame['Account value'], errors='coerce') if 'Account value' in frame else pd.Series(
-        account_value, index=frame.index, dtype=float
-    )
+    equity = pd.to_numeric(frame['Account value'], errors='coerce')
     funding = pd.to_numeric(frame['Funding'], errors='coerce')
     fees_usd = pd.to_numeric(frame['Fees USD'], errors='coerce')
-    frame['Funding / Equity (%)'] = (funding / equity * 100).where(equity > 0)
-    frame['Funding / Position (%)'] = (funding / position_value * 100).where(position_value > 0)
-    frame['Fees / Equity (%)'] = (fees_usd.abs() / equity * 100).where(equity > 0)
     frame['Fees / Position (%)'] = (fees_usd.abs() / position_value * 100).where(position_value > 0)
     frame['Position / Account (%)'] = (position_value / equity * 100).where(equity > 0)
-    frame = frame.rename(columns={'Funding': 'Funding (since open)'})
-    position_columns = ['Coin', 'Dex', 'Liq %', 'ROE', 'uPnL', 'Funding (since open)',
-        'Funding / Equity (%)', 'Funding / Position (%)', 'Funding (1h)', 'Funding APR',
-        'Expected Price PnL (5d)', 'Expected Funding PnL (5d)',
-        'Expected PnL incl. funding (5d)',
-        'Expected Price Return (5d)', 'Expected Funding Return (5d)',
-        'Entry', 'Mark', 'Pos', 'Margin', 'Margin Type', 'Margin %', 'Fees',
-        'Fees / Equity (%)', 'Fees / Position (%)', 'Position / Account (%)',
-        'Liq Px', 'Lev.', 'Sz']
-    usd = lambda value: f'-${abs(value):,.2f}' if value < 0 else f'${value:,.2f}'
-    usd_whole = lambda value: f'-${abs(value):,.0f}' if value < 0 else f'${value:,.0f}'
-    price = lambda value: f'{value:,.8g}'
-    def position_style(row_index, column, value, row):
-        if column == 'Coin':
-            return 'color:#c62828;font-weight:600;' if row['Side'] == 'SHORT' else \
-                'color:#188038;font-weight:600;'
-        if column == 'Margin Type':
-            return {'Isolated': 'color:#c62828;font-weight:600;',
-                'Cross': 'color:#188038;font-weight:600;'}.get(value, '')
-        if column == 'Mark':
-            in_profit = value > row['Entry'] if row['Side'] == 'LONG' else value < row['Entry']
-            return 'color:#188038;font-weight:600;' if in_profit else \
+    frame = frame.rename(columns={'Funding': 'Funding (since open)','Coin':'Ticker'})
+    frame = pd.concat([frame,pd.DataFrame([_positions_total_row(frame)])],ignore_index=True)
+    blank_total_cells={(len(frame)-1,column) for column in frame.columns}
+    # Split across two tables so each fits on screen; both repeat the identifying columns.
+    identifiers=(['Wallet'] if show_wallet else [])+['Ticker','Side']
+    pnl_columns=identifiers+['Liq %','ROE','uPnL','Funding (since open)',
+             'Funding (1h)','Funding APR',
+             'Expected Price PnL (5d)','Expected Funding PnL (5d)',
+             'Expected PnL incl. funding (5d)',
+             'Expected Price Return (5d)','Expected Funding Return (5d)']
+    position_columns=identifiers+['Entry','Mark','Pos','Margin','Margin Type','Margin %','Fees',
+             'Fees / Position (%)','Position / Account (%)',
+             'Liq Px','Lev.','Sz']
+    usd=lambda value:f'-${abs(value):,.2f}' if value<0 else f'${value:,.2f}'
+    def style(row_index,column,value,row):
+        if column=='Side' and value in {'LONG','SHORT'}:
+            return 'color:#188038;font-weight:600;' if value=='LONG' else \
                 'color:#c62828;font-weight:600;'
-        if column == 'Fees':
-            return 'color:#c62828;'
+        if column=='Mark' and pd.notna(value) and pd.notna(row['Entry']):
+            out_of_money=(row['Side']=='LONG' and value<row['Entry']) or \
+                (row['Side']=='SHORT' and value>row['Entry'])
+            return 'color:#c62828;font-weight:600;' if out_of_money else ''
+        if column in {'Funding (1h)','Funding APR'} and pd.notna(value):
+            if value==0: return ''
+            pays=(value>0 and row['Side']=='LONG') or (value<0 and row['Side']=='SHORT')
+            return 'color:#c62828;font-weight:600;' if pays else 'color:#188038;font-weight:600;'
         if column == 'Liq %' and pd.notna(value):
-            return 'color:#c62828;' if value <= 10 else 'color:#d97706;' if value <= 25 \
-                else 'color:#188038;'
-        if column in {'Funding (1h)', 'Funding APR'} and pd.notna(value):
-            if value == 0:
-                return ''
-            account_pays = (value > 0 and row['Side'] == 'LONG') or \
-                (value < 0 and row['Side'] == 'SHORT')
-            return 'color:#c62828;font-weight:600;' if account_pays else \
-                'color:#188038;font-weight:600;'
-        if column in {'Fees / Equity (%)', 'Fees / Position (%)', 'Fees'}:
+            return 'color:#c62828;' if value <= 10 else \
+                'color:#d97706;' if value <= 25 else 'color:#188038;'
+        if column in {'Fees','Fees / Position (%)'}:
             return 'color:#c62828;'
-        if column in {'uPnL', 'ROE', 'Funding (since open)', 'Funding / Equity (%)',
-                'Funding / Position (%)', 'Expected Price PnL (5d)',
-                'Expected Funding PnL (5d)', 'Expected PnL incl. funding (5d)',
-                'Expected Price Return (5d)', 'Expected Funding Return (5d)'} and isinstance(value, (int, float)):
-            return 'color:#188038;' if value > 0 else 'color:#c62828;' if value < 0 else ''
+        if column in {'uPnL','ROE','Funding (since open)','Expected Price PnL (5d)',
+                'Expected Funding PnL (5d)','Expected PnL incl. funding (5d)',
+                'Expected Price Return (5d)','Expected Funding Return (5d)'} and pd.notna(value):
+            return 'color:#188038;' if value>0 else 'color:#c62828;' if value<0 else ''
+        if column=='Fees': return 'color:#c62828;'
         return ''
-    display_interactive_table(frame, formatters={'Sz': lambda value: f'{value:,.2f}',
-            'Entry': price, 'Mark': price, 'Pos': usd_whole,
-            'Liq %': lambda value: f'{value:,.2f}%' if pd.notna(value) else 'n/a', 'uPnL': usd,
-            'ROE': lambda value: f'{value:.2f}%', 'Lev.': lambda value: f'{value:.2f}x',
-            'Liq Px': price, 'Margin': usd_whole, 'Funding (since open)': usd,
-            'Funding (1h)': lambda value: f'{value:.6f}%' if pd.notna(value) else 'n/a',
-            'Funding APR': lambda value: f'{value:.2f}%' if pd.notna(value) else 'n/a',
-            'Funding / Equity (%)': lambda value: f'{value:.3f}%' if pd.notna(value) else 'n/a',
-            'Funding / Position (%)': lambda value: f'{value:.3f}%' if pd.notna(value) else 'n/a',
-            'Expected Price PnL (5d)': usd,
-            'Expected Funding PnL (5d)': usd,
-            'Expected PnL incl. funding (5d)': usd,
-            'Expected Price Return (5d)': lambda value: f'{value:.3f}%' if pd.notna(value) else 'n/a',
-            'Expected Funding Return (5d)': lambda value: f'{value:.3f}%' if pd.notna(value) else 'n/a',
-            'Fees / Equity (%)': lambda value: f'{value:.3f}%' if pd.notna(value) else 'n/a',
-            'Fees / Position (%)': lambda value: f'{value:.3f}%' if pd.notna(value) else 'n/a',
-            'Position / Account (%)': lambda value: f'{value:.2f}%' if pd.notna(value) else 'n/a',
-            'Margin %': lambda value: f'{value:.2f}%' if pd.notna(value) else 'n/a'},
-        cell_style=position_style, columns=position_columns)
+    formatters={
+        'Sz':lambda v:f'{v:,.2f}','Pos':lambda v:f'${v:,.0f}','Margin':lambda v:f'${v:,.0f}',
+        'Liq %':lambda v:f'{v:.2f}%' if pd.notna(v) else 'n/a',
+        'ROE':lambda v:f'{v:.2f}%','uPnL':usd,'Funding (since open)':usd,
+        'Fees / Position (%)':lambda v:f'{v:.3f}%' if pd.notna(v) else 'n/a',
+        'Position / Account (%)':lambda v:f'{v:.2f}%' if pd.notna(v) else 'n/a',
+        'Funding (1h)':lambda v:f'{v:.6f}%' if pd.notna(v) else 'n/a',
+        'Funding APR':lambda v:f'{v:.2f}%' if pd.notna(v) else 'n/a',
+        'Expected Price PnL (5d)':usd,
+        'Expected Funding PnL (5d)':usd,
+        'Expected PnL incl. funding (5d)':usd,
+        'Expected Price Return (5d)':lambda v:f'{v:.3f}%' if pd.notna(v) else 'n/a',
+        'Expected Funding Return (5d)':lambda v:f'{v:.3f}%' if pd.notna(v) else 'n/a',
+        'Entry':lambda v:f'{v:,.8g}','Mark':lambda v:f'{v:,.8g}',
+        'Liq Px':lambda v:f'{v:,.5g}' if pd.notna(v) else 'n/a','Lev.':lambda v:f'{v:.2f}x',
+        'Margin %':lambda v:f'{v:.2f}%' if pd.notna(v) else 'n/a',
+    }
+    for columns in (pnl_columns,position_columns):
+        display_interactive_table(frame,columns=columns,cell_style=style,formatters=formatters,
+                                  bold_last=True,blank_missing_cells=blank_total_cells)
     print('Funding and fees are cumulative since the position was opened. Fee ratios are '
           'shown only for complete USDC-denominated fees; otherwise they are n/a.')
     if expected_pnl_warnings:
         print('Expected-PnL history warnings: ' + '; '.join(expected_pnl_warnings))
 
+def _long_short_markup(long_value, short_value):
+    """Render a ``long/short`` table cell with long in green and short in red."""
+    return (f"<span style='color:#188038;'>{long_value}</span>/"
+            f"<span style='color:#c62828;'>{short_value}</span>")
+
+def display_exposure_and_funding(rows):
+    """Render account net exposure, net funding, and funding by asset and side."""
+    funding_rows = consolidate_current_funding(rows)
+    if not funding_rows:
+        return
+    print('=== ACCOUNT NET EXPOSURE ===')
+    summary = summarize_current_funding(rows)
+    account_summary = pd.DataFrame([{
+        **summary,
+        'Long/Short Positions': _long_short_markup(
+            summary['Long Positions'], summary['Short Positions']),
+        'Long/Short Notional ($)': _long_short_markup(
+            f"${summary['Long Notional ($)']:,.2f}", f"${summary['Short Notional ($)']:,.2f}"),
+    }])
+    exposure_columns = [
+        'Net Direction', 'Long/Short Positions', 'Long/Short Notional ($)',
+        'Gross Notional ($)', 'Net Notional ($)', 'Net Exposure / Gross (%)',
+    ]
+    display_interactive_table(account_summary, columns=exposure_columns,
+        html_columns={'Long/Short Positions', 'Long/Short Notional ($)'}, formatters={
+        'Gross Notional ($)': lambda value: f'${value:,.2f}',
+        'Net Notional ($)': lambda value: f'${abs(value):,.2f}',
+        'Net Exposure / Gross (%)': lambda value: f'{abs(value):.2f}%' if pd.notna(value) else 'n/a',
+    })
+    print('Net direction compares long and short USD notionals; it is not delta- or beta-adjusted.')
+    print('=== ACCOUNT NET FUNDING ===')
+    funding_columns = [
+        'Net Funding Rate / 1h (%) (covered)',
+        'Net Funding APR (%) (simple, covered)',
+        'Estimated Net Funding PnL / hour ($)',
+        'Estimated Net Funding PnL / day ($)',
+        'Funding-Covered Notional ($)', 'Funding Coverage (%)',
+    ]
+    display_interactive_table(account_summary, columns=funding_columns, formatters={
+        'Net Funding Rate / 1h (%) (covered)': lambda value: f'{value:.6f}%' if pd.notna(value) else 'n/a',
+        'Net Funding APR (%) (simple, covered)': lambda value: f'{value:.2f}%' if pd.notna(value) else 'n/a',
+        'Estimated Net Funding PnL / hour ($)': lambda value: f'${value:,.4f}',
+        'Estimated Net Funding PnL / day ($)': lambda value: f'${value:,.2f}',
+        'Funding-Covered Notional ($)': lambda value: f'${value:,.2f}',
+        'Funding Coverage (%)': lambda value: f'{value:.1f}%' if pd.notna(value) else 'n/a',
+    })
+    print('Net funding rate is estimated net funding cash flow divided by funding-covered gross '
+          'notional. Positive cash flow means estimated receipts. APR assumes current hourly '
+          'rates persist; it is not a forecast.')
+    print('=== FUNDING BY ASSET AND SIDE ===')
+    frame = pd.DataFrame(funding_rows)
+    position_values = frame['Position Value ($)']
+    frame = pd.concat([frame, pd.DataFrame([{
+        'Coin': 'Net/total', 'Position Value ($)': position_values.sum(),
+        'Estimated Funding PnL / hour ($)': frame['Estimated Funding PnL / hour ($)'].sum(),
+        'Estimated Funding PnL / day ($)': frame['Estimated Funding PnL / day ($)'].sum(),
+        'Funding Coverage (%)': (
+            (frame['Funding Coverage (%)'] * position_values).sum() / position_values.sum()
+            if position_values.sum() > 0 else float('nan')
+        ),
+    }])], ignore_index=True)
+    columns = [
+        'Coin', 'Side', 'Size', 'Position Value ($)',
+        'Current Funding / 1h (%)', 'Funding APR (%)',
+        'Estimated Funding PnL / hour ($)',
+        'Estimated Funding PnL / day ($)', 'Funding Coverage (%)',
+    ]
+
+    def style(row_index, column, value, row):
+        if column == 'Side':
+            return 'color:#188038;font-weight:600;' if value == 'LONG' else \
+                'color:#c62828;font-weight:600;'
+        if column in {'Estimated Funding PnL / hour ($)',
+                      'Estimated Funding PnL / day ($)'} and pd.notna(value):
+            return 'color:#188038;' if value > 0 else \
+                'color:#c62828;' if value < 0 else ''
+        return ''
+
+    display_interactive_table(frame, columns=columns, cell_style=style, formatters={
+        'Size': lambda value: f'{value:,.4g}',
+        'Position Value ($)': lambda value: f'${value:,.2f}',
+        'Current Funding / 1h (%)': lambda value: f'{value:.6f}%' if pd.notna(value) else 'n/a',
+        'Funding APR (%)': lambda value: f'{value:.2f}%' if pd.notna(value) else 'n/a',
+        'Estimated Funding PnL / hour ($)': lambda value: f'${value:,.4f}',
+        'Estimated Funding PnL / day ($)': lambda value: f'${value:,.2f}',
+        'Funding Coverage (%)': lambda value: f'{value:.1f}%' if pd.notna(value) else 'n/a',
+    }, bold_last=True, blank_missing_cells={(len(frame) - 1, column) for column in columns})
+    print('Funding rates are current hourly rates, weighted by position notional. '
+          'Positive rates are paid by longs and received by shorts; estimated cash flows '
+          'assume the current rate stays constant. APR is simple annualization, not a forecast.')
+
+
+def _fetch_daily_atr(coin, period):
+    if not isinstance(period, int) or period <= 0:
+        raise ValueError('ATR_PERIOD must be a positive integer.')
+    dex = ''
+    base_coin = coin
+    if ':' in coin:
+        dex, base_coin = coin.split(':', 1)
+    candles = fetch_daily_candles(base_coin, dex, lookback_days=max(period * 10 + 30, 365))
+    available_ranges = len(true_range(candles))
+    if available_ranges == 0:
+        raise RuntimeError(f'No completed daily true-range observations available for {coin}.')
+    period_used = min(period, available_ranges)
+    return wilder_atr(candles, period_used), period_used
+
+
+def _aggregate_open_risk(rows, atr_period, atr_stop_multiple):
+    """Sum stop risk plus the adverse five-day funding reserve per asset and side."""
+    if not rows:
+        return 0.0
+    if not np.isfinite(atr_stop_multiple) or atr_stop_multiple <= 0:
+        raise ValueError('ATR_STOP_MULTIPLE must be a positive finite value.')
+    grouped = {}
+    for row in rows:
+        key = (str(row['Coin']), str(row['Side']).upper())
+        if key[1] not in {'LONG', 'SHORT'}:
+            raise ValueError(f'Unsupported position side for {key[0]}: {key[1]}')
+        grouped.setdefault(key, []).append(row)
+    open_risk_total = 0.0
+    atr_by_asset = {}
+    funding_by_asset = {}
+    short_history = set()
+    for (coin, side), positions in sorted(grouped.items()):
+        direction = 1 if side == 'LONG' else -1
+        quantities = [abs(float(position['Sz'])) for position in positions]
+        marks = [float(position['Mark']) for position in positions]
+        oracles = [float(position.get('Oracle', position['Mark'])) for position in positions]
+        total_quantity = sum(quantities)
+        if total_quantity <= 0 or not all(np.isfinite(value) for value in quantities + marks + oracles):
+            raise ValueError(f'Cannot calculate open risk for {coin} {side}: invalid size or mark.')
+        current_mark = sum(quantity * mark for quantity, mark in zip(quantities, marks)) / total_quantity
+        current_oracle = sum(quantity * oracle for quantity, oracle in zip(quantities, oracles)) / total_quantity
+        if coin not in atr_by_asset:
+            atr_by_asset[coin] = _fetch_daily_atr(coin, atr_period)
+        atr, atr_period_used = atr_by_asset[coin]
+        if atr_period_used < atr_period:
+            short_history.add(coin)
+        stop = current_mark - direction * atr_stop_multiple * atr
+        dex = coin.split(':', 1)[0] if ':' in coin else ''
+        base_coin = coin.split(':', 1)[-1]
+        funding_key = (base_coin, dex)
+        if funding_key not in funding_by_asset:
+            funding_by_asset[funding_key] = fetch_funding_history(
+                base_coin, dex, lookback_days=20
+            )
+        funding_reserve_per_unit = adverse_funding_cost_per_unit(
+            funding_by_asset[funding_key], side, current_oracle,
+            horizon_hours=5 * 24, percentile=0.95,
+        )
+        open_risk_total += sum(
+            quantity * max(direction * (mark - stop), 0.0)
+            for quantity, mark in zip(quantities, marks)
+        ) + total_quantity * funding_reserve_per_unit
+    if short_history:
+        print(f'Limited daily history; ATR uses all completed candles available (shorter than '
+              f'{atr_period} days) for: {", ".join(sorted(short_history))}.')
+    return open_risk_total
+
+
+class _HighlightsMixin:
+    highlights_state_file=STATE_FILE_NAME
+    _highlights_baseline=None
+    _highlights_baseline_loaded=False
+
+    def _positions_missing_stops(self,rows):
+        missing=[]
+        # Position rows identify a wallet by its last four characters.
+        orders={wallet[-4:]:[] for wallet in self.wallet_addresses}
+        for wallet in self.wallet_addresses:
+            for dex in {row['Dex'] for row in rows if row['Wallet']==wallet[-4:]}:
+                orders[wallet[-4:]].extend(post({'type':'frontendOpenOrders','user':wallet,'dex':dex}))
+        for row in rows:
+            stops=[
+                order for order in orders[row['Wallet']]
+                if order.get('coin')==row['Coin'] and order.get('reduceOnly')
+                and 'stop' in str(order.get('orderType','')).lower()
+            ]
+            # A position-level stop has size zero because it always closes the whole position.
+            covered=any(order.get('isPositionTpsl') for order in stops) or \
+                sum(float(order['sz']) for order in stops)>=abs(float(row['Sz']))*0.999
+            if not covered:
+                missing.append(f"{row['Coin']} ({row['Wallet']})")
+        return missing
+
+    def show_highlights(self):
+        data=self._require_data()
+        rows=self._load_positions()
+        now=pd.Timestamp.now(tz=ACCOUNTING_TIMEZONE)
+        # Keep the same baseline if this cell is rerun without fetching new data.
+        if not self._highlights_baseline_loaded:
+            self._highlights_baseline=load_state(self.data_dir,self.highlights_state_file)
+            self._highlights_baseline_loaded=True
+        baseline=self._highlights_baseline
+        windows=[fetch_pnl_windows(wallet) for wallet in self.wallet_addresses]
+        pnl_24h,cumulative_pnl=(sum(values) for values in zip(*windows))
+        margin_capacity=self.collateral_equity*(1-self.margin_reserve_pct/100)
+        well,attention=build_highlights(
+            now,baseline,rows,data.realized_df,data.funding_df,cumulative_pnl,pnl_24h,
+            data.current_account_value,
+            _aggregate_open_risk(rows,self.position_atr_period,self.position_atr_stop_multiple),
+            self.collateral_equity*self.aggregate_risk_pct/100,
+            margin_capacity-sum(row['Margin'] for row in rows),margin_capacity,
+            self._positions_missing_stops(rows),
+        )
+        if baseline is None:
+            print('No earlier run saved yet, so "Since last run" starts from the next run.')
+        else:
+            print(f"Last run: {pd.Timestamp(baseline['ts']).tz_convert(ACCOUNTING_TIMEZONE):%Y-%m-%d %H:%M %Z}.")
+            for change,names in position_changes(baseline,rows).items():
+                if names:
+                    print(f"{change}: {', '.join(names)}.")
+        for title,table in (('WHAT WENT WELL',well),('NEEDS ATTENTION',attention)):
+            print(f'=== {title} ===')
+            if table:
+                display_interactive_table(pd.DataFrame(table),columns=['Window','Update','Detail'])
+            else:
+                print('Nothing to report.')
+        save_state(self.data_dir,make_state(now,cumulative_pnl,rows),self.highlights_state_file)
+
 
 class _OpenPositionsMixin:
+    position_atr_period=14
+    position_atr_stop_multiple=1.25
+    margin_reserve_pct=20.0
+    aggregate_risk_pct=20.0
+
+    def show_funding_apr_chart(self):
+        events=[
+            event for wallet in self.wallet_addresses
+            for event in fetch_user_funding(wallet)
+        ]
+        history=net_funding_apr_history(events,timezone=ACCOUNTING_TIMEZONE)
+        if history.empty:
+            print('No funding history is available.')
+            return None
+        periods=inactive_periods(history.index)
+        filled=history.reindex(pd.date_range(history.index.min(),history.index.max(),freq='D'))
+        fig=go.Figure()
+        fig.add_trace(go.Scatter(
+            x=filled.index,y=filled['apr_pct'],name='Daily',mode='lines',
+            line={'color':'#b5b4ad','width':1},
+            hovertemplate='Daily %{y:.2f}%<extra></extra>',
+        ))
+        fig.add_trace(go.Scatter(
+            x=filled.index,y=filled['rolling_apr_pct'],name='7-day (notional-weighted)',mode='lines',
+            line={'color':'#2a78d6','width':2},
+            hovertemplate='7-day %{y:.2f}%<extra></extra>',
+        ))
+        fig.add_hline(y=0,line_color='#52514e',line_width=1)
+        fig.update_layout(
+            title='Net Funding APR (%) (simple, covered) over time'+(', all wallets' if len(self.wallet_addresses)>1 else ''),
+            template='plotly_white',height=480,hovermode='x unified',
+            yaxis_title='Net funding APR (positive = received)',yaxis_ticksuffix='%',
+            legend={'orientation':'h','y':1.02,'yanchor':'bottom','x':0,'xanchor':'left'},
+            margin={'t':90},
+        )
+        fig.update_xaxes(showgrid=False)
+        clip_inactive_periods(fig,periods)
+        fig.update_yaxes(gridcolor='#ecebe6',zeroline=False)
+        latest=history.iloc[-1]
+        print(f"Latest 7-day net funding APR: {latest['rolling_apr_pct']:.2f}% "
+              f"({history.index[-1]:%Y-%m-%d}, {ACCOUNTING_TIMEZONE} days). "
+              f"Lifetime: {history['funding_pnl'].sum()/history['notional_hours'].sum()*24*365*100:.2f}% "
+              f"on ${history['funding_pnl'].sum():,.2f} net funding.")
+        fig.show()
+        return history
+
     def show_open_positions(self):
-        self._require_data()
-        self._load_positions()
-        display_positions(self.positions, self.data.current_account_value)
-        self.position_summary = summarize_positions(self.positions, self.wallet_address)
-        summary = self.position_summary
-        position_summary = pd.DataFrame([
-            ("Position value", f"${summary.position_value:,.0f}"),
-            ("uPnL", f"${summary.unrealized_pnl:,.2f}"),
-            ("ROE", f"{summary.roe:,.2f}%"),
-            ("Margin", f"${summary.margin_used:,.0f}"),
-            ("Margin % bal",
-                        f"{summary.margin_pct:,.2f}%" if pd.notna(summary.margin_pct) else "n/a"),
-            ("Leverage (Pos / Margin)",
-                        f"{summary.leverage:,.2f}x" if pd.notna(summary.leverage) else "n/a"),
-            ("Funding (open positions, since open)", f"${summary.funding:,.2f}"),
-        ], columns=["Metric", "Value"])
-        def position_summary_style(*cell):
-            _, column, value, row = cell
-            if column != "Value" or not isinstance(value, str):
-                return ""
-            if row["Metric"] in {"Position value", "Margin"}:
-                return "color:#188038;font-weight:600;"
-            if row["Metric"] in {"uPnL", "ROE",
-                "Funding (open positions, since open)"} and (value.startswith("-") or "$-" in value):
-                return "color:#c62828;font-weight:600;"
-            if row["Metric"] in {"uPnL", "ROE", "Funding (open positions, since open)"}:
-                numeric = float(value.replace("$", "").replace("%", "").replace(",", ""))
-                return "color:#188038;font-weight:600;" if numeric > 0 else ""
-            return ""
-        display_interactive_table(position_summary, cell_style=position_summary_style)
+        data=self._require_data()
+        rows=self._load_positions()
+        display_positions(rows,show_wallet=len(self.wallet_addresses)>1)
+        display_exposure_and_funding(rows)
+        if not np.isfinite(self.margin_reserve_pct) or not 0 <= self.margin_reserve_pct < 100:
+            raise ValueError('MARGIN_RESERVE_PCT must be at least 0 and less than 100.')
+        if not np.isfinite(self.aggregate_risk_pct) or self.aggregate_risk_pct<=0:
+            raise ValueError('AGGREGATE_RISK_PCT must be a positive finite percentage.')
+        available_margin=self.collateral_equity*(1-self.margin_reserve_pct/100)
+        aggregate_risk_cap=self.collateral_equity*self.aggregate_risk_pct/100
+        open_risk=_aggregate_open_risk(rows,self.position_atr_period,self.position_atr_stop_multiple)
+        position_value=sum(abs(row['Pos']) for row in rows)
+        margin=sum(row['Margin'] for row in rows)
+        funding=sum(row['Funding'] for row in rows)
+        remaining_available_margin=(
+            available_margin-margin if pd.notna(available_margin) else float('nan')
+        )
+        available_margin_used_pct=(
+            margin/available_margin*100 if pd.notna(available_margin) and available_margin>0
+            else float('nan')
+        )
+        remaining_available_margin_pct=(
+            remaining_available_margin/available_margin*100
+            if pd.notna(available_margin) and available_margin>0 else float('nan')
+        )
+        position_equity_pct=(
+            position_value/data.current_account_value*100
+            if data.current_account_value>0 else float('nan')
+        )
+        funding_equity_pct=(
+            funding/data.current_account_value*100 if data.current_account_value>0 else float('nan')
+        )
+        funding_position_pct=(
+            funding/position_value*100 if position_value>0 else float('nan')
+        )
+        summary=pd.DataFrame([
+            *([('Wallets',f'{len(self.wallet_addresses):,}')] if len(self.wallet_addresses)>1 else []),
+            ('Position value',f'${position_value:,.0f}'),
+            ('uPnL',f'${data.unrealized_pnl_total:,.2f}'),
+            ('ROE',f'{data.unrealized_pnl_total/margin*100:,.2f}%' if margin else 'n/a'),
+            ('Margin',f'${margin:,.0f}'),
+            ('Margin % bal',f'{margin/data.balance_total*100:,.2f}%' if data.balance_total else 'n/a'),
+            (f'Available margin ({100-self.margin_reserve_pct:g}% of collateral)',
+             f'${available_margin:,.2f}' if pd.notna(available_margin) else 'n/a'),
+            (f'Available margin used ({self.margin_reserve_pct:g}% reserve)',
+             f'{available_margin_used_pct:,.2f}%' if pd.notna(available_margin_used_pct) else 'n/a'),
+            ('Available margin remaining',
+             f'${remaining_available_margin:,.2f}' if pd.notna(remaining_available_margin) else 'n/a'),
+            ('Available margin remaining (%)',
+             f'{remaining_available_margin_pct:,.2f}%'
+             if pd.notna(remaining_available_margin_pct) else 'n/a'),
+            (f'Aggregate risk cap ({self.aggregate_risk_pct:g}% of collateral)',f'${aggregate_risk_cap:,.2f}'),
+            ('Aggregate risk used',f'${open_risk:,.2f}'),
+            ('Aggregate risk room',f'${aggregate_risk_cap-open_risk:,.2f}'),
+            ('Position / Equity (%)',f'{position_equity_pct:,.2f}%'
+             if pd.notna(position_equity_pct) else 'n/a'),
+            ('Leverage (Pos / Margin)',f'{position_value/margin:,.2f}x' if margin else 'n/a'),
+            ('Funding (open positions, since open)',f'${funding:,.2f}'),
+            ('Funding / Equity (%)',f'{funding_equity_pct:,.3f}%' if pd.notna(funding_equity_pct) else 'n/a'),
+            ('Funding / Position (%)',f'{funding_position_pct:,.3f}%' if pd.notna(funding_position_pct) else 'n/a'),
+            ('Margin collateral',f'${self.collateral_equity:,.2f}'),
+            ('Account value',f'${data.current_account_value:,.2f}'),
+        ],columns=['Metric','Value'])
+        def style(*cell):
+            _,column,value,row=cell
+            if column!='Value':
+                return ''
+            if row['Metric'] in {'Margin','Position value','Account value',
+                                f'Available margin ({100-self.margin_reserve_pct:g}% of collateral)',
+                                'Position / Equity (%)'}:
+                return 'color:#188038;font-weight:600;'
+            if row['Metric'] in {'Available margin remaining',
+                                'Available margin remaining (%)','Aggregate risk room'}:
+                if isinstance(value,str) and (value.startswith('-') or '$-' in value):
+                    return 'color:#c62828;font-weight:600;'
+                return 'color:#188038;font-weight:600;' if value!='n/a' else ''
+            if row['Metric'] not in {'uPnL','ROE','Funding (open positions, since open)',
+                                    'Funding / Equity (%)','Funding / Position (%)'}:
+                return ''
+            if isinstance(value,str) and (value.startswith('-') or '$-' in value):
+                return 'color:#c62828;font-weight:600;'
+            if isinstance(value,str) and value!='n/a':
+                return 'color:#188038;font-weight:600;'
+            return ''
+        display_interactive_table(summary,cell_style=style)
+        print('ROE is unrealized PnL divided by used margin; a negative ROE means the open positions '
+              'are currently at an unrealized loss relative to the margin supporting them.')
 
 
 # ----------------------------------------------------------------------------
@@ -1303,9 +1743,12 @@ def split_realized_fills(realized_df):
         realized_df[realized_df['assetType'] == 'spot'].copy())
 
 
-def realized_pnl_stats(frame, funding_history=None, now=None):
-    'Summarize fee-net fill PnL plus signed ' \
-        'funding, with trade stats based on fills.'
+def realized_pnl_stats(frame, funding_history=None, now=None, funding_events=None):
+    """Summarize fee-net fill PnL plus signed funding, with trade stats based on fills.
+
+    ``funding_history`` holds daily totals, which suit calendar periods. Pass
+    ``funding_events`` so the 24H, 7D, and 30D windows use exact funding times.
+    """
     now = now or pd.Timestamp.now(tz=ACCOUNTING_TIMEZONE)
     quarter_start_month = (now.month - 1) // 3 * 3 + 1
     quarter_start = pd.Timestamp(year=now.year, month=quarter_start_month, day=1, tz=ACCOUNTING_TIMEZONE)
@@ -1323,9 +1766,14 @@ def realized_pnl_stats(frame, funding_history=None, now=None):
         'avg_win_pct': float('nan'), 'avg_loss_pct': float('nan'), 'ev': float('nan'), 'fills': 0}
     if frame.empty and funding_history.empty:
         return empty_result
-    def combined_pnl_since(start_time=None):
+    if funding_events is None or funding_events.empty:
+        window_funding = funding_history
+    else:
+        window_funding = funding_events.copy()
+        window_funding['ts'] = pd.to_datetime(window_funding['ts'], utc=True)
+    def combined_pnl_since(start_time=None, funding=None):
         fill_part = frame
-        funding_part = funding_history
+        funding_part = funding_history if funding is None else funding
         if start_time is not None:
             if not fill_part.empty:
                 fill_part = fill_part.loc[fill_part['ts'] >= start_time]
@@ -1351,9 +1799,9 @@ def realized_pnl_stats(frame, funding_history=None, now=None):
         closed_count else float('nan')
     return {'total': combined_pnl_since(),
         'funding': float(funding_history['fundingPnl'].sum()) if not funding_history.empty else 0.0,
-        '1d': combined_pnl_since(now - pd.Timedelta(days=1)),
-        '7d': combined_pnl_since(now - pd.Timedelta(days=7)),
-        '30d': combined_pnl_since(now - pd.Timedelta(days=30)),
+        '1d': combined_pnl_since(now - pd.Timedelta(days=1), window_funding),
+        '7d': combined_pnl_since(now - pd.Timedelta(days=7), window_funding),
+        '30d': combined_pnl_since(now - pd.Timedelta(days=30), window_funding),
         'qtd': combined_pnl_since(quarter_start), 'ytd': combined_pnl_since(year_start),
         'wins': len(wins), 'losses': len(losses), 'win_p': win_probability,
         'loss_p': loss_probability, 'avg_win': average_win, 'avg_loss': average_loss,
@@ -1401,9 +1849,10 @@ def perp_close_counts(perp_frame):
     return closes
 
 
-def print_realized_stats(frame, label, funding_history=None, account_value=float('nan')):
+def print_realized_stats(frame, label, funding_history=None, account_value=float('nan'),
+    funding_events=None):
     'Display realized PnL summary metrics with account-value shares.'
-    stats = realized_pnl_stats(frame, funding_history=funding_history)
+    stats = realized_pnl_stats(frame, funding_history=funding_history, funding_events=funding_events)
     rows = [
         ('Realized PnL', stats['total'], 'money', True),
         ('24H', stats['1d'], 'money', True),
@@ -1452,8 +1901,7 @@ def print_realized_stats(frame, label, funding_history=None, account_value=float
             return 'color:#c62828;font-weight:600;'
         return 'color:#c62828;' if str(value).startswith('-') or '$-' in str(value) else \
             'color:#188038;'
-    print(f'=== REALIZED {label} ===')
-    display_interactive_table(table, cell_style=stats_style)
+    display_interactive_table(table, cell_style=stats_style, title=f'REALIZED {label}')
 
 
 def perp_pnl_breakdown(perp_fills, funding_history=None):
@@ -1509,9 +1957,9 @@ class _RealizedPnLMixin:
     def show_realized_pnl(self):
         data = self._require_data()
         perp_df, spot_df = split_realized_fills(data.realized_df)
-        print_realized_stats(spot_df, "SPOT", account_value=data.current_account_value)
         print_realized_stats(perp_df, "PERP", funding_history=data.funding_history_df,
-            account_value=data.current_account_value)
+            account_value=data.current_account_value, funding_events=data.funding_df)
+        print_realized_stats(spot_df, "SPOT", account_value=data.current_account_value)
         print("\n=== PERP PNL BREAKDOWN ===")
         perp_breakdown, non_usd_fee_tokens = perp_pnl_breakdown(perp_df, data.funding_history_df)
         net_row_index = perp_breakdown.index[perp_breakdown["Component"] == "Net perp PnL"][0]
@@ -1589,7 +2037,21 @@ def summarize_volume_pnl(daily_data):
                     method='pearson') if len(part) >= 2 else float('nan'),
                 'Daily Spearman r': part['volume'].corr(part['realized_pnl'],
                     method='spearman') if len(part) >= 2 else float('nan')})
+    if rows:
+        total_volume = daily_data['volume'].sum()
+        total_pnl = daily_data['realized_pnl'].sum()
+        pnl_ratio = total_pnl / total_volume if total_volume else float('nan')
+        rows.append({'Market': 'Net/total', 'Volume ($)': total_volume,
+            'Realized PnL excl. funding (trading + fees) ($)': total_pnl,
+            'Realized PnL / Volume (%)': pnl_ratio * 100, 'PnL / $1k volume ($)': pnl_ratio * 1000,
+            'Active days': daily_data['day'].nunique(),
+            'Daily Pearson r': float('nan'), 'Daily Spearman r': float('nan')})
     return pd.DataFrame(rows)
+
+
+def volume_total_blank_cells(summary):
+    """Blank, rather than n/a, the correlations on a volume summary's Net/total row."""
+    return {(len(summary) - 1, column) for column in ('Daily Pearson r', 'Daily Spearman r')}
 
 
 class _VolumeSummaryMixin:
@@ -1613,7 +2075,8 @@ class _VolumeSummaryMixin:
             "PnL / $1k volume ($)": lambda value: f"${value:,.2f}",
             "Daily Pearson r": lambda value: f"{value:.3f}",
             "Daily Spearman r": lambda value: f"{value:.3f}",
-        }, cell_style=volume_style)
+        }, cell_style=volume_style, bold_last=True,
+            blank_missing_cells=volume_total_blank_cells(volume_pnl_summary))
         print('Volume is one-sided fill notional (price ? ' \
             'size), counted once per fill. Realized PnL is' \
             ' Hyperliquid closedPnl less USDC ' \
@@ -1633,12 +2096,15 @@ class _VolumeSummaryMixin:
 
 
 def build_pnl_attribution(realized_df, open_positions, funding_history=None):
-    'Combine realized fill PnL and current perp ' \
-        'uPnL by market/asset.'
+    """Combine realized fill PnL and current perp uPnL by market/asset.
+
+    Returns ``({'Perp': table, 'Spot': table}, net_pnl)``, omitting a market type
+    with no rows. Percentages are shares of that table's gross absolute PnL.
+    """
     parts = []
-    perp_fills = realized_df.loc[realized_df['assetType'] == 'perp'] \
-        if not realized_df.empty else pd.DataFrame()
+    perp_fills, spot_fills = split_realized_fills(realized_df)
     close_counts = perp_close_counts(perp_fills)
+    spot_close_counts = perp_close_counts(spot_fills)
     if not close_counts.empty:
         close_rows = close_counts.rename_axis('Asset').reset_index()
         close_rows['Type'] = 'Perp'
@@ -1665,81 +2131,94 @@ def build_pnl_attribution(realized_df, open_positions, funding_history=None):
         unrealized['Realized'] = 0.0
         parts.append(unrealized[['Type', 'Asset', 'Realized', 'uPnL']])
     if not parts:
-        return (pd.DataFrame(), 0.0)
+        return ({}, 0.0)
     attribution = pd.concat(parts, ignore_index=True).groupby(['Type', 'Asset'],
         as_index=False)[['Realized', 'uPnL']].sum()
+    attribution['Closes'] = [
+        int((close_counts if asset_type == 'Perp' else spot_close_counts).get(asset, 0))
+        for asset_type, asset in zip(attribution['Type'], attribution['Asset'])
+    ]
     if attribution['Asset'].astype(str).str.startswith('@').any():
         try:
-            metadata = post({'type': 'spotMeta'})
-            names = {}
-            for index, market in enumerate(metadata.get('universe', [])):
-                asset_id = f"@{market.get('index', index)}"
-                names[asset_id] = market.get('name', asset_id)
-            attribution['Asset'] = attribution['Asset'].map(lambda asset: names.get(asset, asset))
+            attribution['Asset'] = attribution['Asset'].map(spot_base_token_names())
         except Exception as exc:
             print(f'Spot labels remain as API IDs: {type(exc).__name__}')
-    attribution['Closes'] = 0
-    perp_rows = attribution['Type'] == 'Perp'
-    attribution.loc[perp_rows, 'Closes'] = attribution.loc[perp_rows, 'Asset'].map(
-        close_counts).fillna(0).astype(int)
     attribution = attribution[(attribution['Realized'] != 0) | (attribution['uPnL'] != 0) |
         (attribution['Closes'] > 0)]
-    attribution['Total PnL'] = attribution['Realized'] + attribution['uPnL']
-    realized_total = attribution['Realized'].sum()
-    unrealized_total = attribution['uPnL'].sum()
-    net_pnl = attribution['Total PnL'].sum()
-    realized_gross = attribution['Realized'].abs().sum()
-    unrealized_gross = attribution['uPnL'].abs().sum()
-    total_gross = attribution['Total PnL'].abs().sum()
-    attribution['Realized (% gross)'] = attribution['Realized'] / realized_gross * 100 \
-        if realized_gross > 1e-12 else float('nan')
-    attribution['uPnL (% gross)'] = attribution['uPnL'] / unrealized_gross * 100 if \
-        unrealized_gross > 1e-12 else float('nan')
-    attribution['Total (% gross)'] = attribution['Total PnL'] / total_gross * 100 if \
-        total_gross > 1e-12 else float('nan')
-    attribution['_abs_pnl'] = attribution['Total PnL'].abs()
-    attribution = attribution.sort_values('_abs_pnl',
-        ascending=False).drop(columns='_abs_pnl').reset_index(drop=True)
-    total_row = pd.DataFrame([{'Type': '', 'Asset': 'Net/total', 'Closes': int(
-                attribution['Closes'].sum()), 'Realized': realized_total,
-                'Realized (% gross)': float('nan'), 'uPnL': unrealized_total,
-                'uPnL (% gross)': float('nan'), 'Total PnL': net_pnl,
-                'Total (% gross)': float('nan')}])
-    columns = ['Type', 'Asset', 'Closes', 'Realized', 'Realized (% gross)', 'uPnL',
-        'uPnL (% gross)', 'Total PnL', 'Total (% gross)']
-    attribution = pd.concat([attribution, total_row], ignore_index=True).reindex(columns=columns)
-    return (attribution, net_pnl)
+    tables = {
+        asset_type: _attribution_table(attribution[attribution['Type'] == asset_type], columns)
+        for asset_type, columns in [
+            ('Perp', ['Asset', 'Closes', 'Realized', 'Realized (% gross)', 'uPnL',
+                'uPnL (% gross)', 'Total PnL', 'Total (% gross)']),
+            # Spot holdings carry no uPnL here, so its total is just the realized PnL.
+            ('Spot', ['Asset', 'Closes', 'Realized', 'Realized (% gross)']),
+        ]
+        if (attribution['Type'] == asset_type).any()
+    }
+    return (tables, float(attribution['Realized'].sum() + attribution['uPnL'].sum()))
+
+
+def spot_base_token_names():
+    """Map spot market IDs such as ``@107`` to base token names such as ``HYPE``."""
+    metadata = post({'type': 'spotMeta'})
+    tokens = {token['index']: token['name'] for token in metadata.get('tokens', [])}
+    names = {}
+    for index, market in enumerate(metadata.get('universe', [])):
+        asset_id = f"@{market.get('index', index)}"
+        market_tokens = market.get('tokens') or [None]
+        names[asset_id] = tokens.get(market_tokens[0], asset_id)
+    return lambda asset: names.get(asset, asset)
+
+
+def _attribution_table(rows, columns):
+    """Sort one market type's rows, add gross shares, and append a net/total row."""
+    rows = rows.copy()
+    rows['Total PnL'] = rows['Realized'] + rows['uPnL']
+    for column, share in [('Realized', 'Realized (% gross)'), ('uPnL', 'uPnL (% gross)'),
+            ('Total PnL', 'Total (% gross)')]:
+        gross = rows[column].abs().sum()
+        rows[share] = rows[column] / gross * 100 if gross > 1e-12 else float('nan')
+    rows = rows.sort_values('Total PnL', key=lambda pnl: pnl.abs(), ascending=False)
+    total_row = pd.DataFrame([{'Asset': 'Net/total', 'Closes': int(rows['Closes'].sum()),
+        'Realized': rows['Realized'].sum(), 'uPnL': rows['uPnL'].sum(),
+        'Total PnL': rows['Total PnL'].sum()}])
+    return pd.concat([rows, total_row], ignore_index=True).reindex(columns=columns)
+
+
+def display_pnl_attribution_tables(tables, title):
+    """Display one attribution table per market type under a shared title."""
+    def style(row_index, column, value, row):
+        if column in {'Realized', 'uPnL', 'Total PnL', 'Realized (% gross)',
+                'uPnL (% gross)', 'Total (% gross)'} and pd.notna(value):
+            return 'color:#188038;' if value > 0 else 'color:#c62828;' if value < 0 else ''
+        return ''
+    for label, table in tables.items():
+        display_interactive_table(table, formatters={
+            'Closes': lambda value: f'{value:,.0f}',
+            'Realized': lambda value: f'${value:,.2f}', 'uPnL': lambda value: f'${value:,.2f}',
+            'Total PnL': lambda value: f'${value:,.2f}',
+            'Realized (% gross)': lambda value: f'{value:.2f}%',
+            'uPnL (% gross)': lambda value: f'{value:.2f}%',
+            'Total (% gross)': lambda value: f'{value:.2f}%',
+        }, cell_style=style, bold_last=True, title=f'{title}: {label.upper()}',
+            blank_missing_cells={(len(table) - 1, column) for column in
+                ('Realized (% gross)', 'uPnL (% gross)', 'Total (% gross)')})
 
 
 class _PnLAttributionMixin:
     def show_pnl_attribution(self):
         data = self._require_data()
-        pnl_attribution, net_attributed_pnl = build_pnl_attribution(
+        attribution_tables, net_attributed_pnl = build_pnl_attribution(
             data.realized_df, self._load_positions(), funding_history=data.funding_history_df
         )
-        print("=== PNL ATTRIBUTION ===")
-        if pnl_attribution.empty:
+        if not attribution_tables:
+            print("=== PNL ATTRIBUTION ===")
             print("No realized or open-position PnL to attribute.")
             return
-        def attribution_style(row_index, column, value, row):
-            if column in {"Realized", "uPnL", "Total PnL", "Realized (% gross)",
-                "uPnL (% gross)", "Total (% gross)"} and pd.notna(value):
-                return "color:#188038;" if value > 0 else "color:#c62828;" if value < 0 else ""
-            return ""
-        display_interactive_table(pnl_attribution, formatters={
-            "Closes": lambda value: f"{value:,.0f}",
-            "Realized": lambda value: f"${value:,.2f}", "uPnL": lambda value: f"${value:,.2f}",
-            "Total PnL": lambda value: f"${value:,.2f}",
-                    "Realized (% gross)": lambda value: f"{value:.2f}%",
-            "uPnL (% gross)": lambda value: f"{value:.2f}%",
-                    "Total (% gross)": lambda value: f"{value:.2f}%",
-        }, cell_style=attribution_style, bold_last=True, blank_missing_cells={
-            (len(pnl_attribution) - 1, column) for column in ("Realized (% gross)",
-                        "uPnL (% gross)", "Total (% gross)")
-        })
+        display_pnl_attribution_tables(attribution_tables, 'PNL ATTRIBUTION')
         print(f"Net attributed PnL: ${net_attributed_pnl:,.2f} | percentages are signed \
-            shares of gross absolute PnL in each column, so their signs match the dollar \
-                contributions.")
+            shares of gross absolute PnL in each column of each table, so their signs match \
+                the dollar contributions.")
         print('Scope: available realized fills (API cap: ' \
             '10,000) + saved perp funding + current open ' \
             'perp uPnL; spot unrealized PnL is not ' \
@@ -1753,7 +2232,7 @@ class _PnLAttributionMixin:
 # Wallet data collection and shared state used by the report method mixins.
 
 
-def collect_wallet_data(wallet_address, data_dir="data", refresh_full_history=False):
+def collect_wallet_data(wallet_address, data_dir="data"):
     'Fetch current wallet data and merge it into ' \
         "that wallet's history CSV."
     if not isinstance(wallet_address, str) or not re.fullmatch(r"0x[0-9a-fA-F]{40}",
@@ -1763,8 +2242,7 @@ def collect_wallet_data(wallet_address, data_dir="data", refresh_full_history=Fa
     data_path.mkdir(parents=True, exist_ok=True)
     csv_path = data_path / f"hl_account_history_{wallet_address.lower()}.csv"
     saved = load_saved_history(csv_path)
-    history = fetch_all_time_history(wallet_address) if saved.empty or refresh_full_history else []
-    history_rows_added = 0
+    history = fetch_all_time_history(wallet_address)
     current_states = fetch_perp_states(wallet_address)
     balance_total, priced_spot, unpriced_spot = spot_balance_usd(wallet_address)
     unrealized_pnl_total = sum(
@@ -1777,7 +2255,13 @@ def collect_wallet_data(wallet_address, data_dir="data", refresh_full_history=Fa
         for state in current_states.values()
         for item in state.get("assetPositions", [])
     )
-    current_account_value = balance_total + unrealized_pnl_total
+    perp_equity = sum(
+        as_float((state.get("marginSummary") or {}).get("accountValue"))
+        for state in current_states.values()
+    )
+    current_account_value = live_account_value(
+        balance_total, perp_equity, is_unified_account(wallet_address.lower())
+    )
     realized_fills = fetch_user_fills(wallet_address)
     realized_df = normalize_fills(realized_fills)
     # Rebuild daily fill and funding rows from the API so a wrong saved row cannot persist.
@@ -1806,7 +2290,8 @@ def collect_wallet_data(wallet_address, data_dir="data", refresh_full_history=Fa
         chart_df=chart_df, current_states=current_states, balance_total=balance_total,
         priced_spot=priced_spot, unpriced_spot=unpriced_spot,
         unrealized_pnl_total=unrealized_pnl_total, position_value_total=position_value_total,
-        current_account_value=current_account_value, realized_fills=realized_fills,
+        current_account_value=current_account_value, perp_equity=perp_equity,
+        realized_fills=realized_fills,
         realized_df=realized_df, funding_df=funding_df, funding_history_df=funding_history_df,
     )
 
@@ -1816,23 +2301,31 @@ class _AnalyticsCore:
             wallet_address):
             raise ValueError("wallet_address must be a 0x-prefixed 40-hex-character address")
         self.wallet_address = wallet_address
+        self.wallet_addresses = [wallet_address]
+        self.highlights_state_file = f"hl_highlights_state_{wallet_address.lower()}.json"
         self.data_dir = data_dir
         self.data = None
+        self.portfolio_history = None
+        self.collateral_equity = None
         self.account_metrics = None
         self.positions = []
-        self.position_summary = None
         self._positions_loaded = False
-    def fetch_data(self, refresh_full_history=False):
+    def fetch_data(self):
         'Fetch current account inputs and persist ' \
             'fresh wallet-specific history.'
         self.data = None
         self.account_metrics = None
         self.positions = []
-        self.position_summary = None
         self._positions_loaded = False
-        self.data = collect_wallet_data(self.wallet_address, self.data_dir, refresh_full_history)
+        self._highlights_baseline_loaded = False
+        self.data = collect_wallet_data(self.wallet_address, self.data_dir)
+        self.portfolio_history = update_portfolio_history(self.wallet_address, self.data_dir)
+        self.collateral_equity = fetch_collateral_equity(
+            self.wallet_address.lower(), self.data.perp_equity
+        )
         self.account_metrics = calculate_account_metrics(
-            self.data.chart_df, self.data.current_account_value, self.data.unrealized_pnl_total
+            self.data.chart_df, self.data.current_account_value, self.data.unrealized_pnl_total,
+            time_weighted_index([self.portfolio_history]),
         )
         return self.data
     def _require_data(self):
@@ -1842,16 +2335,21 @@ class _AnalyticsCore:
     def _load_positions(self):
         data = self._require_data()
         if not self._positions_loaded:
-            _, self.positions = fetch_position_rows(
+            _, rows = fetch_position_rows(
                 self.wallet_address, data.realized_df,
                     fills_complete=len(data.realized_fills) < 10000,
                     states=data.current_states,
             )
+            self.positions = [
+                {**row, 'Wallet': self.wallet_address[-4:],
+                    'Account value': data.current_account_value}
+                for row in rows
+            ]
             self._positions_loaded = True
         return self.positions
 
 class HyperliquidAnalytics(
-    _AccountPnLMixin, _AccountChartsMixin, _AccountVsBTCMixin,
+    _HighlightsMixin, _AccountPnLMixin, _AccountChartsMixin, _AccountVsBTCMixin,
     _VolumeChartMixin, _OpenPositionsMixin, _RealizedPnLMixin,
     _VolumeSummaryMixin, _PnLAttributionMixin, _AnalyticsCore,
 ):

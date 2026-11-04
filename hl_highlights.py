@@ -44,16 +44,16 @@ def make_state(now: pd.Timestamp, cumulative_pnl: float, positions: list[dict[st
     }
 
 
-def load_state(data_dir: Path | str) -> dict[str, Any] | None:
+def load_state(data_dir: Path | str, file_name: str = STATE_FILE_NAME) -> dict[str, Any] | None:
     """Return the last run's saved state, or ``None`` when there is no usable file."""
     try:
-        return json.loads((Path(data_dir) / STATE_FILE_NAME).read_text())
+        return json.loads((Path(data_dir) / file_name).read_text())
     except (FileNotFoundError, ValueError):
         return None
 
 
-def save_state(data_dir: Path | str, state: dict[str, Any]) -> None:
-    (Path(data_dir) / STATE_FILE_NAME).write_text(json.dumps(state, indent=1))
+def save_state(data_dir: Path | str, state: dict[str, Any], file_name: str = STATE_FILE_NAME) -> None:
+    (Path(data_dir) / file_name).write_text(json.dumps(state, indent=1))
 
 
 def position_changes(baseline: dict[str, Any], positions: list[dict[str, Any]]) -> dict[str, list[str]]:

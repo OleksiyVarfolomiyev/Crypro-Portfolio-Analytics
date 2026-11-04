@@ -556,13 +556,18 @@ def consolidate_current_funding(rows: list[dict[str, Any]]) -> list[dict[str, An
     return consolidated
 
 
+def is_unified_account(wallet: str) -> bool:
+    """Return whether a wallet's perp account value is held inside its USDC balance."""
+    return post_info({"type": "userAbstraction", "user": wallet}) == "unifiedAccount"
+
+
 def fetch_collateral_equity(wallet: str, perp_equity: float) -> float:
     """Return a wallet's margin collateral, using USDC balance on unified accounts.
 
     A unified account's perp account value is already included in its USDC
     balance, so the two are never added. Other account modes keep perp equity.
     """
-    if post_info({"type": "userAbstraction", "user": wallet}) != "unifiedAccount":
+    if not is_unified_account(wallet):
         return perp_equity
     response = post_info({"type": "spotClearinghouseState", "user": wallet})
     balances = response.get("balances") if isinstance(response, dict) else None

@@ -20,7 +20,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "execution"), str(ROOT / "research")]
 
 import hl_trade_analytics
 from hl_backtest import BacktestSettings, backtest_signal
-from hl_highlights import build_highlights, make_state, position_changes
+from hl_highlights import build_highlights, load_state, make_state, position_changes, save_state
 from hl_market_research import (
     asset_class,
     CHANGE,
@@ -163,6 +163,196 @@ class RealizedPnlTests(unittest.TestCase):
         self.assertEqual(stats["wins"], 1)
         self.assertEqual(stats["losses"], 2)
         self.assertEqual(int(self.account.perp_close_counts(self.fills()).sum()), 3)
+
+    def test_attribution_splits_perp_then_spot_with_base_token_names(self):
+        fills = pd.DataFrame(
+            [
+                {"time": 1, "coin": "BTC", "assetType": "perp", "dir": "Close Long",
+                 "closedPnl": -50.0, "grossPnl": -49.0},
+                {"time": 2, "coin": "@107", "assetType": "spot", "dir": "Sell",
+                 "closedPnl": 10.0, "grossPnl": 10.2},
+            ]
+        )
+        spot_meta = {
+            "tokens": [{"index": 0, "name": "USDC"}, {"index": 150, "name": "HYPE"}],
+            "universe": [{"index": 107, "name": "@107", "tokens": [150, 0]}],
+        }
+        with patch.object(self.account, "post", return_value=spot_meta):
+            tables, net_pnl = self.account.build_pnl_attribution(fills, [{"Coin": "BTC", "uPnL": 5.0}])
+        self.assertEqual(list(tables), ["Perp", "Spot"])
+        self.assertEqual(list(tables["Spot"]["Asset"]), ["HYPE", "Net/total"])
+        self.assertEqual(tables["Spot"]["Closes"].iloc[0], 1)
+        self.assertNotIn("uPnL", tables["Spot"].columns)
+        self.assertAlmostEqual(tables["Perp"]["Total PnL"].iloc[-1], -45.0)
+        self.assertAlmostEqual(net_pnl, -35.0)
+
+    def test_live_account_value_counts_unified_perp_equity_once(self):
+        self.assertEqual(self.account.live_account_value(1_000.0, 700.0, unified=True), 1_000.0)
+        self.assertEqual(self.account.live_account_value(1_000.0, 700.0, unified=False), 1_700.0)
+
+    def test_collect_wallet_data_adds_new_history_to_saved_csv(self):
+        wallet = "0x" + "a" * 40
+        state = {"marginSummary": {"accountValue": "700"}, "assetPositions": [{"position": {
+            "unrealizedPnl": "50", "positionValue": "500"}}]}
+        now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+        history = [[now_ms - 200_000, "900"], [now_ms - 100_000, "1000"]]
+        with (
+            tempfile.TemporaryDirectory() as data_dir,
+            patch.object(self.account, "fetch_perp_states", return_value={"": state}),
+            patch.object(self.account, "spot_balance_usd", return_value=(1_000.0, [], [])),
+            patch.object(self.account, "is_unified_account", return_value=True),
+            patch.object(self.account, "fetch_user_fills", return_value=[]),
+            patch.object(self.account, "fetch_user_funding", return_value=[]),
+        ):
+            with patch.object(self.account, "fetch_all_time_history", return_value=history[:1]):
+                self.account.collect_wallet_data(wallet, data_dir)
+            with patch.object(self.account, "fetch_all_time_history", return_value=history):
+                data = self.account.collect_wallet_data(wallet, data_dir)
+        self.assertEqual(data.history_rows_added, 1)
+        self.assertEqual(data.current_account_value, 1_000.0)
+        points = data.chart_df.loc[data.chart_df["source"] == "portfolio_allTime", "accountValue"]
+        self.assertEqual(list(points), [900.0, 1000.0])
+
+    def test_volume_summary_total_counts_shared_days_once(self):
+        daily = pd.DataFrame({
+            "day": ["2026-01-01", "2026-01-01", "2026-01-02"],
+            "assetType": ["perp", "spot", "perp"],
+            "volume": [100.0, 50.0, 50.0],
+            "realized_pnl": [10.0, 2.0, -2.0],
+        })
+        total = self.account.summarize_volume_pnl(daily).iloc[-1]
+        self.assertEqual(total["Market"], "Net/total")
+        self.assertEqual(total["Volume ($)"], 200.0)
+        self.assertEqual(total["Active days"], 2)
+        self.assertAlmostEqual(total["Realized PnL / Volume (%)"], 5.0)
+
+    def test_positions_total_row_recomputes_ratios(self):
+        frame = pd.DataFrame({
+            "Wallet": ["a", "a", "b"], "Account value": [1_000.0, 1_000.0, 1_000.0],
+            "Pos": [600.0, 400.0, 1_000.0], "Margin": [100.0, 100.0, 200.0],
+            "uPnL": [10.0, -30.0, 60.0], "Funding (since open)": [1.0, 2.0, 3.0],
+            "Fees USD": [1.0, 1.0, 2.0],
+            "Expected Price PnL (5d)": [6.0, float("nan"), 10.0],
+            "Expected Funding PnL (5d)": [1.0, 1.0, 2.0],
+            "Expected PnL incl. funding (5d)": [7.0, 1.0, 12.0],
+        })
+        total = self.account._positions_total_row(frame)
+        self.assertEqual(total["Pos"], 2_000.0)
+        self.assertEqual(total["ROE"], 10.0)
+        self.assertEqual(total["Lev."], 5.0)
+        self.assertEqual(total["Position / Account (%)"], 100.0)
+        self.assertEqual(total["Fees"], "-$4.00")
+        self.assertAlmostEqual(total["Expected Price Return (5d)"], 16 / 1_600 * 100)
+        frame.loc[0, "Fees USD"] = float("nan")
+        self.assertEqual(self.account._positions_total_row(frame)["Fees"], "n/a")
+
+    def test_account_history_gap_warns_only_above_threshold(self):
+        warning = self.account.account_history_gap_warning
+        self.assertIsNone(warning(1_015.0, 1_000.0))
+        self.assertIn("3.0%", warning(1_030.0, 1_000.0))
+        self.assertIsNone(warning(float("nan"), 1_000.0))
+
+    def test_rolling_24h_excludes_deposits_and_older_activity(self):
+        now = pd.Timestamp("2026-06-02 12:00", tz="UTC")
+        start = now - pd.Timedelta(hours=24)
+        # A $900 deposit mid-window must not count as a return; only the $10 PnL does.
+        day = pd.DataFrame({
+            "ts": [start, start + pd.Timedelta(hours=12), now],
+            "accountValue": [100.0, 1_005.0, 1_010.0],
+            "pnl": [0.0, 5.0, 10.0],
+        })
+        perp_day = pd.DataFrame({"ts": [start, now], "pnl": [0.0, 10.0]})
+        fills = pd.DataFrame({
+            "ts": [now - pd.Timedelta(hours=1), now - pd.Timedelta(hours=30)],
+            "assetType": ["perp", "perp"], "closedPnl": [4.0, 99.0],
+        })
+        funding = pd.DataFrame({
+            "ts": [now - pd.Timedelta(hours=2), now - pd.Timedelta(hours=30)],
+            "fundingPnl": [-1.0, 50.0],
+        })
+        with (
+            patch.object(self.account, "fetch_portfolio_history", return_value=day),
+            patch.object(self.account, "fetch_perp_pnl_history", return_value=perp_day),
+        ):
+            result = self.account.rolling_24h_metrics(["w"], fills, funding, now=now)
+        self.assertAlmostEqual(result.realized, 3.0)
+        self.assertAlmostEqual(result.unrealized_change, 7.0)
+        self.assertLess(result.account_return_pct, 6.0)
+
+    def test_realized_windows_use_exact_funding_times(self):
+        now = pd.Timestamp("2026-06-02 12:00", tz="UTC")
+        fills = pd.DataFrame(columns=["closedPnl", "grossPnl", "notional", "ts"])
+        daily = pd.DataFrame({"ts": [pd.Timestamp("2026-06-02", tz="UTC")], "fundingPnl": [-5.0]})
+        events = pd.DataFrame({
+            "ts": [now - pd.Timedelta(hours=1), now - pd.Timedelta(hours=30)],
+            "fundingPnl": [-1.0, -4.0],
+        })
+        stats = self.account.realized_pnl_stats(fills, daily, now=now, funding_events=events)
+        self.assertAlmostEqual(stats["1d"], -1.0)
+        self.assertAlmostEqual(stats["7d"], -5.0)
+
+    def test_index_returns_skip_multi_day_gaps_in_daily_stats(self):
+        times = pd.to_datetime(["2026-06-01 12:00", "2026-06-02 12:00", "2026-06-09 12:00"], utc=True)
+        index = pd.Series([1.0, 1.1, 1.21], index=times)
+        daily, weekly, _ = self.account.index_period_returns(index)
+        self.assertEqual(len(daily), 1)
+        self.assertAlmostEqual(daily.iloc[0], 10.0)
+        self.assertAlmostEqual(((1 + weekly / 100).prod() - 1) * 100, 21.0)
+
+    def _portfolio_period(self, now, points):
+        ms = lambda hours: int((now - pd.Timedelta(hours=hours)).timestamp() * 1000)
+        return {
+            "accountValueHistory": [[ms(hours), str(value)] for hours, value, _ in points],
+            "pnlHistory": [[ms(hours), str(pnl)] for hours, _, pnl in points],
+        }
+
+    def test_stitched_periods_keep_one_pnl_baseline(self):
+        now = pd.Timestamp("2026-06-30 12:00", tz="UTC")
+        periods = {
+            "allTime": self._portfolio_period(now, [(200, 100, 0), (100, 120, 20), (0, 140, 40)]),
+            # A shorter period's PnL restarts near zero, so it must be rebased.
+            "week": self._portfolio_period(now, [(100, 120, 0), (50, 130, 10), (0, 140, 20)]),
+        }
+        history = self.account.stitch_portfolio_periods(periods)
+        self.assertEqual(list(history["pnl"]), [0.0, 20.0, 30.0, 40.0])
+
+    def test_saved_points_survive_after_hyperliquid_drops_them(self):
+        now = pd.Timestamp("2026-06-30 12:00", tz="UTC")
+        times = [now - pd.Timedelta(hours=hours) for hours in (4, 2)]
+        saved = pd.DataFrame({"ts": times, "accountValue": [100.0, 101.0], "pnl": [50.0, 51.0]})
+        fresh = pd.DataFrame({
+            "ts": [times[1], now], "accountValue": [101.0, 103.0], "pnl": [0.0, 2.0],
+        })
+        merged = self.account.merge_portfolio_history(saved, fresh)
+        self.assertEqual(list(merged["ts"]), [*times, now])
+        self.assertEqual(list(merged["pnl"]), [50.0, 51.0, 53.0])
+
+    def test_index_from_history_excludes_deposit_and_sets_drawdown_basis(self):
+        now = pd.Timestamp("2026-06-30 12:00", tz="UTC")
+        periods = {"allTime": self._portfolio_period(now, [(48, 100, 0), (24, 1110, 10), (0, 1120, 20)])}
+        index = hl_trade_analytics.time_weighted_index([self.account.stitch_portfolio_periods(periods)])
+        daily, _, _ = self.account.index_period_returns(index)
+        self.assertTrue((daily.abs() < 11).all())
+
+    def test_portfolio_history_is_saved_and_extended_between_runs(self):
+        now = pd.Timestamp("2026-06-30 12:00", tz="UTC")
+        wallet = "0x" + "a" * 40
+        first = {"allTime": self._portfolio_period(now, [(10, 100, 0), (5, 110, 10)])}
+        second = {"allTime": self._portfolio_period(now, [(5, 110, 10), (0, 120, 20)])}
+        with tempfile.TemporaryDirectory() as data_dir:
+            with patch.object(self.account, "_fetch_portfolio_periods", return_value=first):
+                self.account.update_portfolio_history(wallet, data_dir)
+            with patch.object(self.account, "_fetch_portfolio_periods", return_value=second):
+                history = self.account.update_portfolio_history(wallet, data_dir)
+        self.assertEqual(list(history["accountValue"]), [100.0, 110.0, 120.0])
+        self.assertEqual(list(history["pnl"]), [0.0, 10.0, 20.0])
+
+    def test_highlights_state_is_kept_per_file(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            save_state(data_dir, {"scope": "all"})
+            save_state(data_dir, {"scope": "one"}, "one.json")
+            self.assertEqual(load_state(data_dir), {"scope": "all"})
+            self.assertEqual(load_state(data_dir, "one.json"), {"scope": "one"})
 
     def test_breakdown_reconciles_gross_trading_fees_and_funding(self):
         funding = pd.DataFrame({"fundingPnl": [-1.0]})
