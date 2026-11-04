@@ -21,6 +21,7 @@ from hl_account_analytics_implementation import (
     calculate_account_metrics,
     display_interactive_table,
     display_pnl_attribution_tables,
+    fetch_non_perp_pnl,
     liquidation_stats,
     perp_pnl_breakdown,
     plot_account_dashboard,
@@ -325,7 +326,8 @@ class _MultiWalletAttributionMixin:
         data=self._require_data()
         positions=self._load_positions()
         tables,net_pnl=build_pnl_attribution(
-            data.realized_df,positions,funding_history=data.funding_history_df
+            data.realized_df,positions,funding_history=data.funding_history_df,
+            non_perp_pnl=fetch_non_perp_pnl(self.wallet_addresses),
         )
         if not tables:
             print('=== CONSOLIDATED PNL ATTRIBUTION ===')
@@ -333,7 +335,8 @@ class _MultiWalletAttributionMixin:
             return
         display_pnl_attribution_tables(tables,'CONSOLIDATED PNL ATTRIBUTION')
         print(f'Net attributed PnL across wallets: ${net_pnl:,.2f}. '
-              'Spot unrealized PnL is not included.')
+              "The Spot table's Other row is Hyperliquid's non-perp PnL less spot fill PnL, so the "
+              "net matches Hyperliquid's total to within small timing differences.")
 
 
 # ----------------------------------------------------------------------------

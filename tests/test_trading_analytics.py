@@ -347,6 +347,19 @@ class RealizedPnlTests(unittest.TestCase):
         self.assertEqual(list(history["accountValue"]), [100.0, 110.0, 120.0])
         self.assertEqual(list(history["pnl"]), [0.0, 10.0, 20.0])
 
+    def test_attribution_other_row_reconciles_to_non_perp_pnl(self):
+        fills = pd.DataFrame([
+            {"time": 1, "coin": "BTC", "assetType": "perp", "dir": "Close Long",
+             "closedPnl": -50.0, "grossPnl": -49.0},
+            {"time": 2, "coin": "HYPE/USDC", "assetType": "spot", "dir": "Sell",
+             "closedPnl": 22.0, "grossPnl": 22.5},
+        ])
+        tables, net = self.account.build_pnl_attribution(fills, [], non_perp_pnl=73.0)
+        spot = tables["Spot"].set_index("Asset")
+        self.assertAlmostEqual(spot.loc[self.account.OTHER_NON_PERP_LABEL, "Realized"], 51.0)
+        self.assertAlmostEqual(spot.loc["Net/total", "Realized"], 73.0)
+        self.assertAlmostEqual(net, 23.0)
+
     def test_highlights_state_is_kept_per_file(self):
         with tempfile.TemporaryDirectory() as data_dir:
             save_state(data_dir, {"scope": "all"})

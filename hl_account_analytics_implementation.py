@@ -49,6 +49,7 @@ API = "https://api.hyperliquid.xyz/info"
 ACCOUNTING_TIMEZONE = "America/New_York"
 ACCOUNT_VALUE_GAP_WARNING_PCT = 2.0
 PORTFOLIO_HISTORY_COLUMNS = ["ts", "accountValue", "pnl"]
+OTHER_NON_PERP_LABEL = "Other (vaults, transfers, open spot)"
 HISTORY_COLUMNS = [
     "ts", "accountValue", "source", "asset", "balance", "open_position_value",
     "unrealized_pnl", "realized_pnl",
@@ -289,7 +290,10 @@ def _period_history(periods, period):
 
 def _pnl_at(history, ts):
     """Interpolate a history's cumulative PnL at a timestamp."""
-    return np.interp(ts.value, history['ts'].astype('int64').to_numpy(), history['pnl'].to_numpy())
+    # Elapsed seconds stay comparable whatever time unit pandas stores the column in.
+    epoch = pd.Timestamp(0, tz='UTC')
+    seconds = (history['ts'] - epoch) / pd.Timedelta(seconds=1)
+    return np.interp((ts - epoch) / pd.Timedelta(seconds=1), seconds.to_numpy(), history['pnl'].to_numpy())
 
 
 def stitch_portfolio_periods(periods):
@@ -2095,14 +2099,30 @@ class _VolumeSummaryMixin:
 # `_PnLAttributionMixin.show_pnl_attribution()`.
 
 
-def build_pnl_attribution(realized_df, open_positions, funding_history=None):
+def fetch_non_perp_pnl(wallets):
+    """Return Hyperliquid's all-time PnL outside perps, across the given wallets."""
+    total = 0.0
+    for wallet in wallets:
+        periods = _fetch_portfolio_periods(wallet)
+        history = {name: periods.get(name, {}).get('pnlHistory', []) for name in ('allTime', 'perpAllTime')}
+        if history['allTime'] and history['perpAllTime']:
+            total += float(history['allTime'][-1][1]) - float(history['perpAllTime'][-1][1])
+    return total
+
+
+def build_pnl_attribution(realized_df, open_positions, funding_history=None, non_perp_pnl=None):
     """Combine realized fill PnL and current perp uPnL by market/asset.
 
     Returns ``({'Perp': table, 'Spot': table}, net_pnl)``, omitting a market type
-    with no rows. Percentages are shares of that table's gross absolute PnL.
+    with no rows. Percentages are shares of that table's gross absolute PnL. When
+    ``non_perp_pnl`` is given, a Spot row holds what spot fills do not explain.
     """
     parts = []
     perp_fills, spot_fills = split_realized_fills(realized_df)
+    if non_perp_pnl is not None:
+        spot_realized = spot_fills['closedPnl'].sum() if not spot_fills.empty else 0.0
+        parts.append(pd.DataFrame([{'Type': 'Spot', 'Asset': OTHER_NON_PERP_LABEL,
+            'Realized': non_perp_pnl - spot_realized, 'uPnL': 0.0}]))
     close_counts = perp_close_counts(perp_fills)
     spot_close_counts = perp_close_counts(spot_fills)
     if not close_counts.empty:
@@ -2209,7 +2229,8 @@ class _PnLAttributionMixin:
     def show_pnl_attribution(self):
         data = self._require_data()
         attribution_tables, net_attributed_pnl = build_pnl_attribution(
-            data.realized_df, self._load_positions(), funding_history=data.funding_history_df
+            data.realized_df, self._load_positions(), funding_history=data.funding_history_df,
+            non_perp_pnl=fetch_non_perp_pnl(self.wallet_addresses),
         )
         if not attribution_tables:
             print("=== PNL ATTRIBUTION ===")
@@ -2221,8 +2242,8 @@ class _PnLAttributionMixin:
                 the dollar contributions.")
         print('Scope: available realized fills (API cap: ' \
             '10,000) + saved perp funding + current open ' \
-            'perp uPnL; spot unrealized PnL is not ' \
-            'included.')
+            'perp uPnL. The Spot table\'s Other row is Hyperliquid\'s non-perp PnL less spot ' \
+            'fill PnL, so the net matches Hyperliquid\'s total to within small timing differences.')
 
 
 # ----------------------------------------------------------------------------
