@@ -41,12 +41,14 @@ BASE_URL = "https://api.hyperliquid.xyz"
 RESERVE_PCT = 0.20
 RISK_PCT_OF_USABLE_MARGIN = 0.05
 MAX_TOTAL_RISK_PCT = 0.20
+MAX_RISK_PCT_OVERRIDE_LIMIT = 50.0
 STOP_ATR_MULTIPLE = 1.25
 REWARD_RISK_RATIO = 1.0
 FUNDING_STRESS_PERCENTILE = 0.95
 MIN_ORDER_VALUE_USD = 10.0
 ENTRY_TIMEOUT_SECONDS = 5 * 60
 CHASE_INTERVAL_SECONDS = 10
+ENTRY_RETRY_SECONDS = 2
 CANCEL_CONFIRM_ATTEMPTS = 30
 MONITOR_INTERVAL_SECONDS = 15
 KILL_SWITCH_FILE = Path(__file__).resolve().parent / "KILL_SWITCH"
@@ -859,7 +861,7 @@ def size_trade(
     )
     reason = ""
     if risk_headroom <= 0:
-        reason = "combined open risk already meets or exceeds the 20% equity cap"
+        reason = f"combined open risk already meets or exceeds the {MAX_TOTAL_RISK_PCT * 100:g}% equity cap"
     elif available_margin <= 0:
         reason = "no margin remains above the 20% equity reserve"
     elif quantity <= 0:
@@ -1386,44 +1388,97 @@ def kill_switch_engaged() -> bool:
     return KILL_SWITCH_FILE.exists()
 
 
+def _read_fill(wallet: str, oid: int, size_decimals: int) -> tuple[str, float]:
+    """Read an order's fill, returning an empty state when the read itself fails."""
+    try:
+        return _order_fill(_order_status(wallet, oid), size_decimals)
+    except (ValueError, KeyError, TypeError, requests.RequestException) as exc:
+        print(f"Could not read order {oid}: {exc}; will check again.")
+        return "", 0.0
+
+
 def _rest_entry(
     wallet: str, oid: int, plan: PlannedTrade, market: Market, price: float, deadline: float
 ) -> tuple[str, float]:
     """Wait on a resting entry, keeping queue priority until its target price changes."""
     while True:
         time.sleep(CHASE_INTERVAL_SECONDS)
-        state, filled = _order_fill(_order_status(wallet, oid), market.size_decimals)
-        if state != "open" or time.monotonic() >= deadline or kill_switch_engaged():
+        state, filled = _read_fill(wallet, oid, market.size_decimals)
+        if time.monotonic() >= deadline or kill_switch_engaged():
+            return state, filled
+        if state == "":
+            continue
+        if state != "open":
             return state, filled
         try:
             if post_only_price(plan.coin, plan.dex, plan.side, market.size_decimals) != price:
                 return state, filled
         except (ValueError, requests.RequestException) as exc:
-            # A bad book read must not leave the order unmanaged; the caller cancels it.
-            print(f"{plan.coin}: could not refresh the entry price ({exc}); cancelling the resting order.")
-            return state, filled
+            # Keep the order working; the next check can price it again.
+            print(f"{plan.coin}: could not refresh the entry price ({exc}); keeping the resting order.")
+
+
+def _failed_send_left_nothing(wallet: str, plan: PlannedTrade, expected_quantity: float) -> bool:
+    """Return whether a failed send verifiably left no resting entry and no new fill."""
+    try:
+        resting = [
+            order
+            for order in fetch_open_orders(wallet, [plan.dex])
+            if order.get("coin") == plan.coin and not _is_reduce_only(order)
+        ]
+        quantity = _current_position_quantity(wallet, plan.dex, plan.coin)
+    except (ValueError, KeyError, TypeError, requests.RequestException):
+        return False
+    return not resting and bool(np.isclose(quantity, expected_quantity, atol=1e-8))
 
 
 def _place_entry(exchange: Any, wallet: str, plan: PlannedTrade, market: Market) -> tuple[float, float]:
-    """Chase the planned entry with post-only limits and return filled size and average price."""
+    """Chase the planned entry with post-only limits and return filled size and average price.
+
+    Recoverable failures retry until the window ends. A failed send is retried only
+    after the exchange shows it left nothing, so a retry cannot double the position.
+    """
     deadline = time.monotonic() + ENTRY_TIMEOUT_SECONDS
+    baseline = _current_position_quantity(wallet, plan.dex, plan.coin)
+    direction = side_to_direction(plan.side)
     filled_total = 0.0
     weighted_entry = 0.0
     remaining = plan.quantity
     while remaining > 0 and time.monotonic() < deadline and not kill_switch_engaged():
-        price = post_only_price(plan.coin, plan.dex, plan.side, market.size_decimals)
+        try:
+            price = post_only_price(plan.coin, plan.dex, plan.side, market.size_decimals)
+        except (ValueError, requests.RequestException) as exc:
+            print(f"{plan.coin}: could not read the order book ({exc}); retrying.")
+            time.sleep(ENTRY_RETRY_SECONDS)
+            continue
         is_buy = plan.side == "LONG"
-        response = exchange.order(
-            plan.coin,
-            is_buy,
-            remaining,
-            price,
-            {"limit": {"tif": "Alo"}},
-            reduce_only=False,
-        )
-        status = _status_rows(response)[0]
+        try:
+            response = exchange.order(
+                plan.coin,
+                is_buy,
+                remaining,
+                price,
+                {"limit": {"tif": "Alo"}},
+                reduce_only=False,
+            )
+            status = _status_rows(response)[0]
+        except Exception as exc:  # The SDK raises its own types; every send failure is checked the same way.
+            if _failed_send_left_nothing(wallet, plan, baseline + direction * filled_total):
+                print(f"{plan.coin}: order send failed ({exc}); the exchange shows nothing placed, retrying.")
+                time.sleep(ENTRY_RETRY_SECONDS)
+                continue
+            message = f"{plan.coin}: order send failed ({exc}) and its result could not be ruled out; stopping entry."
+            if filled_total > 0:
+                # Earlier fills still need exit protection from the caller.
+                print(message)
+                break
+            raise RuntimeError(f"{message} Check this market on the exchange.") from exc
         oid = _oid_from_status(status)
         if oid is None:
+            if "post only" in str(status.get("error", "")).lower():
+                print(f"{plan.coin}: price moved as the order was placed; repricing.")
+                time.sleep(ENTRY_RETRY_SECONDS)
+                continue
             if filled_total > 0:
                 # Earlier fills still need exit protection from the caller.
                 print(f"{plan.coin}: entry stopped after a partial fill; order rejected: {status!r}")
@@ -1437,10 +1492,13 @@ def _place_entry(exchange: Any, wallet: str, plan: PlannedTrade, market: Market)
             break
         state, filled = _rest_entry(wallet, oid, plan, market, price, deadline)
         if state != "filled":
-            exchange.cancel(plan.coin, oid)
+            try:
+                exchange.cancel(plan.coin, oid)
+            except Exception as exc:  # The confirmation below decides whether the order is gone.
+                print(f"{plan.coin}: cancel request for order {oid} failed ({exc}); checking its state.")
             # The status endpoint can briefly report a cancelled order as open.
             for _ in range(CANCEL_CONFIRM_ATTEMPTS):
-                state, filled = _order_fill(_order_status(wallet, oid), market.size_decimals)
+                state, filled = _read_fill(wallet, oid, market.size_decimals)
                 if state not in {"", "open"}:
                     break
                 time.sleep(1)
@@ -1449,8 +1507,11 @@ def _place_entry(exchange: Any, wallet: str, plan: PlannedTrade, market: Market)
         weighted_entry += filled * price
         if state in {"", "open"}:
             # Re-placing while this order may still rest could double the position.
-            print(f"{plan.coin}: could not confirm order {oid} was cancelled; stopping entry.")
-            break
+            message = f"{plan.coin}: could not confirm order {oid} was cancelled; stopping entry."
+            if filled_total > 0:
+                print(message)
+                break
+            raise RuntimeError(f"{message} Check this market on the exchange.")
         remaining = round(plan.quantity - filled_total, market.size_decimals)
     if filled_total <= 0:
         raise RuntimeError(
@@ -1590,7 +1651,7 @@ def _watch_trades(exchange: Any, wallet: str, active_trades: list[ActiveTrade], 
                 (
                     index
                     for index, item in enumerate(universe)
-                    if (f"{plan.dex}:{item.get('name')}" if plan.dex else item.get("name")) == plan.coin
+                    if normalize_market(str(item.get("name")), plan.dex)[0] == plan.coin
                 ),
                 None,
             )
@@ -1712,7 +1773,7 @@ def print_plan(snapshot: AccountSnapshot, plans: list[PlannedTrade], current_ris
     print(f"Estimated current stop + 5-day adverse funding risk: ${current_risk:,.2f} "
           f"({current_risk / snapshot.equity:.2%} of collateral equity)")
     print(f"Aggregate stop-risk cap: ${snapshot.equity * MAX_TOTAL_RISK_PCT:,.2f} "
-          f"({MAX_TOTAL_RISK_PCT:.0%} of collateral equity)")
+          f"({MAX_TOTAL_RISK_PCT * 100:g}% of collateral equity)")
     print(
         f"Per-position risk budget: ${snapshot.equity * (1 - RESERVE_PCT) * RISK_PCT_OF_USABLE_MARGIN:,.2f} "
         f"(5% of the 80% usable-equity amount)"
@@ -2495,6 +2556,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Inspect open positions and add only missing reduce-only stop/target orders.",
     )
     parser.add_argument(
+        "--max-risk-pct",
+        type=float,
+        help="Aggregate risk cap for this run only, as a percentage of collateral equity (default 20).",
+    )
+    parser.add_argument(
         "--kill-switch",
         action="store_true",
         help="Show (or with --live, execute) closing every perp position and cancelling every order "
@@ -2508,6 +2574,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--store-key", action="store_true", help="Prompt locally and store the API-wallet key in Keychain.")
     parser.add_argument("--live", action="store_true", help="Allow live orders after typing the confirmation phrase.")
     args = parser.parse_args(argv)
+    if args.max_risk_pct is not None:
+        if not 0 < args.max_risk_pct <= MAX_RISK_PCT_OVERRIDE_LIMIT:
+            parser.error(f"--max-risk-pct must be above 0 and at most {MAX_RISK_PCT_OVERRIDE_LIMIT:g}.")
+        global MAX_TOTAL_RISK_PCT
+        MAX_TOTAL_RISK_PCT = args.max_risk_pct / 100
+        print(f"NOTE: aggregate risk cap for this run is {args.max_risk_pct:g}%, not the default 20%.")
     try:
         if args.store_key:
             store_key(args.wallet)

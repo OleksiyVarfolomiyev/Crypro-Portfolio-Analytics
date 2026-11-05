@@ -144,7 +144,7 @@ Run a dry check first:
   --actions position_actions.csv
 ```
 
-Additions use the existing maker-only ALO entry approach; a resting entry keeps its queue position and is only replaced when its target price changes. Reductions and closes use reduce-only market orders, and never reverse a position. After a size change, the executor cancels and recreates the recognized reduce-only SL/TP orders to match the actual remaining position. The exchange cannot atomically resize the position and its exit orders, so a brief unprotected interval is possible; the CLI warns before live confirmation. Use one action per market in a CSV and review every refreshed quantity and order level.
+Additions use the existing maker-only ALO entry approach; a resting entry keeps its queue position and is only replaced when its target price changes. Within its five-minute window an entry retries after price moves, failed reads, and failed sends. A failed send is retried only after the exchange shows nothing was placed, and rejections retrying cannot fix, such as insufficient margin, stop at once. Reductions and closes use reduce-only market orders, and never reverse a position. After a size change, the executor cancels and recreates the recognized reduce-only SL/TP orders to match the actual remaining position. The exchange cannot atomically resize the position and its exit orders, so a brief unprotected interval is possible; the CLI warns before live confirmation. Use one action per market in a CSV and review every refreshed quantity and order level.
 
 First run without `--live` to inspect the proposed sizing and current aggregate risk:
 

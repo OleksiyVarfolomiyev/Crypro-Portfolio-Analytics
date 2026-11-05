@@ -180,11 +180,11 @@ class RealizedPnlTests(unittest.TestCase):
         }
         with patch.object(self.account, "post", return_value=spot_meta):
             tables, net_pnl = self.account.build_pnl_attribution(fills, [{"Coin": "BTC", "uPnL": 5.0}])
-        self.assertEqual(list(tables), ["Perp", "Spot"])
+        self.assertEqual(list(tables), ["Perp Crypto", "Spot"])
         self.assertEqual(list(tables["Spot"]["Asset"]), ["HYPE", "Net/total"])
         self.assertEqual(tables["Spot"]["Closes"].iloc[0], 1)
         self.assertNotIn("uPnL", tables["Spot"].columns)
-        self.assertAlmostEqual(tables["Perp"]["Total PnL"].iloc[-1], -45.0)
+        self.assertAlmostEqual(tables["Perp Crypto"]["Total PnL"].iloc[-1], -45.0)
         self.assertAlmostEqual(net_pnl, -35.0)
 
     def test_live_account_value_counts_unified_perp_equity_once(self):
@@ -348,6 +348,56 @@ class RealizedPnlTests(unittest.TestCase):
         self.assertEqual(list(history["accountValue"]), [100.0, 110.0, 120.0])
         self.assertEqual(list(history["pnl"]), [0.0, 10.0, 20.0])
 
+    def test_attribution_splits_perps_into_crypto_and_tradfi(self):
+        fills = pd.DataFrame([
+            {"time": t, "coin": coin, "assetType": "perp", "dir": "Close Short",
+             "closedPnl": pnl, "grossPnl": pnl}
+            for t, (coin, pnl) in enumerate([
+                ("BTC", 10.0), ("para:ANSEM", -4.0), ("hyna:ETH", 1.0),
+                ("xyz:AAPL", 6.0), ("para:STX", 2.0),
+            ])
+        ])
+        funding = pd.DataFrame([{"coin": "xyz:AAPL", "fundingPnl": -1.0}])
+        tables, net = self.account.build_pnl_attribution(
+            fills, [{"Coin": "xyz:AAPL", "uPnL": 3.0}, {"Coin": "BTC", "uPnL": 2.0}],
+            funding_history=funding,
+        )
+        self.assertEqual(list(tables), ["Perp Crypto", "Perp TradFi"])
+        crypto, tradfi = tables["Perp Crypto"].set_index("Asset"), tables["Perp TradFi"].set_index("Asset")
+        self.assertEqual(set(crypto.index), {"BTC", "para:ANSEM", "hyna:ETH", "Net/total"})
+        self.assertEqual(set(tradfi.index), {"xyz:AAPL", "para:STX", "Net/total"})
+        self.assertAlmostEqual(crypto.loc["Net/total", "Total PnL"], 9.0)
+        self.assertAlmostEqual(tradfi.loc["Net/total", "Total PnL"], 10.0)
+        self.assertEqual(tradfi.loc["xyz:AAPL", "Closes"], 1)
+        self.assertAlmostEqual(tradfi.loc["xyz:AAPL", "Total PnL"], 8.0)
+        self.assertAlmostEqual(net, 19.0)
+
+    def test_open_positions_split_into_crypto_and_tradfi_tables(self):
+        def position(coin, wallet, pos, margin, upnl):
+            return {"Wallet": wallet, "Coin": coin, "Side": "SHORT", "Pos": pos, "Margin": margin,
+                    "uPnL": upnl, "Account value": 1_000.0 if wallet == "a" else 3_000.0,
+                    "Funding": 0.0, "Fees USD": -1.0, "Funding (1h)": 0.01, "Expected Price PnL (5d)": 0.0,
+                    "Expected Funding PnL (5d)": 0.0, "Expected PnL incl. funding (5d)": 0.0}
+        rows = [position("BTC", "a", -100.0, 10.0, 1.0), dict(position("xyz:AAPL", "b", 400.0, 40.0, -2.0), Side="LONG"),
+                position("para:ANSEM", "b", -50.0, 5.0, 3.0)]
+        shown = []
+        with patch.object(self.account, "add_expected_pnl_columns", return_value=(rows, [])), \
+                patch.object(self.account, "display_interactive_table",
+                             side_effect=lambda frame, **kwargs: shown.append((kwargs["title"], frame))):
+            self.account.display_positions(rows, show_wallet=True)
+        self.assertEqual([title for title, _ in shown], ["OPEN POSITIONS: PERP CRYPTO"] * 2
+                         + ["OPEN POSITIONS: PERP TRADFI"] * 2)
+        crypto, tradfi = shown[0][1], shown[2][1]
+        self.assertEqual(list(crypto["Ticker"]), ["BTC", "para:ANSEM", "Net/total"])
+        self.assertEqual(list(tradfi["Ticker"]), ["xyz:AAPL", "Net/total"])
+        self.assertAlmostEqual(crypto["uPnL"].iloc[-1], 4.0)
+        # Shorts receive a positive rate; the long pays it.
+        self.assertAlmostEqual(crypto["Funding (1h)"].iloc[-1], 0.01)
+        self.assertAlmostEqual(crypto["Funding APR"].iloc[-1], 87.6)
+        self.assertAlmostEqual(tradfi["Funding (1h)"].iloc[-1], -0.01)
+        # TradFi sits in one wallet, but its share is of both wallets' combined $4,000.
+        self.assertAlmostEqual(tradfi["Position / Account (%)"].iloc[-1], 10.0)
+
     def test_attribution_other_row_reconciles_to_non_perp_pnl(self):
         fills = pd.DataFrame([
             {"time": 1, "coin": "BTC", "assetType": "perp", "dir": "Close Long",
@@ -380,6 +430,36 @@ class RealizedPnlTests(unittest.TestCase):
         self.assertAlmostEqual(total["Notional ($)"], 2_000.0)
         self.assertAlmostEqual(total["Fees (bps)"], 3.0)
         self.assertAlmostEqual(self.account.taker_fee_excess(summary), 0.30)
+
+    def test_saved_portfolio_history_reads_mixed_timestamp_precision(self):
+        now = pd.Timestamp("2026-06-30 12:00", tz="UTC")
+        wallet = "0x" + "a" * 40
+        fresh = {"allTime": self._portfolio_period(now, [(0, 120, 20)])}
+        with tempfile.TemporaryDirectory() as data_dir:
+            Path(data_dir, f"hl_portfolio_history_{wallet}.csv").write_text(
+                "ts,accountValue,pnl\n"
+                "2026-06-29 12:00:00.060000-04:00,100.0,0.0\n"
+                "2026-06-29 13:00:00-04:00,110.0,10.0\n"
+            )
+            with patch.object(self.account, "_fetch_portfolio_periods", return_value=fresh):
+                history = self.account.update_portfolio_history(wallet, data_dir)
+        self.assertEqual(list(history["accountValue"]), [100.0, 110.0, 120.0])
+
+    def test_funding_table_total_shows_net_rate_with_received_as_positive(self):
+        rows = [
+            {"Coin": "BTC", "Side": "LONG", "Pos": 1_000.0, "Sz": 0.01, "Funding (1h)": 0.001, "Funding APR": 8.76},
+            {"Coin": "SOL", "Side": "SHORT", "Pos": 2_000.0, "Sz": 8.0, "Funding (1h)": 0.003, "Funding APR": 26.28},
+        ]
+        tables = []
+        with patch.object(self.account, "display_interactive_table",
+                side_effect=lambda frame, **kwargs: tables.append(frame)):
+            self.account.display_exposure_and_funding(rows)
+        total = tables[-1].iloc[-1]
+        # Pays 0.01 on the long and receives 0.06 on the short: $0.05/hour on $3,000.
+        self.assertEqual(total["Coin"], "Net/total")
+        self.assertAlmostEqual(total["Estimated Funding PnL / hour ($)"], 0.05)
+        self.assertAlmostEqual(total["Current Funding / 1h (%)"], 0.05 / 3_000 * 100)
+        self.assertAlmostEqual(total["Funding APR (%)"], 0.05 / 3_000 * 100 * 24 * 365)
 
     def test_highlights_state_is_kept_per_file(self):
         with tempfile.TemporaryDirectory() as data_dir:
@@ -1012,7 +1092,7 @@ class TradeAnalyticsTests(unittest.TestCase):
             self.assertEqual(step.quantity, round(step.quantity, 1))
         self.assertAlmostEqual(sum(step.quantity for step in plan.stop_steps), 21449.8)
 
-    def _run_entry(self, statuses, responses=None, prices=None):
+    def _run_entry(self, statuses, responses=None, prices=None, position=0.0, open_orders=None):
         exchange = MagicMock()
         exchange.order.side_effect = responses or [
             {"response": {"data": {"statuses": [{"resting": {"oid": index}}]}}}
@@ -1024,6 +1104,8 @@ class TradeAnalyticsTests(unittest.TestCase):
         # A moving price forces a reprice on each check unless a test passes fixed prices.
         prices = prices or (0.01 + step * 1e-9 for step in itertools.count())
         with patch(f"{module}.post_only_price", side_effect=prices), \
+                patch(f"{module}._current_position_quantity", return_value=position), \
+                patch(f"{module}.fetch_open_orders", return_value=open_orders or []), \
                 patch(f"{module}.time.sleep"), \
                 patch(f"{module}._order_status", side_effect=statuses):
             return exchange, _place_entry(exchange, "0x" + "1" * 40, plan, market)
@@ -1046,6 +1128,100 @@ class TradeAnalyticsTests(unittest.TestCase):
         self.assertEqual([call.args[2] for call in exchange.order.call_args_list], [21449.7, 16992.5])
         self.assertAlmostEqual(quantity, 21449.7)
         self.assertAlmostEqual(entry, 0.01)
+
+    def test_entry_retries_when_price_moves_during_the_first_order(self):
+        status = self._order_status_response
+        exchange, (quantity, _) = self._run_entry(
+            [status("filled", 21449.7, 0)],
+            [
+                {"response": {"data": {"statuses": [{"error": "Post only order would have immediately matched"}]}}},
+                {"response": {"data": {"statuses": [{"resting": {"oid": 2}}]}}},
+            ],
+        )
+        self.assertEqual(exchange.order.call_count, 2)
+        self.assertAlmostEqual(quantity, 21449.7)
+
+    def test_entry_stops_at_once_on_a_rejection_that_retrying_cannot_fix(self):
+        with self.assertRaises(RuntimeError):
+            self._run_entry([], [{"response": {"data": {"statuses": [{"error": "Insufficient margin"}]}}}])
+
+    def test_entry_retries_a_failed_send_only_when_nothing_was_placed(self):
+        status = self._order_status_response
+        exchange, (quantity, _) = self._run_entry(
+            [status("filled", 21449.7, 0)],
+            [TimeoutError("send failed"), {"response": {"data": {"statuses": [{"resting": {"oid": 2}}]}}}],
+        )
+        self.assertEqual(exchange.order.call_count, 2)
+        self.assertAlmostEqual(quantity, 21449.7)
+
+    def test_failed_send_is_not_retried_if_an_order_is_resting(self):
+        failure = [TimeoutError("send failed"), {"response": {"data": {"statuses": [{"resting": {"oid": 2}}]}}}]
+        resting = [{"coin": "USUAL", "oid": 9, "reduceOnly": False}]
+        with self.assertRaises(RuntimeError):
+            self._run_entry([], failure, open_orders=resting)
+
+    def test_failed_send_check_needs_no_order_no_new_fill_and_a_good_read(self):
+        import hl_trade_execution as execution
+        plan = SimpleNamespace(coin="USUAL", dex="")
+        stop = {"coin": "USUAL", "oid": 1, "reduceOnly": True}
+        entry = {"coin": "USUAL", "oid": 2, "reduceOnly": False}
+        for orders, position, expected, safe in (
+            ([stop], -5.0, -5.0, True),
+            ([entry], -5.0, -5.0, False),
+            ([], -6.0, -5.0, False),
+        ):
+            with patch.object(execution, "fetch_open_orders", return_value=orders), \
+                    patch.object(execution, "_current_position_quantity", return_value=position):
+                self.assertEqual(execution._failed_send_left_nothing("w", plan, expected), safe)
+        with patch.object(execution, "fetch_open_orders", side_effect=ValueError("bad read")):
+            self.assertFalse(execution._failed_send_left_nothing("w", plan, 0.0))
+
+    def test_entry_survives_failed_status_reads_and_cancel_request(self):
+        status = self._order_status_response
+        exchange = MagicMock()
+        exchange.order.return_value = {"response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}}
+        exchange.cancel.side_effect = TimeoutError("cancel failed")
+        plan = SimpleNamespace(coin="USUAL", dex="", side="SHORT", quantity=100.0)
+        market = Market("USUAL", "", 0.01, 0.01, 1, 3)
+        reads = [
+            hl_trade_analytics.requests.Timeout("read failed"),
+            status("open", 100.0, 100.0),
+            status("filled", 100.0, 0),
+        ]
+        module = "hl_trade_execution"
+        prices = (0.01 + step * 1e-9 for step in itertools.count())
+        with patch(f"{module}.post_only_price", side_effect=prices), \
+                patch(f"{module}._current_position_quantity", return_value=0.0), \
+                patch(f"{module}.time.sleep"), \
+                patch(f"{module}._order_status", side_effect=reads):
+            quantity, _ = _place_entry(exchange, "0x" + "1" * 40, plan, market)
+        self.assertEqual(exchange.order.call_count, 1)
+        self.assertAlmostEqual(quantity, 100.0)
+
+    def test_entry_keeps_chasing_through_book_read_failures(self):
+        status = self._order_status_response
+        def prices():
+            yield ValueError("no book")
+            yield hl_trade_analytics.requests.Timeout("slow")
+            while True:
+                yield 0.01
+        source = prices()
+        def next_price(*_):
+            value = next(source)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        exchange = MagicMock()
+        exchange.order.return_value = {"response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}}
+        plan = SimpleNamespace(coin="USUAL", dex="", side="SHORT", quantity=100.0)
+        market = Market("USUAL", "", 0.01, 0.01, 1, 3)
+        module = "hl_trade_execution"
+        with patch(f"{module}.post_only_price", side_effect=next_price), \
+                patch(f"{module}._current_position_quantity", return_value=0.0), \
+                patch(f"{module}.time.sleep"), \
+                patch(f"{module}._order_status", return_value=status("filled", 100.0, 0)):
+            quantity, _ = _place_entry(exchange, "0x" + "1" * 40, plan, market)
+        self.assertAlmostEqual(quantity, 100.0)
 
     def test_entry_chase_keeps_queue_position_while_price_is_unchanged(self):
         status = self._order_status_response
@@ -1084,7 +1260,7 @@ class TradeAnalyticsTests(unittest.TestCase):
             [status("open", 21449.7, 16992.5), status("canceled", 21449.7, 16992.5)],
             [
                 {"response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}},
-                {"response": {"data": {"statuses": [{"error": "Post only would have matched"}]}}},
+                {"response": {"data": {"statuses": [{"error": "Insufficient margin to place order"}]}}},
             ],
         )
 
@@ -1521,9 +1697,8 @@ class RestingEntryTests(unittest.TestCase):
     def test_filled_order_stops_waiting_without_repricing(self):
         self.assertEqual(self._run(["open", "filled"], [100.0]), ("filled", 2, 1))
 
-    def test_book_error_hands_order_back_for_cancel(self):
-        state, _, _ = self._run(["open"], ValueError("no book"))
-        self.assertEqual(state, "open")
+    def test_book_error_keeps_the_order_working(self):
+        self.assertEqual(self._run(["open", "filled"], ValueError("no book")), ("filled", 2, 1))
 
 
 class KillSwitchTests(unittest.TestCase):
@@ -1632,6 +1807,16 @@ class KillSwitchTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertFalse(self.flag.exists())
 
+    def test_risk_cap_override_applies_to_the_run_and_rejects_extreme_values(self):
+        with patch.object(self.execution, "MAX_TOTAL_RISK_PCT", 0.20), \
+                patch.object(self.execution, "store_key"):
+            self.execution.main(["--wallet", "0x" + "1" * 40, "--store-key", "--max-risk-pct", "28"])
+            self.assertAlmostEqual(self.execution.MAX_TOTAL_RISK_PCT, 0.28)
+            for bad in ("0", "51", "-5"):
+                with self.assertRaises(SystemExit):
+                    self.execution.main(["--wallet", "0x" + "1" * 40, "--store-key", "--max-risk-pct", bad])
+        self.assertEqual(self.execution.MAX_TOTAL_RISK_PCT, 0.20)
+
     def test_engaged_switch_stops_a_running_entry_chase(self):
         self.flag.write_text("engaged")
         exchange = MagicMock()
@@ -1639,6 +1824,79 @@ class KillSwitchTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.execution._place_entry(exchange, "w", plan, SimpleNamespace(size_decimals=3))
         exchange.order.assert_not_called()
+
+
+class CoinGeckoRetryTests(unittest.TestCase):
+    def _get(self, responses):
+        import portfolio_analytics_implementation as portfolio
+        owner = SimpleNamespace(_coingecko_last_request_at=0.0)
+        with (
+            patch.object(portfolio.requests, "get", side_effect=responses) as get,
+            patch.object(portfolio.time, "sleep"),
+        ):
+            result = portfolio._MarketDataMixin._coingecko_get(owner, "https://example.test")
+        return result, get.call_count
+
+    def test_timeout_is_retried_until_a_response_arrives(self):
+        import requests
+        success = MagicMock(status_code=200)
+        success.json.return_value = {"prices": []}
+        result, calls = self._get([requests.ReadTimeout(), requests.ConnectionError(), success])
+        self.assertIs(result, success)
+        self.assertEqual(calls, 3)
+
+    def test_repeated_timeouts_still_raise(self):
+        import requests
+        with self.assertRaises(requests.ReadTimeout):
+            self._get([requests.ReadTimeout()] * 3)
+
+
+class PortfolioAssetSelectionTests(unittest.TestCase):
+    def test_coingecko_midnight_point_is_dated_by_the_day_it_closes(self):
+        import portfolio_analytics_implementation as portfolio
+        ms = lambda text: int(pd.Timestamp(text, tz="UTC").timestamp() * 1000)
+        series = portfolio._coingecko_daily_series(
+            [[ms("2026-06-02 00:00"), 100.0], [ms("2026-06-03 00:00"), 110.0], [ms("2026-06-03 15:30"), 120.0]],
+            "X",
+        )
+        self.assertEqual(series[pd.Timestamp("2026-06-01", tz="UTC")], 100.0)
+        self.assertEqual(series[pd.Timestamp("2026-06-02", tz="UTC")], 110.0)
+        self.assertEqual(series[pd.Timestamp("2026-06-03", tz="UTC")], 120.0)
+
+    def test_explicit_assets_replace_wallet_discovery(self):
+        import portfolio_analytics_implementation as portfolio
+        with tempfile.TemporaryDirectory() as data_dir:
+            analysis = portfolio.PortfolioAnalytics(data_dir, ["0x" + "1" * 40], assets=["TRX", "xyz:AAPL", "TRX"])
+            with patch.object(analysis, "_post_hyperliquid") as post:
+                assets = analysis._wallet_assets()
+        post.assert_not_called()
+        self.assertEqual(assets, ["TRX", "xyz:AAPL"])
+        self.assertEqual(analysis.perp_asset_dex, {"TRX": "", "xyz:AAPL": "xyz"})
+
+
+class NetLossGuardTests(unittest.TestCase):
+    def test_guard_finds_hip3_market_and_exits_on_net_loss(self):
+        import hl_trade_execution as execution
+        plan = SimpleNamespace(coin="xyz:AAPL", dex="xyz", side="LONG", quantity=2.0, risk_budget=10.0)
+        trade = SimpleNamespace(
+            plan=plan, quantity=2.0, entry_price=350.0, baseline_quantity=0.0, stop_oid=1, target_oid=2,
+            started_at=pd.Timestamp("2026-06-01", tz="UTC"),
+        )
+        exchange = MagicMock()
+        # Hyperliquid names HIP-3 markets with their DEX prefix already included.
+        metadata = [{"universe": [{"name": "xyz:TSLA"}, {"name": "xyz:AAPL"}]}, [{"markPx": "400"}, {"markPx": "340"}]]
+        with (
+            patch.object(execution, "_order_status", return_value={"order": {"status": "open"}}),
+            patch.object(execution, "_current_position_quantity", return_value=2.0),
+            patch.object(execution, "_cancel_if_open"),
+            patch.object(execution, "post_info", return_value=metadata) as info,
+            patch.object(execution, "fetch_funding_history", return_value=pd.DataFrame(
+                {"time": pd.Series(dtype="datetime64[ns, UTC]"), "fundingRate": pd.Series(dtype=float)}
+            )),
+        ):
+            execution._watch_trades(exchange, "w", [trade], 0.00015, 0.00045)
+        self.assertEqual(info.call_args.args[0], {"type": "metaAndAssetCtxs", "dex": "xyz"})
+        exchange.market_close.assert_called_once_with("xyz:AAPL", 2.0)
 
 
 if __name__ == "__main__":

@@ -50,6 +50,12 @@ ACCOUNTING_TIMEZONE = "America/New_York"
 ACCOUNT_VALUE_GAP_WARNING_PCT = 2.0
 PORTFOLIO_HISTORY_COLUMNS = ["ts", "accountValue", "pnl"]
 OTHER_NON_PERP_LABEL = "Other (vaults, transfers, open spot)"
+# Builder (HIP-3) markets are TradFi unless their DEX or market is listed here as crypto.
+CRYPTO_HIP3_DEXES = {"hyna"}
+CRYPTO_HIP3_MARKETS = {
+    "cash:BTC", "cash:ETH", "flx:BTC", "flx:USDE", "flx:XMR", "io:PRL", "para:ANSEM",
+    "para:BTCD", "para:HYPE2", "para:OTHERS", "para:TOTAL2",
+}
 HISTORY_COLUMNS = [
     "ts", "accountValue", "source", "asset", "balance", "open_position_value",
     "unrealized_pnl", "realized_pnl",
@@ -333,7 +339,8 @@ def update_portfolio_history(user, data_dir):
     saved = pd.DataFrame(columns=PORTFOLIO_HISTORY_COLUMNS)
     if path.exists():
         saved = pd.read_csv(path)
-        saved['ts'] = pd.to_datetime(saved['ts'], utc=True).dt.tz_convert(ACCOUNTING_TIMEZONE)
+        # Timestamps on an exact second are saved without fractional seconds.
+        saved['ts'] = pd.to_datetime(saved['ts'], utc=True, format='ISO8601').dt.tz_convert(ACCOUNTING_TIMEZONE)
     history = merge_portfolio_history(saved, stitch_portfolio_periods(_fetch_portfolio_periods(user)))
     history.to_csv(path, index=False)
     return history
@@ -1269,11 +1276,20 @@ def fetch_position_rows(user=None, fills=None, fills_complete=False, states=None
     return (states, rows)
 
 
-def _positions_total_row(frame):
-    """Sum dollar columns and recompute ratios for the position tables' Net/total row."""
+def _account_equity(frame):
+    """Sum account value once per wallet."""
+    return frame.drop_duplicates('Wallet')['Account value'].sum()
+
+
+def _positions_total_row(frame, equity=None):
+    """Sum dollar columns and recompute ratios for the position tables' Net/total row.
+
+    ``equity`` overrides the wallets found in ``frame``, so a table holding only part
+    of the book still measures its size against the whole account.
+    """
     position_value = frame['Pos'].abs().sum()
     margin = frame['Margin'].sum()
-    equity = frame.drop_duplicates('Wallet')['Account value'].sum()
+    equity = _account_equity(frame) if equity is None else equity
     price_pnl, funding_pnl = frame['Expected Price PnL (5d)'], frame['Expected Funding PnL (5d)']
     def expected_return(pnl):
         notional = frame.loc[pnl.notna(), 'Pos'].abs().sum()
@@ -1311,8 +1327,6 @@ def display_positions(rows,show_wallet=False):
     frame['Fees / Position (%)'] = (fees_usd.abs() / position_value * 100).where(position_value > 0)
     frame['Position / Account (%)'] = (position_value / equity * 100).where(equity > 0)
     frame = frame.rename(columns={'Funding': 'Funding (since open)','Coin':'Ticker'})
-    frame = pd.concat([frame,pd.DataFrame([_positions_total_row(frame)])],ignore_index=True)
-    blank_total_cells={(len(frame)-1,column) for column in frame.columns}
     # Split across two tables so each fits on screen; both repeat the identifying columns.
     identifiers=(['Wallet'] if show_wallet else [])+['Ticker','Side']
     pnl_columns=identifiers+['Liq %','ROE','uPnL','Funding (since open)',
@@ -1334,7 +1348,9 @@ def display_positions(rows,show_wallet=False):
             return 'color:#c62828;font-weight:600;' if out_of_money else ''
         if column in {'Funding (1h)','Funding APR'} and pd.notna(value):
             if value==0: return ''
-            pays=(value>0 and row['Side']=='LONG') or (value<0 and row['Side']=='SHORT')
+            # The Net/total rate is already net cash flow, so positive means received.
+            pays=value<0 if row['Side'] not in {'LONG','SHORT'} else \
+                (value>0 and row['Side']=='LONG') or (value<0 and row['Side']=='SHORT')
             return 'color:#c62828;font-weight:600;' if pays else 'color:#188038;font-weight:600;'
         if column == 'Liq %' and pd.notna(value):
             return 'color:#c62828;' if value <= 10 else \
@@ -1364,9 +1380,27 @@ def display_positions(rows,show_wallet=False):
         'Liq Px':lambda v:f'{v:,.5g}' if pd.notna(v) else 'n/a','Lev.':lambda v:f'{v:.2f}x',
         'Margin %':lambda v:f'{v:.2f}%' if pd.notna(v) else 'n/a',
     }
-    for columns in (pnl_columns,position_columns):
-        display_interactive_table(frame,columns=columns,cell_style=style,formatters=formatters,
-                                  bold_last=True,blank_missing_cells=blank_total_cells)
+    equity_total=_account_equity(frame)
+    groups=frame['Ticker'].map(perp_market_group)
+    for group in ('Perp Crypto','Perp TradFi'):
+        table=frame[groups==group]
+        if table.empty:
+            continue
+        total_row=_positions_total_row(table,equity=equity_total)
+        funding_summary=summarize_current_funding(table.to_dict('records'))
+        total_row['Funding (1h)']=funding_summary['Net Funding Rate / 1h (%) (covered)']
+        total_row['Funding APR']=funding_summary['Net Funding APR (%) (simple, covered)']
+        table=pd.concat([table,pd.DataFrame([total_row])],ignore_index=True)
+        blank_total_cells={(len(table)-1,column) for column in table.columns}
+        for columns in (pnl_columns,position_columns):
+            display_interactive_table(table,columns=columns,cell_style=style,formatters=formatters,
+                                      bold_last=True,blank_missing_cells=blank_total_cells,
+                                      title=f'OPEN POSITIONS: {group.upper()}')
+    print(f"All positions: notional ${frame['Pos'].abs().sum():,.0f} | "
+          f"margin ${frame['Margin'].sum():,.0f} | uPnL {usd(frame['uPnL'].sum())}.")
+    print('Net/total Funding (1h) and APR are net cash flow on covered notional at current '
+          'rates: positive means received. Asset rows show the market rate: positive means '
+          'longs pay shorts.')
     print('Funding and fees are cumulative since the position was opened. Fee ratios are '
           'shown only for complete USDC-denominated fees; otherwise they are n/a.')
     if expected_pnl_warnings:
@@ -1426,6 +1460,8 @@ def display_exposure_and_funding(rows):
     position_values = frame['Position Value ($)']
     frame = pd.concat([frame, pd.DataFrame([{
         'Coin': 'Net/total', 'Position Value ($)': position_values.sum(),
+        'Current Funding / 1h (%)': summary['Net Funding Rate / 1h (%) (covered)'],
+        'Funding APR (%)': summary['Net Funding APR (%) (simple, covered)'],
         'Estimated Funding PnL / hour ($)': frame['Estimated Funding PnL / hour ($)'].sum(),
         'Estimated Funding PnL / day ($)': frame['Estimated Funding PnL / day ($)'].sum(),
         'Funding Coverage (%)': (
@@ -1461,7 +1497,8 @@ def display_exposure_and_funding(rows):
     }, bold_last=True, blank_missing_cells={(len(frame) - 1, column) for column in columns})
     print('Funding rates are current hourly rates, weighted by position notional. '
           'Positive rates are paid by longs and received by shorts; estimated cash flows '
-          'assume the current rate stays constant. APR is simple annualization, not a forecast.')
+          'assume the current rate stays constant. APR is simple annualization, not a forecast. '
+          'The Net/total rate and APR are net cash flow on covered notional: positive means received.')
 
 
 def _fetch_daily_atr(coin, period):
@@ -2169,11 +2206,19 @@ def fetch_non_perp_pnl(wallets):
     return total
 
 
+def perp_market_group(asset):
+    """Return ``Perp Crypto`` or ``Perp TradFi`` for a perp name such as ``xyz:AAPL``."""
+    name = str(asset)
+    dex = name.split(':')[0] if ':' in name else ''
+    crypto = not dex or dex in CRYPTO_HIP3_DEXES or name in CRYPTO_HIP3_MARKETS
+    return 'Perp Crypto' if crypto else 'Perp TradFi'
+
+
 def build_pnl_attribution(realized_df, open_positions, funding_history=None, non_perp_pnl=None):
     """Combine realized fill PnL and current perp uPnL by market/asset.
 
-    Returns ``({'Perp': table, 'Spot': table}, net_pnl)``, omitting a market type
-    with no rows. Percentages are shares of that table's gross absolute PnL. When
+    Returns ``({'Perp Crypto': table, 'Perp TradFi': table, 'Spot': table}, net_pnl)``,
+    omitting a market type with no rows. Percentages are shares of that table's gross absolute PnL. When
     ``non_perp_pnl`` is given, a Spot row holds what spot fills do not explain.
     """
     parts = []
@@ -2223,12 +2268,16 @@ def build_pnl_attribution(realized_df, open_positions, funding_history=None, non
         except Exception as exc:
             print(f'Spot labels remain as API IDs: {type(exc).__name__}')
     attribution = attribution[(attribution['Realized'] != 0) | (attribution['uPnL'] != 0) |
-        (attribution['Closes'] > 0)]
+        (attribution['Closes'] > 0)].copy()
+    is_perp = attribution['Type'] == 'Perp'
+    attribution.loc[is_perp, 'Type'] = attribution.loc[is_perp, 'Asset'].map(perp_market_group)
+    perp_columns = ['Asset', 'Closes', 'Realized', 'Realized (% gross)', 'uPnL',
+        'uPnL (% gross)', 'Total PnL', 'Total (% gross)']
     tables = {
         asset_type: _attribution_table(attribution[attribution['Type'] == asset_type], columns)
         for asset_type, columns in [
-            ('Perp', ['Asset', 'Closes', 'Realized', 'Realized (% gross)', 'uPnL',
-                'uPnL (% gross)', 'Total PnL', 'Total (% gross)']),
+            ('Perp Crypto', perp_columns),
+            ('Perp TradFi', perp_columns),
             # Spot holdings carry no uPnL here, so its total is just the realized PnL.
             ('Spot', ['Asset', 'Closes', 'Realized', 'Realized (% gross)']),
         ]

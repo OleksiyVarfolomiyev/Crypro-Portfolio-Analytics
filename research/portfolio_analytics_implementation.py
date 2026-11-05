@@ -57,6 +57,23 @@ class _TableStyleMixin:
 # returns against BTC are reported and skipped.
 
 
+def _coingecko_daily_series(points, column):
+    """Convert CoinGecko points to daily values dated by the day they close.
+
+    A point at exactly 00:00 UTC is the previous day's close, so it takes that date;
+    this matches Hyperliquid candles, which are dated by the day they cover.
+    """
+    if not points:
+        return pd.Series(dtype=float, name=column)
+    frame = pd.DataFrame(points, columns=['timestamp_ms', column])
+    times = pd.to_datetime(frame.pop('timestamp_ms'), unit='ms', utc=True)
+    days = times.dt.normalize()
+    frame['date'] = days.where(times != days, days - pd.Timedelta(days=1))
+    return pd.to_numeric(
+        frame.drop_duplicates('date', keep='last').set_index('date')[column], errors='coerce'
+    )
+
+
 class _MarketDataMixin:
     def _post_hyperliquid(self, payload):
         try:
@@ -80,6 +97,13 @@ class _MarketDataMixin:
 
         self.perp_asset_dex = {}
         self.spot_wallet_assets = []
+        if self.configured_assets:
+            # An explicit list replaces wallet discovery; "dex:COIN" names a HIP-3 market.
+            self.perp_asset_dex = {
+                ticker: ticker.split(':', 1)[0] if ':' in ticker else ''
+                for ticker in self.configured_assets
+            }
+            return list(self.configured_assets)
 
         dexes = post_info({'type': 'perpDexs'})
         if not isinstance(dexes, list):
@@ -126,12 +150,20 @@ class _MarketDataMixin:
 
     def _coingecko_get(self, url, params=None, timeout=30):
         max_attempts = 8
+        network_failures = 0
         for attempt in range(1, max_attempts + 1):
             elapsed = time.monotonic() - self._coingecko_last_request_at
             if elapsed < 2.6:
                 time.sleep(2.6 - elapsed)
             self._coingecko_last_request_at = time.monotonic()
-            response = requests.get(url, params=params, timeout=timeout)
+            try:
+                response = requests.get(url, params=params, timeout=timeout)
+            except (requests.Timeout, requests.ConnectionError):
+                network_failures += 1
+                if network_failures >= 3 or attempt == max_attempts:
+                    raise
+                time.sleep(5 * network_failures)
+                continue
             rate_limited = response.status_code == 429
             if not rate_limited:
                 try:
@@ -276,15 +308,6 @@ class _MarketDataMixin:
         else:
             market = pd.DataFrame(index=pd.DatetimeIndex([], tz='UTC', name='date'))
 
-        def points_to_series(points, column):
-            if not points:
-                return pd.Series(dtype=float, name=column)
-            frame = pd.DataFrame(points, columns=['timestamp_ms',column])
-            frame['date'] = pd.to_datetime(frame.pop('timestamp_ms'),unit='ms',utc=True).dt.normalize()
-            return pd.to_numeric(
-                frame.drop_duplicates('date',keep='last').set_index('date')[column], errors='coerce'
-            )
-
         updated = {}
         for ticker, coin_id in coins.items():
             if ticker not in prices:
@@ -319,15 +342,19 @@ class _MarketDataMixin:
             data=response.json()
             if not isinstance(data, dict) or 'prices' not in data:
                 raise ValueError(f'{ticker}: CoinGecko response did not contain prices.')
-            fetched=points_to_series(data['prices'],ticker)
-            if not fetched.empty:
+            fetched=_coingecko_daily_series(data['prices'],ticker)
+            # Perps use Hyperliquid candles only, so one venue sets their closes and dates.
+            if ticker in self.perp_asset_dex:
+                updated[ticker]=0
+            elif not fetched.empty:
                 prices=prices.reindex(prices.index.union(fetched.index)).sort_index()
                 prices.loc[fetched.index,ticker]=fetched
             else:
                 warnings.append(f'{ticker}: CoinGecko returned no new price observations.')
-            updated[ticker]=len(fetched)
+            if ticker not in self.perp_asset_dex:
+                updated[ticker]=len(fetched)
             for response_key,column in [('market_caps',cap_col),('total_volumes',volume_col)]:
-                series=points_to_series(data.get(response_key,[]),column)
+                series=_coingecko_daily_series(data.get(response_key,[]),column)
                 if series.empty:
                     warnings.append(f'{ticker}: no {response_key} history was returned.')
                     continue
@@ -1045,8 +1072,9 @@ class PortfolioAnalytics(
     _KellyMixin, _PerformanceMixin,
     _FactorModelMixin, _OutputMixin, _TableStyleMixin,
 ):
-    def __init__(self, data_dir, wallet_addresses):
+    def __init__(self, data_dir, wallet_addresses, assets=None):
         self.data_dir=Path(data_dir)
+        self.configured_assets=list(dict.fromkeys(assets)) if assets else []
         if not isinstance(wallet_addresses, (list, tuple)) or not wallet_addresses:
             raise ValueError('wallet_addresses must be a non-empty list of wallet addresses.')
         if any(not isinstance(wallet, str) for wallet in wallet_addresses):
