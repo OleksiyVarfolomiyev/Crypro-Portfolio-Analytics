@@ -742,12 +742,14 @@ class _PerformanceMixin(_TableStyleMixin):
             'Historical VaR 95% ($ / $100)':risk_metrics['Historical VaR 95%']*100,
             'Historical 1D VaR 99%':risk_metrics['Historical VaR 99%'],
             'Historical VaR 99% ($ / $100)':risk_metrics['Historical VaR 99%']*100,
-            'Normal 1D VaR 95%':risk_metrics['Normal VaR 95%'],
-            'Normal VaR 95% ($ / $100)':risk_metrics['Normal VaR 95%']*100,
-            'Normal 1D VaR 99%':risk_metrics['Normal VaR 99%'],
-            'Normal VaR 99% ($ / $100)':risk_metrics['Normal VaR 99%']*100,
-            'Normal 1D VaR 99% (zero mean)':risk_metrics['Normal VaR 99% (zero mean)'],
-            'Normal VaR 99% ($ / $100, zero mean)':risk_metrics['Normal VaR 99% (zero mean)']*100,
+            'Bootstrap 1D VaR 95%':risk_metrics['Bootstrap VaR 95%'],
+            'Bootstrap VaR 95% ($ / $100)':risk_metrics['Bootstrap VaR 95%']*100,
+            'Bootstrap VaR 95% (90% CI low)':risk_metrics['Bootstrap VaR 95% Low'],
+            'Bootstrap VaR 95% (90% CI high)':risk_metrics['Bootstrap VaR 95% High'],
+            'Bootstrap 1D VaR 99%':risk_metrics['Bootstrap VaR 99%'],
+            'Bootstrap VaR 99% ($ / $100)':risk_metrics['Bootstrap VaR 99%']*100,
+            'Bootstrap VaR 99% (90% CI low)':risk_metrics['Bootstrap VaR 99% Low'],
+            'Bootstrap VaR 99% (90% CI high)':risk_metrics['Bootstrap VaR 99% High'],
             'Daily Return Observations':risk_metrics['Daily Return Observations'],
             'Historical VaR 99% Tail Observations':risk_metrics['Historical VaR 99% Tail Observations'],
             'Risk-Free Rate':risk_free_annual,'Max Drawdown':max_drawdown,
@@ -764,20 +766,23 @@ class _PerformanceMixin(_TableStyleMixin):
             'Historical VaR 95% ($ / $100)':'${:,.2f}',
             'Historical 1D VaR 99%':'{:.2%}',
             'Historical VaR 99% ($ / $100)':'${:,.2f}',
-            'Normal 1D VaR 95%':'{:.2%}',
-            'Normal VaR 95% ($ / $100)':'${:,.2f}',
-            'Normal 1D VaR 99%':'{:.2%}',
-            'Normal VaR 99% ($ / $100)':'${:,.2f}',
-            'Normal 1D VaR 99% (zero mean)':'{:.2%}',
-            'Normal VaR 99% ($ / $100, zero mean)':'${:,.2f}',
+            'Bootstrap 1D VaR 95%':'{:.2%}',
+            'Bootstrap VaR 95% ($ / $100)':'${:,.2f}',
+            'Bootstrap VaR 95% (90% CI low)':'{:.2%}',
+            'Bootstrap VaR 95% (90% CI high)':'{:.2%}',
+            'Bootstrap 1D VaR 99%':'{:.2%}',
+            'Bootstrap VaR 99% ($ / $100)':'${:,.2f}',
+            'Bootstrap VaR 99% (90% CI low)':'{:.2%}',
+            'Bootstrap VaR 99% (90% CI high)':'{:.2%}',
             'Risk-Free Rate':'{:.2%}',
             'Max Drawdown':'{:.2%}',
         })
         print(f"Risk estimates use {risk_metrics['Daily Return Observations']} daily observations "
               f"and 365-day crypto annualization. Historical 99% VaR has only "
               f"{risk_metrics['Historical VaR 99% Tail Observations']} observed tail "
-              "observation(s); treat it as a weak tail estimate. Normal VaR is a "
-              "Gaussian-model comparison, not a tail guarantee. Arithmetic return is "
+              "observation(s); treat it as a weak tail estimate. Bootstrap VaR resamples "
+              "observed daily returns, so it cannot exceed the largest loss in the sample; "
+              "its range shows sampling uncertainty, not a worst case. Arithmetic return is "
               "the daily mean multiplied by 365, not a forecast or compounded return. "
               "These are in-sample results: Kelly weights were optimized and evaluated "
               "on the same return window; use a walk-forward backtest for out-of-sample evidence.")

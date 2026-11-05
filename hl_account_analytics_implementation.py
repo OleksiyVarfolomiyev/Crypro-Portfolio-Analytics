@@ -12,6 +12,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 from hl_trade_analytics import (
+    bootstrap_var,
     MAX_RATE_LIMIT_RETRIES,
     _rate_limit_delay,
     add_expected_pnl_columns,
@@ -49,6 +50,8 @@ API = "https://api.hyperliquid.xyz/info"
 ACCOUNTING_TIMEZONE = "America/New_York"
 ACCOUNT_VALUE_GAP_WARNING_PCT = 2.0
 PORTFOLIO_HISTORY_COLUMNS = ["ts", "accountValue", "pnl"]
+# Six attempts back off for about 30 seconds, enough to ride out a short network drop.
+MAX_TRANSPORT_ATTEMPTS = 6
 OTHER_NON_PERP_LABEL = "Other (vaults, transfers, open spot)"
 # Builder (HIP-3) markets are TradFi unless their DEX or market is listed here as crypto.
 CRYPTO_HIP3_DEXES = {"hyna"}
@@ -168,7 +171,7 @@ def post(payload):
             response = requests.post(API, json=payload, timeout=30)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             transport_failures += 1
-            if transport_failures == 3:
+            if transport_failures == MAX_TRANSPORT_ATTEMPTS:
                 raise
             sleep(2 ** (transport_failures - 1))
             continue
@@ -610,16 +613,24 @@ def fetch_btc_candles(start_ms, end_ms, interval='1d'):
 
 
 def historical_var(pnl_observations, account_value, confidence, min_observations):
-    'Estimate loss VaR from the empirical ' \
-        'lower-tail daily PnL quantile.'
+    """Estimate loss VaR from the daily PnL quantile, directly and by bootstrap.
+
+    Both need ``min_observations``; below that every estimate is NaN.
+    """
     sample = pd.to_numeric(pnl_observations, errors='coerce').dropna()
     count = len(sample)
     if count < min_observations or account_value <= 0:
-        return {'usd': float('nan'), 'pct': float('nan'), 'n': count, 'quantile_pnl': float('nan')}
+        missing = float('nan')
+        return {'usd': missing, 'pct': missing, 'n': count, 'quantile_pnl': missing,
+            'bootstrap_usd': missing, 'bootstrap_pct': missing,
+            'bootstrap_low_usd': missing, 'bootstrap_high_usd': missing}
     quantile_pnl = float(sample.quantile(1 - confidence))
     loss_usd = max(0.0, -quantile_pnl)
+    bootstrap = bootstrap_var(sample, confidence)
     return {'usd': loss_usd, 'pct': loss_usd / account_value * 100, 'n': count,
-        'quantile_pnl': quantile_pnl}
+        'quantile_pnl': quantile_pnl, 'bootstrap_usd': bootstrap['var'],
+        'bootstrap_pct': bootstrap['var'] / account_value * 100,
+        'bootstrap_low_usd': bootstrap['low'], 'bootstrap_high_usd': bootstrap['high']}
 
 
 def historical_volatility(pnl_observations, account_value, annualization_days=365):
@@ -821,6 +832,11 @@ def print_account_metrics(metrics, new_api_rows, fill_count, rolling_24h):
         return f'${value:,.2f}' if pd.notna(value) else 'n/a'
     def percent(value):
         return f'{value:.2f}%' if pd.notna(value) else 'n/a'
+    def bootstrap_var_text(var):
+        if pd.isna(var['bootstrap_usd']):
+            return f"n/a (n={var['n']})"
+        return (f"{money(var['bootstrap_usd'])} ({percent(var['bootstrap_pct'])}; 90% range "
+                f"{money(var['bootstrap_low_usd'])}-{money(var['bootstrap_high_usd'])}; n={var['n']})")
     index = metrics.account_index
     drawdown_sample = (
         f'{len(index):,} history points ({index.index.min().date()} to {index.index.max().date()})'
@@ -850,6 +866,8 @@ def print_account_metrics(metrics, new_api_rows, fill_count, rolling_24h):
             f"{money(metrics.var_95['usd'])} ({percent(metrics.var_95['pct'])}; n={metrics.var_95['n']})"),
         ('24H historical VaR 99%',
             f"{money(metrics.var_99['usd'])} ({percent(metrics.var_99['pct'])}; n={metrics.var_99['n']})"),
+        ('24H bootstrap VaR 95%', bootstrap_var_text(metrics.var_95)),
+        ('24H bootstrap VaR 99%', bootstrap_var_text(metrics.var_99)),
         ('Historical volatility',
             f"{percent(metrics.historical_volatility['daily_pct'])}/day; {percent(metrics.historical_volatility['annualized_pct'])}/year (n={metrics.historical_volatility['n']})"),
         ('New history rows', str(new_api_rows)),
@@ -862,7 +880,7 @@ def print_account_metrics(metrics, new_api_rows, fill_count, rolling_24h):
         if row['Metric'] == 'BTC beta':
             # Green when the account moves less than BTC, including when it moves opposite.
             return 'color:#188038;font-weight:600;' if text != 'n/a' and float(text) < 1 else ''
-        if row['Metric'].startswith('24H historical VaR'):
+        if row['Metric'].startswith(('24H historical VaR', '24H bootstrap VaR')):
             if re.search(r'\$\s*\d', text) and '$-' not in text:
                 return 'color:#188038;font-weight:600;'
         if text.startswith('-') or '$-' in text or '(-' in text:
@@ -879,6 +897,9 @@ def print_account_metrics(metrics, new_api_rows, fill_count, rolling_24h):
     if gap_warning:
         print(gap_warning)
     display_interactive_table(table, cell_style=sign_style)
+    print('Bootstrap VaR resamples observed daily PnL 10,000 times and reports the median with a '
+          "90% range. It cannot exceed the sample's largest daily loss, and it needs the same "
+          'history as historical VaR: 20 days for 95%, 100 days for 99%.')
 
 
 class _AccountPnLMixin:

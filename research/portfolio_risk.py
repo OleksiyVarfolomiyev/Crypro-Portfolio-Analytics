@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from statistics import NormalDist
-
 import numpy as np
 import pandas as pd
+
+from hl_trade_analytics import bootstrap_var
 
 
 def calculate_portfolio_risk_metrics(
@@ -59,13 +59,9 @@ def calculate_portfolio_risk_metrics(
     # Left-tail return quantiles: the 5% and 1% worst-day cutoffs.
     quantile_95 = float(daily_returns.quantile(0.05))
     quantile_99 = float(daily_returns.quantile(0.01))
-    # Parametric VaR assumes normal returns, which understates fat crypto tails.
-    # The zero-mean variant keeps a strong recent trend from shrinking the estimate.
-    normal = NormalDist(mu=daily_mean, sigma=daily_vol)
-    zero_mean_normal = NormalDist(mu=0.0, sigma=daily_vol)
-    normal_var_95 = max(0.0, -normal.inv_cdf(0.05))
-    normal_var_99 = max(0.0, -normal.inv_cdf(0.01))
-    zero_mean_normal_var_99 = max(0.0, -zero_mean_normal.inv_cdf(0.01))
+    # Resampling keeps the sample's fat tails, which a normal model would understate.
+    bootstrap_95 = bootstrap_var(daily_returns, 0.95)
+    bootstrap_99 = bootstrap_var(daily_returns, 0.99)
 
     return {
         "Sharpe (annualized)": sharpe,
@@ -77,9 +73,12 @@ def calculate_portfolio_risk_metrics(
         "Hist Vol (annualized)": daily_vol * np.sqrt(periods_per_year),
         "Historical VaR 95%": max(0.0, -quantile_95),
         "Historical VaR 99%": max(0.0, -quantile_99),
-        "Normal VaR 95%": normal_var_95,
-        "Normal VaR 99%": normal_var_99,
-        "Normal VaR 99% (zero mean)": zero_mean_normal_var_99,
+        "Bootstrap VaR 95%": bootstrap_95["var"],
+        "Bootstrap VaR 95% Low": bootstrap_95["low"],
+        "Bootstrap VaR 95% High": bootstrap_95["high"],
+        "Bootstrap VaR 99%": bootstrap_99["var"],
+        "Bootstrap VaR 99% Low": bootstrap_99["low"],
+        "Bootstrap VaR 99% High": bootstrap_99["high"],
         "Daily Return Observations": int(len(daily_returns)),
         # Few tail observations mean the 99% historical estimate is unreliable.
         "Historical VaR 99% Tail Observations": int((daily_returns <= quantile_99).sum()),

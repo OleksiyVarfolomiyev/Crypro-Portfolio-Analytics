@@ -726,6 +726,32 @@ def net_funding_apr_history(
     return daily[columns]
 
 
+BOOTSTRAP_SAMPLES = 10_000
+BOOTSTRAP_SEED = 7
+
+
+def bootstrap_var(
+    returns: pd.Series,
+    confidence: float,
+    samples: int = BOOTSTRAP_SAMPLES,
+    seed: int = BOOTSTRAP_SEED,
+) -> dict[str, float]:
+    """Bootstrap 1-day historical VaR by resampling observed daily results with replacement.
+
+    ``returns`` may hold fractions or dollars. Returns the median estimate and a 90%
+    interval as positive losses in the same unit, each
+    floored at zero. Only observed returns are drawn, so no resample can exceed the
+    largest loss in the sample. The fixed seed keeps reruns on the same data identical.
+    """
+    observed = pd.to_numeric(returns, errors="coerce").dropna().to_numpy()
+    if len(observed) < 2:
+        raise ValueError("At least two daily observations are required.")
+    draws = np.random.default_rng(seed).choice(observed, size=(samples, len(observed)))
+    losses = np.maximum(0.0, -np.quantile(draws, 1 - confidence, axis=1))
+    low, median, high = np.quantile(losses, [0.05, 0.5, 0.95])
+    return {"var": float(median), "low": float(low), "high": float(high)}
+
+
 def summarize_current_funding(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Summarize gross/net exposure and current funding cash flow.
 

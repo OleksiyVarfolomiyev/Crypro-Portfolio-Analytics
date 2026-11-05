@@ -155,6 +155,38 @@ class RealizedPnlTests(unittest.TestCase):
         self.assertEqual(post.call_count, 2)
         sleep.assert_called_once_with(0.0)
 
+    def test_historical_var_adds_bootstrap_in_dollars_and_needs_same_history(self):
+        pnl = pd.Series(np.linspace(-50.0, 50.0, 101))
+        var = self.account.historical_var(pnl, 1_000.0, 0.95, min_observations=20)
+        self.assertAlmostEqual(var["usd"], 45.0)
+        self.assertAlmostEqual(var["bootstrap_usd"], 45.0, delta=2.0)
+        self.assertAlmostEqual(var["bootstrap_pct"], var["bootstrap_usd"] / 10)
+        self.assertLess(var["bootstrap_low_usd"], var["bootstrap_usd"])
+        self.assertGreater(var["bootstrap_high_usd"], var["bootstrap_usd"])
+        self.assertLessEqual(var["bootstrap_high_usd"], 50.0)
+        short = self.account.historical_var(pnl.head(5), 1_000.0, 0.99, min_observations=100)
+        self.assertTrue(pd.isna(short["bootstrap_usd"]))
+        self.assertEqual(short["n"], 5)
+
+    def test_post_rides_out_a_short_connection_drop_then_gives_up(self):
+        success = MagicMock(status_code=200)
+        success.json.return_value = {"ok": True}
+        drop = self.account.requests.exceptions.ConnectionError("refused")
+        with (
+            patch.object(self.account.requests, "post", side_effect=[drop] * 5 + [success]) as post,
+            patch.object(self.account, "sleep") as sleep,
+        ):
+            self.assertEqual(self.account.post({"type": "meta"}), {"ok": True})
+        self.assertEqual(post.call_count, 6)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2, 4, 8, 16])
+        with (
+            patch.object(self.account.requests, "post", side_effect=drop) as post,
+            patch.object(self.account, "sleep"),
+            self.assertRaises(self.account.requests.exceptions.ConnectionError),
+        ):
+            self.account.post({"type": "meta"})
+        self.assertEqual(post.call_count, 6)
+
     def test_realized_pnl_subtracts_fees_on_opening_and_closing_fills(self):
         stats = self.account.realized_pnl_stats(self.fills())
         self.assertAlmostEqual(stats["total"], 7.2 - 2.2)
@@ -713,7 +745,10 @@ class TradeAnalyticsTests(unittest.TestCase):
             [{"t": candle_time, "o": "100", "h": "102", "l": "99", "c": "101"}],
             [{"time": funding_time, "fundingRate": "0.0001"}],
         ]
-        with patch("hl_trade_analytics.post_info", side_effect=responses) as post:
+        with (
+            patch("hl_trade_analytics.CACHE_DIR", None),
+            patch("hl_trade_analytics.post_info", side_effect=responses) as post,
+        ):
             fetch_daily_candles("AAPL", dex="xyz")
             fetch_funding_history("AAPL", dex="xyz")
         self.assertEqual(post.call_args_list[0].args[0]["req"]["coin"], "xyz:AAPL")
