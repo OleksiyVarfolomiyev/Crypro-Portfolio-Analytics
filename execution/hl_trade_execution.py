@@ -51,6 +51,9 @@ CHASE_INTERVAL_SECONDS = 10
 ENTRY_RETRY_SECONDS = 2
 CANCEL_CONFIRM_ATTEMPTS = 30
 MONITOR_INTERVAL_SECONDS = 15
+# While reads keep failing, the guard warns this often and keeps retrying; it never exits.
+GUARD_WARNING_INTERVAL_SECONDS = 5 * 60
+GUARD_HEARTBEAT_SECONDS = 60 * 60
 KILL_SWITCH_FILE = Path(__file__).resolve().parent / "KILL_SWITCH"
 KILL_SWITCH_PHRASE = "SHUT IT ALL DOWN"
 # Reduce-only IOC limits; a wider last attempt reaches thin books before giving up.
@@ -136,6 +139,10 @@ class ActiveTrade:
     stop_oid: int
     target_oid: int
     started_at: pd.Timestamp
+    # Funding already received (+) or paid (-) before this guard began watching.
+    prior_funding_pnl: float = 0.0
+    # Set once the guard decides to exit; it then retries the close until flat.
+    exiting: bool = False
 
 
 @dataclass(frozen=True)
@@ -1609,84 +1616,137 @@ def _current_position_quantity(wallet: str, dex: str, coin: str) -> float:
     return 0.0
 
 
+def _check_trade(exchange: Any, wallet: str, trade: ActiveTrade, maker_rate: float, taker_rate: float) -> str:
+    """Run one guard check for a trade; return a message once the guard is done with it."""
+    plan = trade.plan
+    stop_status = _order_status(wallet, trade.stop_oid).get("order", {})
+    target_status = (
+        _order_status(wallet, trade.target_oid).get("order", {})
+        if trade.target_oid
+        else {}
+    )
+    stop_state = str(stop_status.get("status", "")).lower()
+    target_state = str(target_status.get("status", "")).lower()
+    if stop_state == "filled" or target_state == "filled":
+        sibling = trade.target_oid if stop_state == "filled" else trade.stop_oid
+        if sibling:
+            _cancel_if_open(exchange, plan.coin, wallet, sibling)
+        return f"{plan.coin}: {'stop' if stop_state == 'filled' else 'take-profit'} filled."
+
+    current_quantity = _current_position_quantity(wallet, plan.dex, plan.coin)
+    tranche_quantity = side_to_direction(plan.side) * (current_quantity - trade.baseline_quantity)
+    if tranche_quantity <= max(1e-8, trade.quantity * 0.01):
+        _cancel_if_open(exchange, plan.coin, wallet, trade.stop_oid)
+        if trade.target_oid:
+            _cancel_if_open(exchange, plan.coin, wallet, trade.target_oid)
+        if trade.exiting:
+            return f"{plan.coin}: net-loss guard exit is complete."
+        return f"{plan.coin}: managed position tranche is no longer open."
+    close_quantity = min(trade.quantity, abs(tranche_quantity))
+    if trade.exiting:
+        # A close that failed or filled partly is retried; the stop stays until flat.
+        exchange.market_close(plan.coin, close_quantity)
+        return ""
+
+    dex_request: dict[str, Any] = {"type": "metaAndAssetCtxs"}
+    if plan.dex:
+        dex_request["dex"] = plan.dex
+    metadata = post_info(dex_request)
+    universe = metadata[0]["universe"]
+    contexts = metadata[1]
+    market_index = next(
+        (
+            index
+            for index, item in enumerate(universe)
+            if normalize_market(str(item.get("name")), plan.dex)[0] == plan.coin
+        ),
+        None,
+    )
+    if market_index is None:
+        raise RuntimeError(f"Could not refresh mark price for active market {plan.coin}.")
+    mark = float(contexts[market_index].get("markPx") or 0)
+    if mark <= 0:
+        raise RuntimeError(f"Invalid current mark price for active market {plan.coin}.")
+
+    funding = fetch_funding_history(
+        plan.coin.split(":")[-1],
+        plan.dex,
+        start_time=trade.started_at,
+        allow_empty=True,
+    )
+    rates = funding.loc[funding["time"] >= trade.started_at, "fundingRate"]
+    net_pnl = _guard_net_pnl(trade, close_quantity, mark, float(rates.sum()), maker_rate, taker_rate)
+    tranche_risk_budget = (
+        plan.risk_budget * trade.quantity / plan.quantity if plan.quantity > 0 else 0
+    )
+    if net_pnl <= -tranche_risk_budget and tranche_risk_budget > 0:
+        # Close first: if the close fails, the exchange stop still protects the position.
+        trade.exiting = True
+        print(
+            f"{plan.coin}: funding-aware net-loss guard is exiting the tranche "
+            f"(estimated net PnL ${net_pnl:,.2f})."
+        )
+        exchange.market_close(plan.coin, close_quantity)
+    return ""
+
+
+def _guard_net_pnl(
+    trade: ActiveTrade,
+    quantity: float,
+    mark: float,
+    funding_rate_sum: float,
+    maker_rate: float,
+    taker_rate: float,
+) -> float:
+    """Estimate a tranche's net PnL after funding, the entry fee, and a taker close."""
+    direction = side_to_direction(trade.plan.side)
+    price_pnl = direction * quantity * (mark - trade.entry_price)
+    funding_pnl = -direction * quantity * trade.entry_price * funding_rate_sum + trade.prior_funding_pnl
+    estimated_close_fee = mark * quantity * taker_rate
+    entry_fee = trade.entry_price * trade.quantity * maker_rate
+    return price_pnl + funding_pnl - estimated_close_fee - entry_fee
+
+
 def _watch_trades(exchange: Any, wallet: str, active_trades: list[ActiveTrade], maker_rate: float, taker_rate: float) -> None:
-    """Monitor managed entries, cancel sibling exits, and enforce the net-loss guard."""
+    """Monitor managed trades until each is closed, retrying through any failed check.
+
+    A failed read or order call never stops the guard: it warns, waits, and checks
+    again, while the exchange stop keeps protecting the position meanwhile.
+    """
     remaining = list(active_trades)
+    failing_since: dict[int, float] = {}
+    last_warning: dict[int, float] = {}
+    last_heartbeat = time.monotonic()
     while remaining:
         for trade in list(remaining):
-            plan = trade.plan
-            stop_status = _order_status(wallet, trade.stop_oid).get("order", {})
-            target_status = (
-                _order_status(wallet, trade.target_oid).get("order", {})
-                if trade.target_oid
-                else {}
-            )
-            stop_state = str(stop_status.get("status", "")).lower()
-            target_state = str(target_status.get("status", "")).lower()
-            if stop_state == "filled" or target_state == "filled":
-                sibling = trade.target_oid if stop_state == "filled" else trade.stop_oid
-                if sibling:
-                    _cancel_if_open(exchange, plan.coin, wallet, sibling)
-                remaining.remove(trade)
-                print(f"{plan.coin}: {'stop' if stop_state == 'filled' else 'take-profit'} filled.")
+            key = id(trade)
+            try:
+                message = _check_trade(exchange, wallet, trade, maker_rate, taker_rate)
+            except Exception as exc:  # The guard must outlive any single failed call.
+                now = time.monotonic()
+                failing_since.setdefault(key, now)
+                if now - last_warning.get(key, -math.inf) >= GUARD_WARNING_INTERVAL_SECONDS:
+                    last_warning[key] = now
+                    print(
+                        f"{pd.Timestamp.now(tz='UTC'):%Y-%m-%d %H:%M:%S} UTC {trade.plan.coin}: guard check "
+                        f"failed ({type(exc).__name__}: {exc}); retrying. The exchange stop stays active."
+                    )
                 continue
-
-            current_quantity = _current_position_quantity(wallet, plan.dex, plan.coin)
-            tranche_quantity = side_to_direction(plan.side) * (current_quantity - trade.baseline_quantity)
-            if tranche_quantity <= max(1e-8, trade.quantity * 0.01):
-                _cancel_if_open(exchange, plan.coin, wallet, trade.stop_oid)
-                if trade.target_oid:
-                    _cancel_if_open(exchange, plan.coin, wallet, trade.target_oid)
-                remaining.remove(trade)
-                print(f"{plan.coin}: managed position tranche is no longer open.")
-                continue
-
-            dex_request: dict[str, Any] = {"type": "metaAndAssetCtxs"}
-            if plan.dex:
-                dex_request["dex"] = plan.dex
-            metadata = post_info(dex_request)
-            universe = metadata[0]["universe"]
-            contexts = metadata[1]
-            market_index = next(
-                (
-                    index
-                    for index, item in enumerate(universe)
-                    if normalize_market(str(item.get("name")), plan.dex)[0] == plan.coin
-                ),
-                None,
-            )
-            if market_index is None:
-                raise RuntimeError(f"Could not refresh mark price for active market {plan.coin}.")
-            mark = float(contexts[market_index].get("markPx") or 0)
-            if mark <= 0:
-                raise RuntimeError(f"Invalid current mark price for active market {plan.coin}.")
-
-            funding = fetch_funding_history(
-                plan.coin.split(":")[-1],
-                plan.dex,
-                start_time=trade.started_at,
-                allow_empty=True,
-            )
-            rates = funding.loc[funding["time"] >= trade.started_at, "fundingRate"]
-            direction = side_to_direction(plan.side)
-            price_pnl = direction * min(trade.quantity, abs(tranche_quantity)) * (mark - trade.entry_price)
-            funding_pnl = -direction * min(trade.quantity, abs(tranche_quantity)) * trade.entry_price * float(rates.sum())
-            estimated_close_fee = mark * min(trade.quantity, abs(tranche_quantity)) * taker_rate
-            entry_fee = trade.entry_price * trade.quantity * maker_rate
-            net_pnl = price_pnl + funding_pnl - estimated_close_fee - entry_fee
-            tranche_risk_budget = (
-                plan.risk_budget * trade.quantity / plan.quantity if plan.quantity > 0 else 0
-            )
-            if net_pnl <= -tranche_risk_budget and tranche_risk_budget > 0:
-                _cancel_if_open(exchange, plan.coin, wallet, trade.stop_oid)
-                if trade.target_oid:
-                    _cancel_if_open(exchange, plan.coin, wallet, trade.target_oid)
-                exchange.market_close(plan.coin, min(trade.quantity, abs(tranche_quantity)))
-                remaining.remove(trade)
+            if key in failing_since:
                 print(
-                    f"{plan.coin}: funding-aware net-loss guard exited the tranche "
-                    f"(estimated net PnL ${net_pnl:,.2f})."
+                    f"{trade.plan.coin}: guard checks recovered after "
+                    f"{time.monotonic() - failing_since.pop(key):.0f}s."
                 )
+                last_warning.pop(key, None)
+            if message:
+                remaining.remove(trade)
+                print(message)
+        if remaining and time.monotonic() - last_heartbeat >= GUARD_HEARTBEAT_SECONDS:
+            last_heartbeat = time.monotonic()
+            print(
+                f"{pd.Timestamp.now(tz='UTC'):%Y-%m-%d %H:%M} UTC guard running for "
+                + ", ".join(trade.plan.coin for trade in remaining)
+            )
         if remaining:
             time.sleep(MONITOR_INTERVAL_SECONDS)
 
@@ -2363,6 +2423,150 @@ def run_position_reconciliation(
         )
 
 
+@dataclass(frozen=True)
+class GuardReattachment:
+    """An open position, its exchange stop and target, and the guard rebuilt for it."""
+
+    trade: ActiveTrade | None
+    coin: str
+    side: str
+    quantity: float
+    entry_price: float
+    mark_price: float
+    stop_price: float
+    target_price: float
+    risk_budget: float
+    net_pnl: float
+    note: str
+
+
+def _order_price(order: dict[str, Any]) -> float:
+    """Return a trigger order's trigger price, or a limit order's limit price."""
+    try:
+        trigger = float(order.get("triggerPx") or 0)
+        return trigger if trigger > 0 else float(order.get("limitPx") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def plan_guard_reattachment(
+    wallet: str,
+    dexes: list[str],
+    markets: dict[str, Market],
+    coins: set[str] | None = None,
+) -> list[GuardReattachment]:
+    """Rebuild net-loss guards for open positions from their live stop and target orders.
+
+    Each guard watches the whole position. Its loss budget mirrors a fresh entry's:
+    the distance from entry to the nearest stop, twice the current adverse funding
+    reserve, and entry and exit fees. Funding since the position opened counts as
+    already realized. Positions without a stop get no guard.
+    """
+    snapshot = collect_snapshot([wallet], dexes, markets)
+    open_orders = fetch_open_orders(wallet, dexes)
+    funding_since_open: dict[str, float] = {}
+    for dex in dexes:
+        for item in fetch_user_state(wallet, dex)["assetPositions"]:
+            position = item.get("position", {})
+            funding_since_open[str(position.get("coin"))] = -float(
+                (position.get("cumFunding") or {}).get("sinceOpen") or 0
+            )
+    maker, taker = snapshot.maker_fee_rate, snapshot.taker_fee_rate
+    started_at = pd.Timestamp.now(tz="UTC")
+    plans = []
+    for position in snapshot.positions:
+        if coins and position.coin.upper() not in coins:
+            continue
+        side = "LONG" if position.quantity > 0 else "SHORT"
+        direction = side_to_direction(side)
+        quantity = abs(position.quantity)
+        stops, targets = _matching_protection_orders(position, open_orders)
+        nearest = lambda orders: min(orders, key=lambda order: abs(_order_price(order) - position.mark_price))
+        stop = nearest(stops) if stops else None
+        target = nearest(targets) if targets else None
+        stop_price = _order_price(stop) if stop else float("nan")
+        target_price = _order_price(target) if target else float("nan")
+        prior_funding = funding_since_open.get(position.coin, 0.0)
+        base = dict(
+            coin=position.coin, side=side, quantity=quantity, entry_price=position.entry_price,
+            mark_price=position.mark_price, stop_price=stop_price, target_price=target_price,
+        )
+        net_pnl = (
+            direction * quantity * (position.mark_price - position.entry_price) + prior_funding
+            - position.mark_price * quantity * taker - position.entry_price * quantity * maker
+        )
+        if stop is None:
+            plans.append(GuardReattachment(trade=None, risk_budget=float("nan"), net_pnl=net_pnl,
+                note="no stop order; add one with --protect-open first", **base))
+            continue
+        try:
+            funding = fetch_funding_history(position.coin.split(":")[-1], position.dex)
+            reserve = adverse_funding_cost_per_unit(
+                funding, side, position.oracle_price,
+                horizon_hours=DEFAULT_HORIZON_DAYS * 24, percentile=FUNDING_STRESS_PERCENTILE,
+            )
+        except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+            plans.append(GuardReattachment(trade=None, risk_budget=float("nan"), net_pnl=net_pnl,
+                note=f"funding history unavailable ({type(exc).__name__})", **base))
+            continue
+        stop_distance = direction * (position.entry_price - stop_price)
+        risk_budget = quantity * (
+            max(0.0, stop_distance) + 2 * reserve + position.entry_price * (maker + taker)
+        )
+        note = "ok"
+        if stop_distance <= 0:
+            risk_budget = 0.0
+            note = "stop is past entry, so it locks in profit; guard only tidies up exits"
+        elif net_pnl <= -risk_budget:
+            note = "ALREADY PAST THE LOSS LIMIT: the guard would close this at market at once"
+        plan = PlannedTrade(
+            coin=position.coin, dex=position.dex, side=side, quantity=quantity,
+            entry_reference=position.entry_price, stop_price=stop_price,
+            target_price=target_price if target else 0.0,
+            stop_distance=max(0.0, stop_distance) + reserve, funding_reserve_per_unit=reserve,
+            risk_budget=risk_budget,
+            expected_pnl=ExpectedPnl(0.0, 0.0, 0.0, 0.0, 0, 0),
+            maker_fee_rate=maker, taker_fee_rate=taker, leverage=position.leverage,
+            price_stop_distance=max(0.0, stop_distance),
+        )
+        trade = ActiveTrade(
+            plan=plan, quantity=quantity, entry_price=position.entry_price, baseline_quantity=0.0,
+            stop_oid=int(stop["oid"]), target_oid=int(target["oid"]) if target else 0,
+            started_at=started_at, prior_funding_pnl=prior_funding,
+        )
+        plans.append(GuardReattachment(trade=trade, risk_budget=risk_budget, net_pnl=net_pnl,
+            note=note, **base))
+    return plans
+
+
+def print_guard_reattachment(plans: list[GuardReattachment]) -> None:
+    """Show which positions would get a guard, with their stop, target, and loss budget."""
+    if not plans:
+        print("No open positions match.")
+        return
+    print("Guard reattachment (whole positions; net PnL includes funding since open and fees):")
+    for item in plans:
+        target = f"${item.target_price:,.6g}" if item.target_price == item.target_price else "none"
+        stop = f"${item.stop_price:,.6g}" if item.stop_price == item.stop_price else "none"
+        budget = f"${item.risk_budget:,.2f}" if item.risk_budget == item.risk_budget else "n/a"
+        print(
+            f"  {item.coin} {item.side} {item.quantity:g} @ ${item.entry_price:,.6g} | mark "
+            f"${item.mark_price:,.6g} | stop {stop} | target {target} | loss limit {budget} | "
+            f"net PnL now ${item.net_pnl:,.2f} | {item.note}"
+        )
+
+
+def run_guard_reattachment(wallet: str, private_key: str, dexes: list[str], plans: list[GuardReattachment]) -> None:
+    """Start the net-loss guard for reattached positions and keep it running."""
+    trades = [item.trade for item in plans if item.trade is not None]
+    if not trades:
+        return
+    exchange = build_exchange(wallet, private_key, dexes)
+    print("Guards attached for " + ", ".join(trade.plan.coin for trade in trades)
+          + ". Keep this process running for the guards to remain active.")
+    _watch_trades(exchange, wallet, trades, trades[0].plan.maker_fee_rate, trades[0].plan.taker_fee_rate)
+
+
 def run_live(wallet: str, private_key: str, dexes: list[str], plans: list[PlannedTrade], markets: dict[str, Market]) -> None:
     """Execute planned entries, place protective exits, and monitor resulting trades."""
     exchange = build_exchange(wallet, private_key, dexes)
@@ -2571,6 +2775,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Allow new entries again after the kill switch.",
     )
+    parser.add_argument(
+        "--reattach-guards",
+        action="store_true",
+        help="Show (or with --live, start) net-loss guards for --wallet's open positions, "
+        "built from their existing stop and target orders.",
+    )
+    parser.add_argument(
+        "--coins",
+        help="With --reattach-guards: comma-separated markets to guard (default: all with a stop).",
+    )
     parser.add_argument("--store-key", action="store_true", help="Prompt locally and store the API-wallet key in Keychain.")
     parser.add_argument("--live", action="store_true", help="Allow live orders after typing the confirmation phrase.")
     args = parser.parse_args(argv)
@@ -2601,6 +2815,33 @@ def main(argv: list[str] | None = None) -> int:
                 print("Confirmation did not match; no order was sent.")
                 return 0
             return 0 if run_kill_switch(wallets, dexes) else 2
+        if args.reattach_guards:
+            if args.signals is not None or args.actions is not None or args.protect_open:
+                parser.error("--reattach-guards cannot be combined with --signals, --actions, or --protect-open.")
+            coins = {coin.strip().upper() for coin in args.coins.split(",") if coin.strip()} if args.coins else None
+            dexes = get_dexes([])
+            plans = plan_guard_reattachment(args.wallet, dexes, fetch_markets(dexes), coins)
+            print_guard_reattachment(plans)
+            if not args.live:
+                print("Dry run only. No signing key was loaded and no guard was started.")
+                return 0
+            if not any(item.trade for item in plans):
+                print("No position can be guarded.")
+                return 2
+            if input("Type LIVE TRADING to review the guards: ").strip() != "LIVE TRADING":
+                print("Confirmation did not match; no guard was started.")
+                return 0
+            plans = plan_guard_reattachment(args.wallet, dexes, fetch_markets(dexes), coins)
+            print("Refreshed check immediately before starting:")
+            print_guard_reattachment(plans)
+            if not any(item.trade for item in plans):
+                print("The refreshed check found no position to guard.")
+                return 2
+            if input("Type START GUARDS to start them (they can close positions): ").strip() != "START GUARDS":
+                print("Confirmation did not match; no guard was started.")
+                return 0
+            run_guard_reattachment(args.wallet, _load_key_from_keychain(args.wallet), dexes, plans)
+            return 0
         if args.live and not args.protect_open and kill_switch_engaged():
             print("Kill switch is engaged; no order was sent. Use --clear-kill-switch to trade again.")
             return 2

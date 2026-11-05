@@ -12,7 +12,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 from hl_trade_analytics import (
+    bootstrap_btc_regression,
     bootstrap_var,
+    position_book_beta,
     MAX_RATE_LIMIT_RETRIES,
     _rate_limit_delay,
     add_expected_pnl_columns,
@@ -612,6 +614,33 @@ def fetch_btc_candles(start_ms, end_ms, interval='1d'):
                     'interval': interval, 'startTime': start_ms, 'endTime': end_ms}}))
 
 
+def fetch_btc_day_closes(start, end, timezone=ACCOUNTING_TIMEZONE):
+    """Return BTC's last hourly close in each local day, matching how account days close.
+
+    Hourly candles are indexed just before their close time, so the 23:00 candle closes
+    the day it belongs to. Hyperliquid keeps about 5,000 recent candles, so days
+    older than roughly 200 days come back missing.
+    """
+    start_ms, end_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+    parts = []
+    while start_ms < end_ms:
+        candles = fetch_btc_candles(start_ms, end_ms, interval='1h')
+        if candles.empty:
+            break
+        parts.append(candles)
+        last_open = int(candles['t'].max())
+        if last_open < start_ms or len(candles) < 2:
+            break
+        start_ms = last_open + 1
+    if not parts:
+        return pd.Series(dtype=float)
+    candles = pd.concat(parts).drop_duplicates('t')
+    close_time = pd.to_datetime(candles['t'] + 3_600_000 - 1, unit='ms', utc=True)
+    closes = pd.Series(candles['c'].astype(float).to_numpy(),
+        index=pd.DatetimeIndex(close_time).tz_convert(timezone)).sort_index()
+    return closes.resample('1D').last().dropna()
+
+
 def historical_var(pnl_observations, account_value, confidence, min_observations):
     """Estimate loss VaR from the daily PnL quantile, directly and by bootstrap.
 
@@ -726,35 +755,27 @@ def calculate_account_metrics(chart_df, current_account_value, unrealized_pnl_to
     var_99 = historical_var(observed_daily_pnl, current_account_value, 0.99, min_observations=100)
     hist_vol = historical_volatility(observed_daily_pnl, current_account_value,
         annualization_days=365)
-    alpha_annual = beta = sharpe_annual = float('nan')
-    btc_sample_n = 0
     btc_df = pd.DataFrame()
+    btc_stats = bootstrap_btc_regression(pd.Series(dtype=float), pd.Series(dtype=float))
     try:
         starts = [index.min() for index in [day_index, live_account_daily.index] if len(index)]
         if starts:
             start_ms = int(min(starts).timestamp() * 1000)
             end_ms = int(pd.Timestamp.now(tz='UTC').timestamp() * 1000)
             btc_df = fetch_btc_candles(start_ms, end_ms, interval='1d')
-            if not btc_df.empty:
-                btc_df['day'] = pd.to_datetime(btc_df['t'], unit='ms',
-                    utc=True).dt.tz_convert(ACCOUNTING_TIMEZONE).dt.normalize()
-                btc_close = btc_df.assign(close=btc_df['c'].astype(float)).set_index( \
-                    'day')['close'].sort_index()
-                btc_returns = btc_close.pct_change()
-                portfolio_returns = daily_return_pct / 100
-                compare = pd.concat([portfolio_returns.rename('pnl'),
-                        btc_returns.reindex(portfolio_returns.index).rename('btc')],
-                            axis=1).dropna()
-                btc_sample_n = len(compare)
-                if btc_sample_n >= 2 and compare['btc'].var() > 0:
-                    beta = compare['pnl'].cov(compare['btc']) / compare['btc'].var()
-                    alpha_annual = (compare['pnl'].mean() - beta * compare['btc'].mean() \
-                        ) * 365 * 100
-                    pnl_std = compare['pnl'].std()
-                    sharpe_annual = compare['pnl'].mean() / pnl_std * 365 ** 0.5 if \
-                        pnl_std else float('nan')
+        # Today's return is still moving, so only completed local days are compared.
+        today = pd.Timestamp.now(tz=ACCOUNTING_TIMEZONE).normalize()
+        completed = daily_return_pct[daily_return_pct.index < today] / 100
+        if not completed.empty:
+            btc_closes = fetch_btc_day_closes(completed.index.min() - pd.Timedelta(days=2),
+                pd.Timestamp.now(tz='UTC'))
+            btc_returns = btc_closes.pct_change()
+            btc_returns.index = btc_returns.index.normalize()
+            btc_stats = bootstrap_btc_regression(completed, btc_returns)
     except Exception as exc:
         print(f'BTC metrics unavailable: {type(exc).__name__}')
+    alpha_annual, beta, sharpe_annual = btc_stats['alpha'], btc_stats['beta'], btc_stats['sharpe']
+    btc_sample_n = btc_stats['n']
     return SimpleNamespace(**{'account_series': account_series,
             'daily_account': daily_account, 'realized_series': realized_series,
             'daily_realized': daily_realized, 'daily_unrealized': daily_unrealized,
@@ -767,6 +788,7 @@ def calculate_account_metrics(chart_df, current_account_value, unrealized_pnl_to
             'account_index': account_index, 'account_dd_pct': account_dd_pct,
             'live_account': live_account, 'btc_df': btc_df, 'alpha_annual': alpha_annual,
             'beta': beta, 'sharpe_annual': sharpe_annual, 'btc_sample_n': btc_sample_n,
+            'btc_stats': btc_stats,
             'current_account_value': current_account_value,
             'unrealized_pnl_total': unrealized_pnl_total, 'observed_daily_pnl': observed_daily_pnl,
             'var_95': var_95, 'var_99': var_99, 'historical_volatility': hist_vol})
@@ -818,7 +840,7 @@ def rolling_24h_metrics(wallets, fills, funding_events, now=None):
     )
 
 
-def print_account_metrics(metrics, new_api_rows, fill_count, rolling_24h):
+def print_account_metrics(metrics, new_api_rows, fill_count, rolling_24h, book_beta=None):
     'Display account performance and risk measures' \
         ' as an interactive table.'
     account = metrics.daily_account
@@ -832,6 +854,21 @@ def print_account_metrics(metrics, new_api_rows, fill_count, rolling_24h):
         return f'${value:,.2f}' if pd.notna(value) else 'n/a'
     def percent(value):
         return f'{value:.2f}%' if pd.notna(value) else 'n/a'
+    def number(value):
+        return f'{value:.2f}' if pd.notna(value) else 'n/a'
+    def with_range(key, formatter):
+        stats = metrics.btc_stats
+        if pd.isna(stats[f'{key}_low']):
+            return formatter(stats[key])
+        return (f"{formatter(stats[key])} (90% range {formatter(stats[f'{key}_low'])} to "
+                f"{formatter(stats[f'{key}_high'])})")
+    def book_beta_text(book):
+        if not book or pd.isna(book['beta']):
+            return 'n/a'
+        coverage = book['covered_notional'] / book['total_notional'] * 100
+        missing = f"; no beta for {', '.join(book['missing'])}" if book['missing'] else ''
+        return (f"{book['beta']:.2f} ({book['lookback_days']}d asset betas; "
+                f"{coverage:.0f}% of notional{missing})")
     def bootstrap_var_text(var):
         if pd.isna(var['bootstrap_usd']):
             return f"n/a (n={var['n']})"
@@ -850,11 +887,11 @@ def print_account_metrics(metrics, new_api_rows, fill_count, rolling_24h):
         ('Unrealized PnL (% of account value)', percent(unrealized_pct)),
         ('Unrealized 24H change', money(rolling_24h.unrealized_change)), ('Average realized PnL / day',
             money(metrics.realized_avg_day)), ('Average unrealized PnL change / day',
-            money(metrics.u_avg_day)), ('--- RISK ---', ''), ('BTC alpha / year',
-            percent(metrics.alpha_annual)), ('BTC beta',
-            f'{metrics.beta:.2f}' if pd.notna(metrics.beta) else 'n/a'), ('Annualized Sharpe',
-            f'{metrics.sharpe_annual:.2f}' if pd.notna(metrics.sharpe_annual) else 'n/a'),
-        ('Matched BTC observations', str(metrics.btc_sample_n)), ('Average daily account PnL',
+            money(metrics.u_avg_day)), ('--- RISK ---', ''),
+        ('Current book BTC beta', book_beta_text(book_beta)),
+        ('BTC alpha / year', with_range('alpha', percent)),
+        ('BTC beta', with_range('beta', number)), ('Annualized Sharpe', with_range('sharpe', number)),
+        ('Matched BTC observations', f'{metrics.btc_sample_n} completed days'), ('Average daily account PnL',
             money(metrics.net_avg_day)), ('Daily return observations',
             str(len(metrics.daily_return_pct))), ('Average daily account return',
             percent(metrics.avg_daily_return_pct)), ('Maximum daily gain',
@@ -877,9 +914,10 @@ def print_account_metrics(metrics, new_api_rows, fill_count, rolling_24h):
         if column != 'Value' or not value:
             return ''
         text = str(value).strip()
-        if row['Metric'] == 'BTC beta':
+        if row['Metric'] in {'BTC beta', 'Current book BTC beta'}:
             # Green when the account moves less than BTC, including when it moves opposite.
-            return 'color:#188038;font-weight:600;' if text != 'n/a' and float(text) < 1 else ''
+            return 'color:#188038;font-weight:600;' if text != 'n/a' and \
+                float(text.split()[0]) < 1 else ''
         if row['Metric'].startswith(('24H historical VaR', '24H bootstrap VaR')):
             if re.search(r'\$\s*\d', text) and '$-' not in text:
                 return 'color:#188038;font-weight:600;'
@@ -897,6 +935,10 @@ def print_account_metrics(metrics, new_api_rows, fill_count, rolling_24h):
     if gap_warning:
         print(gap_warning)
     display_interactive_table(table, cell_style=sign_style)
+    print('Current book BTC beta sums each open position\'s signed notional times its 60-day '
+          'beta to BTC, per dollar of account value: today\'s book, not past returns. Alpha, '
+          'beta, and Sharpe use completed US Eastern days with BTC priced at the same local '
+          'midnight; ranges come from 5,000 bootstrap resamples of those days.')
     print('Bootstrap VaR resamples observed daily PnL 10,000 times and reports the median with a '
           "90% range. It cannot exceed the sample's largest daily loss, and it needs the same "
           'history as historical VaR: 20 days for 95%, 100 days for 99%.')
@@ -908,6 +950,8 @@ class _AccountPnLMixin:
         print_account_metrics(
             self.account_metrics, data.history_rows_added, len(data.realized_fills),
             rolling_24h_metrics(self.wallet_addresses, data.realized_df, data.funding_df),
+            book_beta=position_book_beta(self._load_positions(),
+                self.account_metrics.current_account_value),
         )
 
 
@@ -1457,25 +1501,6 @@ def display_exposure_and_funding(rows):
         'Net Exposure / Gross (%)': lambda value: f'{abs(value):.2f}%' if pd.notna(value) else 'n/a',
     })
     print('Net direction compares long and short USD notionals; it is not delta- or beta-adjusted.')
-    print('=== ACCOUNT NET FUNDING ===')
-    funding_columns = [
-        'Net Funding Rate / 1h (%) (covered)',
-        'Net Funding APR (%) (simple, covered)',
-        'Estimated Net Funding PnL / hour ($)',
-        'Estimated Net Funding PnL / day ($)',
-        'Funding-Covered Notional ($)', 'Funding Coverage (%)',
-    ]
-    display_interactive_table(account_summary, columns=funding_columns, formatters={
-        'Net Funding Rate / 1h (%) (covered)': lambda value: f'{value:.6f}%' if pd.notna(value) else 'n/a',
-        'Net Funding APR (%) (simple, covered)': lambda value: f'{value:.2f}%' if pd.notna(value) else 'n/a',
-        'Estimated Net Funding PnL / hour ($)': lambda value: f'${value:,.4f}',
-        'Estimated Net Funding PnL / day ($)': lambda value: f'${value:,.2f}',
-        'Funding-Covered Notional ($)': lambda value: f'${value:,.2f}',
-        'Funding Coverage (%)': lambda value: f'{value:.1f}%' if pd.notna(value) else 'n/a',
-    })
-    print('Net funding rate is estimated net funding cash flow divided by funding-covered gross '
-          'notional. Positive cash flow means estimated receipts. APR assumes current hourly '
-          'rates persist; it is not a forecast.')
     print('=== FUNDING BY ASSET AND SIDE ===')
     frame = pd.DataFrame(funding_rows)
     position_values = frame['Position Value ($)']

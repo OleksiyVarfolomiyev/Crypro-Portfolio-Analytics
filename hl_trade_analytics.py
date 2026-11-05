@@ -752,6 +752,86 @@ def bootstrap_var(
     return {"var": float(median), "low": float(low), "high": float(high)}
 
 
+def bootstrap_btc_regression(
+    returns: pd.Series,
+    btc_returns: pd.Series,
+    periods_per_year: int = 365,
+    samples: int = 5_000,
+    seed: int = BOOTSTRAP_SEED,
+) -> dict[str, float]:
+    """Estimate BTC beta, annualized alpha (%), and annualized Sharpe with 90% bootstrap ranges.
+
+    Inputs are simple daily returns as fractions on a shared index; days missing either
+    value are dropped. Day pairs are resampled together, so each resample keeps the
+    same-day link between account and BTC. Every value is NaN with fewer than five pairs.
+    """
+    pairs = pd.concat([returns.rename("account"), btc_returns.rename("btc")], axis=1).dropna()
+    keys = ["beta", "alpha", "sharpe"]
+    result = {f"{key}{suffix}": float("nan") for key in keys for suffix in ("", "_low", "_high")}
+    result["n"] = len(pairs)
+    if len(pairs) < 5 or pairs["btc"].var() <= 0:
+        return result
+
+    def estimate(account: np.ndarray, btc: np.ndarray) -> tuple[float, float, float]:
+        btc_var = btc.var(ddof=1)
+        beta = np.cov(account, btc)[0, 1] / btc_var if btc_var > 0 else float("nan")
+        alpha = (account.mean() - beta * btc.mean()) * periods_per_year * 100
+        account_std = account.std(ddof=1)
+        sharpe = account.mean() / account_std * math.sqrt(periods_per_year) if account_std > 0 else float("nan")
+        return beta, alpha, sharpe
+
+    account, btc = pairs["account"].to_numpy(), pairs["btc"].to_numpy()
+    result.update(zip(keys, estimate(account, btc)))
+    picks = np.random.default_rng(seed).integers(0, len(pairs), size=(samples, len(pairs)))
+    draws = np.array([estimate(account[pick], btc[pick]) for pick in picks])
+    for column, key in enumerate(keys):
+        finite = draws[:, column][np.isfinite(draws[:, column])]
+        if len(finite):
+            result[f"{key}_low"], result[f"{key}_high"] = (float(v) for v in np.quantile(finite, [0.05, 0.95]))
+    return result
+
+
+def position_book_beta(
+    positions: list[dict[str, Any]],
+    account_value: float,
+    lookback_days: int = 60,
+    min_observations: int = 20,
+) -> dict[str, Any]:
+    """Return the open book's BTC beta per dollar of account value.
+
+    Each position's beta is the regression of its daily close-to-close returns on
+    BTC's over ``lookback_days`` completed UTC days. Signed notional times beta is
+    summed and divided by ``account_value``, so the result reads like a realized
+    account beta. Positions with fewer than ``min_observations`` paired days, or
+    whose candles cannot be read, are left out and listed in ``missing``.
+    """
+    result: dict[str, Any] = {"beta": float("nan"), "covered_notional": 0.0,
+        "total_notional": 0.0, "missing": [], "lookback_days": lookback_days}
+    if not positions or not account_value or account_value <= 0:
+        return result
+    btc = fetch_daily_candles("BTC", lookback_days=lookback_days + 1).set_index("time")["close"].pct_change()
+    exposure = 0.0
+    for row in positions:
+        notional = abs(float(row["Pos"]))
+        result["total_notional"] += notional
+        try:
+            candles = fetch_daily_candles(str(row["Coin"]), str(row.get("Dex") or ""),
+                lookback_days=lookback_days + 1)
+            asset = candles.set_index("time")["close"].pct_change()
+            pairs = pd.concat([asset.rename("asset"), btc.rename("btc")], axis=1).dropna()
+        except Exception:
+            pairs = pd.DataFrame()
+        if len(pairs) < min_observations or pairs["btc"].var() <= 0:
+            result["missing"].append(str(row["Coin"]))
+            continue
+        beta = pairs["asset"].cov(pairs["btc"]) / pairs["btc"].var()
+        exposure += side_to_direction(str(row["Side"])) * notional * beta
+        result["covered_notional"] += notional
+    if result["covered_notional"] > 0:
+        result["beta"] = exposure / account_value
+    return result
+
+
 def summarize_current_funding(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Summarize gross/net exposure and current funding cash flow.
 

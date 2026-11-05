@@ -1,4 +1,7 @@
+import io
+from contextlib import redirect_stdout
 import importlib
+import io
 import itertools
 import importlib.util
 import os
@@ -9,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import requests
 import pandas as pd
 from unittest.mock import MagicMock, patch
 
@@ -167,6 +171,48 @@ class RealizedPnlTests(unittest.TestCase):
         short = self.account.historical_var(pnl.head(5), 1_000.0, 0.99, min_observations=100)
         self.assertTrue(pd.isna(short["bootstrap_usd"]))
         self.assertEqual(short["n"], 5)
+
+    def test_bootstrap_btc_regression_recovers_beta_with_a_range(self):
+        rng = np.random.default_rng(3)
+        btc = pd.Series(rng.normal(0, 0.03, 200))
+        account = -0.8 * btc + pd.Series(rng.normal(0.001, 0.01, 200))
+        stats = hl_trade_analytics.bootstrap_btc_regression(account, btc)
+        self.assertEqual(stats["n"], 200)
+        self.assertAlmostEqual(stats["beta"], -0.8, delta=0.1)
+        self.assertLess(stats["beta_low"], stats["beta"])
+        self.assertGreater(stats["beta_high"], stats["beta"])
+        self.assertEqual(stats, hl_trade_analytics.bootstrap_btc_regression(account, btc))
+        short = hl_trade_analytics.bootstrap_btc_regression(account.head(4), btc.head(4))
+        self.assertTrue(pd.isna(short["beta"]))
+
+    def test_position_book_beta_signs_notional_and_reports_missing(self):
+        days = pd.date_range("2026-01-01", periods=61, tz="UTC")
+        btc_close = 100 * np.cumprod(1 + np.random.default_rng(5).normal(0, 0.03, 61))
+        btc_returns = pd.Series(btc_close).pct_change().fillna(0).to_numpy()
+        asset_close = 10 * np.cumprod(1 + 2 * btc_returns)
+        def candles(coin, dex="", lookback_days=61):
+            if coin == "GONE":
+                raise RuntimeError("no candles")
+            close = btc_close if coin == "BTC" else asset_close
+            return pd.DataFrame({"time": days, "close": close})
+        positions = [{"Coin": "ALT", "Dex": "", "Side": "SHORT", "Pos": 500.0},
+                     {"Coin": "GONE", "Dex": "", "Side": "LONG", "Pos": 100.0}]
+        with patch.object(hl_trade_analytics, "fetch_daily_candles", side_effect=candles):
+            book = hl_trade_analytics.position_book_beta(positions, account_value=1_000.0)
+        # A short of $500 in an asset with beta 2 on $1,000 of account value.
+        self.assertAlmostEqual(book["beta"], -1.0, places=6)
+        self.assertEqual(book["missing"], ["GONE"])
+        self.assertAlmostEqual(book["covered_notional"] / book["total_notional"], 500 / 600)
+
+    def test_btc_day_closes_use_the_hour_that_ends_each_local_day(self):
+        start = pd.Timestamp("2026-11-03 00:00", tz="America/New_York")
+        opens = pd.date_range(start, periods=48, freq="1h")
+        candles = pd.DataFrame({"t": [int(t.timestamp() * 1000) for t in opens], "c": [str(i) for i in range(48)]})
+        with patch.object(self.account, "fetch_btc_candles", side_effect=[candles, candles.iloc[:0]]):
+            closes = self.account.fetch_btc_day_closes(start, start + pd.Timedelta(days=2))
+        # The 23:00-24:00 candle (row 23) closes Nov 3; row 47 closes Nov 4.
+        self.assertEqual(list(closes), [23.0, 47.0])
+        self.assertEqual(list(closes.index.day), [3, 4])
 
     def test_post_rides_out_a_short_connection_drop_then_gives_up(self):
         success = MagicMock(status_code=200)
@@ -486,6 +532,7 @@ class RealizedPnlTests(unittest.TestCase):
         with patch.object(self.account, "display_interactive_table",
                 side_effect=lambda frame, **kwargs: tables.append(frame)):
             self.account.display_exposure_and_funding(rows)
+        self.assertEqual(len(tables), 2)  # Net exposure, then funding by asset; no net funding table.
         total = tables[-1].iloc[-1]
         # Pays 0.01 on the long and receives 0.06 on the short: $0.05/hour on $3,000.
         self.assertEqual(total["Coin"], "Net/total")
@@ -1920,18 +1967,110 @@ class NetLossGuardTests(unittest.TestCase):
         exchange = MagicMock()
         # Hyperliquid names HIP-3 markets with their DEX prefix already included.
         metadata = [{"universe": [{"name": "xyz:TSLA"}, {"name": "xyz:AAPL"}]}, [{"markPx": "400"}, {"markPx": "340"}]]
+        trade.prior_funding_pnl, trade.exiting = 0.0, False
+        calls = []
+        exchange.market_close.side_effect = lambda *args: calls.append("close")
         with (
             patch.object(execution, "_order_status", return_value={"order": {"status": "open"}}),
-            patch.object(execution, "_current_position_quantity", return_value=2.0),
-            patch.object(execution, "_cancel_if_open"),
+            # Open on the first check, flat after the guard's close.
+            patch.object(execution, "_current_position_quantity", side_effect=[2.0, 0.0]),
+            patch.object(execution, "_cancel_if_open", side_effect=lambda *args: calls.append("cancel")),
             patch.object(execution, "post_info", return_value=metadata) as info,
             patch.object(execution, "fetch_funding_history", return_value=pd.DataFrame(
                 {"time": pd.Series(dtype="datetime64[ns, UTC]"), "fundingRate": pd.Series(dtype=float)}
             )),
+            patch.object(execution.time, "sleep"),
         ):
             execution._watch_trades(exchange, "w", [trade], 0.00015, 0.00045)
         self.assertEqual(info.call_args.args[0], {"type": "metaAndAssetCtxs", "dex": "xyz"})
         exchange.market_close.assert_called_once_with("xyz:AAPL", 2.0)
+        # The close goes first, so the exchange stop stays in place if the close fails.
+        self.assertEqual(calls, ["close", "cancel", "cancel"])
+
+    def _trade(self, execution, **changes):
+        plan = SimpleNamespace(coin="ETH", dex="", side="SHORT", quantity=1.0, risk_budget=50.0)
+        values = dict(plan=plan, quantity=1.0, entry_price=2_000.0, baseline_quantity=0.0, stop_oid=1,
+                      target_oid=2, started_at=pd.Timestamp("2026-06-01", tz="UTC"),
+                      prior_funding_pnl=0.0, exiting=False)
+        values.update(changes)
+        return execution.ActiveTrade(**values)
+
+    def test_guard_keeps_running_through_failed_checks(self):
+        import hl_trade_execution as execution
+        trade = self._trade(execution)
+        outcomes = iter([requests.ConnectionError("refused"), RuntimeError("bad mark"), "", "ETH: stop filled."])
+        def check(*args):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        with (
+            patch.object(execution, "_check_trade", side_effect=check) as checks,
+            patch.object(execution.time, "sleep") as sleep,
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            execution._watch_trades(MagicMock(), "w", [trade], 0.0, 0.0)
+        self.assertEqual(checks.call_count, 4)
+        self.assertEqual(sleep.call_count, 3)
+        text = output.getvalue()
+        # One warning while failing, not one per failed check, then a recovery note.
+        self.assertEqual(text.count("guard check failed"), 1)
+        self.assertIn("recovered after", text)
+        self.assertIn("ETH: stop filled.", text)
+
+    def test_exiting_guard_retries_the_close_until_flat(self):
+        import hl_trade_execution as execution
+        trade = self._trade(execution, exiting=True)
+        exchange = MagicMock()
+        with (
+            patch.object(execution, "_order_status", return_value={"order": {"status": "open"}}),
+            patch.object(execution, "_current_position_quantity", side_effect=[-1.0, -0.4, 0.0]),
+            patch.object(execution, "_cancel_if_open") as cancel,
+            patch.object(execution.time, "sleep"),
+        ):
+            execution._watch_trades(exchange, "w", [trade], 0.0, 0.0)
+        self.assertEqual([c.args[1] for c in exchange.market_close.call_args_list], [1.0, 0.4])
+        self.assertEqual(cancel.call_count, 2)
+
+    def test_guard_net_pnl_counts_funding_before_the_guard_started(self):
+        import hl_trade_execution as execution
+        trade = self._trade(execution, prior_funding_pnl=3.0)
+        # Short 1 at 2,000 marked at 1,990: +10 price, +3 prior funding, no fees.
+        self.assertAlmostEqual(execution._guard_net_pnl(trade, 1.0, 1_990.0, 0.0, 0.0, 0.0), 13.0)
+
+    def test_reattach_builds_guards_from_live_stops(self):
+        import hl_trade_execution as execution
+        market = execution.Market("ETH", "", 1_900.0, 1_900.0, 4, 25)
+        def position(coin, quantity, entry):
+            return execution.Position("w", coin, "", quantity, entry, 1_900.0, 1_900.0, 100.0, market, 3)
+        snapshot = SimpleNamespace(
+            positions=(position("ETH", -2.0, 2_000.0), position("SOL", 5.0, 150.0), position("BTC", 1.0, 100.0)),
+            maker_fee_rate=0.0, taker_fee_rate=0.0,
+        )
+        orders = [
+            {"coin": "ETH", "side": "B", "oid": 7, "sz": "2", "orderType": "Stop Market", "triggerPx": "2100", "reduceOnly": True},
+            {"coin": "ETH", "side": "B", "oid": 8, "sz": "2", "orderType": "Stop Market", "triggerPx": "2300", "reduceOnly": True},
+            {"coin": "ETH", "side": "B", "oid": 9, "sz": "2", "orderType": "Limit", "limitPx": "1800", "reduceOnly": True},
+        ]
+        state = {"assetPositions": [{"position": {"coin": "ETH", "cumFunding": {"sinceOpen": "-4.5"}}}]}
+        with (
+            patch.object(execution, "collect_snapshot", return_value=snapshot),
+            patch.object(execution, "fetch_open_orders", return_value=orders),
+            patch.object(execution, "fetch_user_state", return_value=state),
+            patch.object(execution, "fetch_funding_history", return_value=pd.DataFrame()),
+            patch.object(execution, "adverse_funding_cost_per_unit", return_value=5.0),
+        ):
+            plans = execution.plan_guard_reattachment("w", [""], {}, coins={"ETH", "SOL"})
+        self.assertEqual([item.coin for item in plans], ["ETH", "SOL"])
+        eth, sol = plans
+        # The nearer stop (2,100) is the one the guard watches; budget 2 x (100 + 2 x 5).
+        self.assertEqual((eth.trade.stop_oid, eth.trade.target_oid), (7, 9))
+        self.assertAlmostEqual(eth.risk_budget, 220.0)
+        self.assertAlmostEqual(eth.trade.prior_funding_pnl, 4.5)
+        self.assertAlmostEqual(eth.net_pnl, 2 * 100.0 + 4.5)
+        self.assertEqual(eth.note, "ok")
+        self.assertIsNone(sol.trade)
+        self.assertIn("no stop", sol.note)
 
 
 if __name__ == "__main__":

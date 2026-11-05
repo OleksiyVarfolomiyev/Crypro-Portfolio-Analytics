@@ -28,6 +28,7 @@ from hl_account_analytics_implementation import (
     plot_account_dashboard,
     plot_value_added_index,
     plot_volume_pnl,
+    position_book_beta,
     print_account_metrics,
     print_realized_stats,
     rolling_24h_metrics,
@@ -229,6 +230,8 @@ class _MultiWalletAccountMixin:
         print_account_metrics(
             self.account_metrics,data.history_rows_added,len(data.realized_fills),
             rolling_24h_metrics(self.wallet_addresses,data.realized_df,data.funding_df),
+            book_beta=position_book_beta(self._load_positions(),
+                self.account_metrics.current_account_value),
         )
 
     def show_account_charts(self):

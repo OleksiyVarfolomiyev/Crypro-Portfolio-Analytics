@@ -1,94 +1,90 @@
 {
- "ts": "2026-11-05T12:09:31.485050-05:00",
- "cumulative_pnl": 245.473444,
+ "ts": "2026-11-05T17:06:32.076321-05:00",
+ "cumulative_pnl": 229.799351,
  "positions": {
   "c248|NEAR|SHORT": {
    "size": 109.2,
-   "upnl": 40.14192
+   "upnl": 42.18396
   },
   "c248|IMX|SHORT": {
    "size": 1466.7,
-   "upnl": 12.520274
+   "upnl": 10.554896
   },
   "c248|GRASS|SHORT": {
    "size": 100.5,
-   "upnl": 9.98166
+   "upnl": 9.926385
   },
   "c248|USUAL|SHORT": {
    "size": 19901.7,
-   "upnl": 7.055629
+   "upnl": -1.303085
   },
   "c248|INIT|SHORT": {
    "size": 244.0,
-   "upnl": 11.35576
+   "upnl": 12.80634
   },
   "c248|XPL|SHORT": {
    "size": 8895.0,
-   "upnl": 30.9546
+   "upnl": 27.316545
   },
   "c248|USELESS|SHORT": {
    "size": 653.0,
-   "upnl": 3.387764
+   "upnl": 1.187154
   },
   "c248|xyz:AAPL|LONG": {
    "size": 1.944,
-   "upnl": -9.19512
+   "upnl": -14.98824
   },
   "07f2|INJ|SHORT": {
    "size": 139.9,
-   "upnl": 4.54675
+   "upnl": -27.33646
   },
   "07f2|TRX|SHORT": {
    "size": 1484.0,
-   "upnl": -4.88236
+   "upnl": -7.98392
   },
   "07f2|RUNE|SHORT": {
    "size": 1141.3,
-   "upnl": 17.128898
+   "upnl": 32.935903
   },
   "07f2|ZRO|SHORT": {
    "size": 21.3,
-   "upnl": 0.69204
+   "upnl": 1.16703
   },
   "07f2|RSR|SHORT": {
    "size": 63189.0,
-   "upnl": -3.808666
+   "upnl": -4.061422
   },
   "07f2|SAGA|SHORT": {
    "size": 18854.0,
-   "upnl": 25.64144
+   "upnl": 28.281
   },
   "07f2|GOAT|SHORT": {
    "size": 77249.0,
-   "upnl": 70.837333
+   "upnl": 71.146329
   },
   "07f2|PENGU|SHORT": {
    "size": 26548.0,
-   "upnl": 22.285144
+   "upnl": 20.586072
   },
   "07f2|INIT|SHORT": {
    "size": 180.0,
-   "upnl": 0.56736
+   "upnl": 1.665
   },
   "07f2|HEMI|SHORT": {
    "size": 4096.0,
-   "upnl": 1.26976
+   "upnl": 1.224704
   },
   "07f2|AERO|LONG": {
    "size": 30.0,
-   "upnl": -7.07777
-  },
-  "07f2|FOGO|SHORT": {
-   "size": 175634.0,
-   "upnl": 44.084134
+   "upnl": -6.79487
   },
   "07f2|PONS|SHORT": {
    "size": 2158.0,
-   "upnl": 68.9481
+   "upnl": 71.79666
   },
   "07f2|xyz:RELIANCE|SHORT": {
    "size": 4.2,
-   "upnl": -0.7134
+   "upnl": -0.3606
   }
  }
 }
