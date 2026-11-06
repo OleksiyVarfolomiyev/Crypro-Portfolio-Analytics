@@ -1,3 +1,4 @@
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -8,6 +9,8 @@ import pandas as pd
 # Modules live in the repository root and its execution/ and research/ folders.
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "execution"), str(ROOT / "research")]
+# Keep tests off real accounts: no IB or wallet in accounts.json is ever contacted.
+os.environ["DESK_ACCOUNTS_FILE"] = str(ROOT / "tests" / "no_accounts.json")
 
 from factor_model import (
     alpha_verdict,

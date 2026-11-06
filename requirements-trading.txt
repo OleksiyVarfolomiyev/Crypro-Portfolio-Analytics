@@ -3,3 +3,4 @@ pandas
 requests
 hyperliquid-python-sdk
 keyring
+ib_async

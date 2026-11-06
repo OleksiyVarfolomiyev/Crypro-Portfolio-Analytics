@@ -1,14 +1,141 @@
 # Trading Desk
 
-This repository contains Jupyter notebooks for portfolio analytics, Hyperliquid account analysis, trade analytics, and backtesting, plus a separate guarded trade-execution script:
+A multi-venue trading desk: analytics, research, and guarded execution across **HL** wallets and **IB** accounts, plus the same wallets' holdings and transfers on other blockchains. Every account in `accounts.json` shares one equity base and one aggregate risk cap, so a trade on either venue is sized and limited by the risk open on both.
 
-1. **Wallet-based portfolio analytics** — discovers the asset universe from nonzero perp positions and spot balances in configured Hyperliquid wallets, then models that basket from historical market data, estimates constrained Kelly weights, and compares modeled performance with BTC. The Kelly weights are model outputs, not the wallets' actual allocations, and the notebook does not place trades.
-2. **Single-wallet Hyperliquid account analytics** — reads the current account, balances, and open perp positions from Hyperliquid, and tracks fee-net realized PnL, signed perp funding, unrealized PnL, and account performance.
-3. **Consolidated Hyperliquid account analytics** — combines account history, balances, positions, fills, and PnL across multiple configured wallets, with ATR-based stop and target sizing for open positions.
-4. **Hyperliquid trade analytics** — estimates historical five-day expected price/funding PnL and ATR-based funding-aware risk for a perp position.
-5. **Hyperliquid backtest** — backtests selected directions with ATR stops/targets, historical funding, and configured maker/taker fees.
+| Part | Venues | Where |
+| --- | --- | --- |
+| Desk overview: balances, positions, exposure by asset class, desk-wide open risk, wallet activity outside HL | All | [`desk_overview.ipynb`](desk_overview.ipynb), `desk/overview.py` |
+| Guarded execution: dry run by default, typed confirmations, desk-wide risk cap, shared kill switch | HL, IB | `execution/hl_trade.py`, `execution/ib_trade.py` |
+| Account analytics: PnL, funding, risk metrics, attribution, charts | HL | `hl_account*.ipynb`, `desk/hl/` |
+| Account analytics: balances, today's PnL, positions with ATR levels, current-book risk vs SPY, fills, attribution | IB | `ib_account.ipynb`, `desk/ib/` |
+| Trade analytics and backtest | HL | `hl_trade_analytics.ipynb`, `hl_backtest.ipynb` |
+| Portfolio research: Kelly weights, factors, market scans | HL data | `research/` |
 
-All notebooks are read-only: they analyze data and do not place trades. Live orders are possible only through the separate execution script, which defaults to dry-run and requires explicit confirmation.
+All notebooks are read-only. Orders are sent only by the execution scripts, which default to a dry run.
+
+## Layout
+
+```
+accounts.json            your accounts (not committed; copy accounts.example.json)
+desk/                    venue-neutral core
+  accounts.py            reads accounts.json
+  risk.py                shared sizing rules and the desk-wide open-risk book
+  overview.py            cross-venue report used by desk_overview.ipynb
+  venues/                one adapter per venue, all returning USD snapshots
+    hl.py                public HL API
+    ib.py                TWS / IB Gateway through ib_async
+    onchain.py           the HL wallets on other EVM chains (Blockscout, Etherscan, DefiLlama)
+  hl/                    HL analytics, research, highlights and backtest modules
+  ib/                    IB account analytics
+execution/               one executor per venue, plus the shared KILL_SWITCH file
+research/                portfolio research notebooks and modules
+tests/                   unit tests (python -m unittest discover -s tests)
+data/                    saved history and caches
+```
+
+## Accounts
+
+Copy `accounts.example.json` to `accounts.json` and list every account the desk should report on and risk together:
+
+```json
+[
+  {"venue": "hl", "id": "0xYOUR_WALLET", "label": "HL main"},
+  {"venue": "ib", "id": "U1234567", "label": "IB", "port": 7496}
+]
+```
+
+HL ids are public wallet addresses. An IB `id` may be left empty to use the first account TWS manages. The file holds no secrets and is ignored by git because it names brokerage accounts.
+
+## IB setup
+
+The IB adapter talks to a running Trader Workstation (or IB Gateway); TWS's own login and two-factor authentication are the credentials, so no API key is stored.
+
+1. In TWS open **File → Global Configuration → API → Settings** (on a Mac, **Trader Workstation → Global Configuration**).
+2. Tick **Enable ActiveX and Socket Clients**.
+3. Set **Socket port** to the `port` in `accounts.json`: 7496 for a live login, 7497 for paper.
+4. Keep **Allow connections from localhost only** ticked.
+5. Untick **Read-Only API** if `execution/ib_trade.py` should place orders; leave it ticked for reporting only.
+6. Click **Apply** and **OK**. If the port still refuses connections, restart TWS.
+7. On the first connection TWS asks whether to accept it; click **Accept** (or add 127.0.0.1 under **Trusted IPs**).
+
+Install `ib_async` into each environment that talks to IB: `python -m pip install ib_async`. Real-time quotes need IB market-data subscriptions; without them the desk falls back to delayed quotes for reports and dry runs, and live IB entries are refused.
+
+## On-chain wallets
+
+Every HL wallet is an ordinary EVM address, so the desk also reads that address on other chains: token holdings appear as `onchain` accounts and positions, and transfers in and out appear in the overview's wallet-activity table. Transfers with the HL bridge on Arbitrum are labelled as deposits to and withdrawals from HL. Set `"onchain": false` on a wallet's entry in `accounts.json` to skip it.
+
+- Ethereum, Optimism, Unichain, Scroll, zkSync and Ink are read from Blockscout's public API without a key.
+- Arbitrum and Polygon need a free Etherscan API key. Create one at etherscan.io, then run `python -m desk.venues.onchain --store-key` to save it in the macOS Keychain, or set `ETHERSCAN_API_KEY`. BNB Chain and Avalanche need a paid Etherscan plan and are listed as skipped.
+- Base is read through Alchemy when a free Alchemy key is stored (`python -m desk.venues.onchain --store-alchemy-key`, or `ALCHEMY_API_KEY`): every token balance and the full transfer history, with the key sent in a header. Base counterparties are not named, because Base's explorers need paid plans. Without an Alchemy key, Base is read without any key through Base's public RPC: native ETH and the main Base tokens (USDC, USDbC, WETH, cbBTC, cbETH, DAI, AERO, EURC, wstETH, USDT), with no transfer history, because free public RPCs block history queries. A Blockscout PRO API key on a paid plan (Builder or above; Blockscout's free plan excludes Base as a "featured chain") adds every Base token, transfer history and contract names: run `python -m desk.venues.onchain --store-blockscout-key`, or set `BLOCKSCOUT_API_KEY`. With a free key, Base keeps the keyless balances. Keys are sent in headers where the API allows it, and stored keys are scrubbed from every printed message.
+- Counterparties are labelled: the HL bridge, the desk's other wallets (shown separately so transfers between your own wallets are not counted as outside flows), mints and burns, and verified contract names from the chain's explorer (cached in `data/api_cache/contract_names.json`). Unlabelled counterparties are ordinary wallets or unverified contracts.
+- Tokens are valued with DefiLlama's public prices. Tokens it cannot price confidently, which includes the scam airdrops most wallets collect, are counted in a note but never valued or listed; balances under $1 are hidden. Transfer values use current prices, not prices at the time of transfer.
+- Staked positions are included. VVV staked with Venice on Base appears as sVVV, valued one-for-one at the VVV price, and its unclaimed rewards (the staking contract's `pendingRewards`) appear as a separate line even when under $1. More staking contracts can be added in `PRICED_AS` and `STAKING_REWARDS` in `desk/venues/onchain.py`.
+- On-chain balances count toward desk value in the overview but not toward the executors' risk equity, because the executors cannot trade them. Transfers are saved to `data/onchain_activity_<wallet>.csv`; the first run reads a year of history.
+
+## When an account cannot be read
+
+Every account is read on its own, so one failure never hides another. The overview reports each unreadable account and shows everything else; with nothing readable, each section says why. In both executors a dry run warns and leaves the unreadable account out of desk equity and risk. A live entry stops, because that account's risk is unknown, unless `--ignore-unreachable` is given. A broken `accounts.json` is treated the same way. Protective commands (`--protect-open`, `--reattach-guards`, `--kill-switch`) never depend on other accounts, and the HL analytics notebooks do not read `accounts.json` at all.
+
+## IB account notebook
+
+Open [`ib_account.ipynb`](ib_account.ipynb) and run all cells; it is the IB counterpart of `hl_account.ipynb` and uses a read-only TWS connection. It shows net liquidation, cash, buying power, margin, unrealized PnL and today's PnL; open positions with average cost, unrealized PnL, the 1.25 × ATR(14) stop and 1:1 target the executor would place now, risk to that stop, and 60-day beta to SPY; and PnL attribution by symbol.
+
+IB's API has no account-value history, so beta and alpha to SPY, Sharpe, volatility, bootstrap VaR and maximum drawdown price **today's holdings** over the past year of IB daily closes, with 90% bootstrap ranges. They describe the current book, not past account performance. Real history builds up from run to run: each run saves a net-liquidation snapshot to `data/ib_account_history_<account>.csv` and merges executions into `data/ib_fills_<account>.csv` (TWS keeps about a week of them), and the history and realized-PnL sections read those files.
+
+## Desk overview notebook
+
+Open [`desk_overview.ipynb`](desk_overview.ipynb) and run all cells. It reads every account in `accounts.json` and shows account balances in USD, exposure by asset class, open positions grouped by asset class, desk open risk against the aggregate cap, wallet activity outside HL, and recent IB fills. An account that cannot be read is reported and left out. Each run appends IB account values to `data/ib_account_history_<account>.csv` and merges IB executions into `data/ib_fills_<account>.csv`, because TWS only returns about a week of executions.
+
+## IB execution
+
+Create a signals CSV with `symbol,side` and optional `sec_type,exchange,currency,expiry` columns:
+
+```csv
+symbol,side,sec_type,exchange,currency,expiry
+AAPL,LONG,,,,
+SPY,SHORT,,,,
+ES,LONG,FUT,CME,USD,
+EURUSD,SHORT,CASH,,,
+```
+
+Defaults are a stock (`STK`) routed through SMART in USD. Futures need an exchange and use the nearest contract with at least five days to expiry unless `expiry` is given. FX pairs use IDEALPRO; `CRYPTO` uses PAXOS. Options are not supported.
+
+```bash
+.venv/bin/python execution/ib_trade.py --signals ib_signals.csv          # dry run
+.venv/bin/python execution/ib_trade.py --signals ib_signals.csv --live   # live, after confirmations
+```
+
+Sizing follows the same rules as HL: ATR(14) from IB daily bars, a stop 1.25 × ATR from the reference price, a 1:1 target, a risk budget of 5% of the 80% usable part of desk equity per position, and a 20% desk-wide aggregate cap (`--max-risk-pct` changes it for one run, at most 50%). Risk per unit is measured from the entry limit to the stop plus round-trip commission, scaled by the contract multiplier and converted to USD. The dry run asks IB for a what-if estimate of initial margin and commission and limits size to IB margin above a 20% reserve.
+
+A live run needs `--live`, typing `LIVE TRADING`, reviewing a refreshed plan, and typing `SUBMIT ORDERS`. Each entry is a marketable DAY limit at most two ticks through the spread (and never past the planned limit), bracketed by a GTC stop and GTC take-profit that cancel each other. IB holds all three orders, so no local process needs to keep running. An entry is skipped without a real-time quote, when the price is already through the stop, or after a move of more than half an ATR since the plan. An entry not filled within 60 seconds is cancelled; a partial fill keeps its exits resized to the filled quantity. A contract held on the opposite side must be closed first.
+
+`--protect-open` adds GTC stops and take-profits to open IB positions that have none, such as positions bought in TWS. Stops sit 1.25 × ATR(14) from the current mark and targets the same distance the other way. `--ladder N` splits each position into up to N parts at 1/N, 2/N … of that distance, like the HL ladder; parts shrink to whole shares worth at least $10, so small positions get fewer steps. `--stops-only` leaves out the targets. A dry run lists every level; `--live` asks for `LIVE TRADING`, re-reads positions and orders, then asks for `SUBMIT PROTECTION ORDERS`.
+
+Stops and targets work in extended hours unless `--rth-only` (see below). IB stock orders have no reduce-only flag, so each ladder step's stop and target are linked one-cancels-other: at most one of each pair fills, and the orders can never sell more than the position. For the same reason a position that already has some exit orders is left alone and reported, rather than given unlinked orders on top. IB's API rejects fractional orders, so only whole shares are protected; a fractional remainder (or a position under one share) is reported to set in TWS. Protection works while the kill switch is engaged.
+
+```bash
+.venv/bin/python execution/ib_trade.py --protect-open --ladder 3          # dry run
+.venv/bin/python execution/ib_trade.py --protect-open --ladder 3 --live   # place, after confirmations
+```
+
+**Extended hours.** By default IB orders also work in pre-market and after-hours (US stocks 04:00-09:30 and 16:00-20:00 ET). Entries and targets are limit orders allowed outside regular hours. Stops are GTC stop-limits, the IB order type that can trigger outside regular hours, with the limit half an ATR past the stop (at most 1.5%, because IB rejects a limit too far through the stop) so a fast move can still fill; a gap past that limit leaves the order resting unfilled. If IB still rejects a stop-limit, the executor replaces it at once with a plain regular-hours stop linked to the same target, and if that is rejected too it cancels the target, so no position is left with a target but no stop. `--rth-only` keeps a run to regular hours with plain stop orders. `--protect-open --replace` cancels the desk's own exit orders for each position (only orders it placed, marked `desk-protect`) and places fresh ones, for example to move older regular-hours orders to extended hours or to a new ladder. A cash account treats overlapping sell orders as a short sale, so the new orders are sent only after IB confirms the old ones cancelled.
+
+`--kill-switch` shows (and with `--live` and `SHUT IT ALL DOWN`, executes) closing every IB position. It halts new entries on every venue, cancels non-exit orders, then for each position cancels its exit orders (a cash account will not accept a sell while resting sells claim the shares) and places a limit close that works in extended hours, 2% through the price and widened to 5% and 10%. A close that still does not fill is cancelled and the position gets its protective stop back. When no session is open the closes are left queued at the 10% limit for the next session, with no stop meanwhile. Fractional shares cannot be sold through the API and are listed to close in TWS.
+
+## Desk-wide kill switch
+
+`execution/kill_switch.py` shows (and with `--live` and `SHUT IT ALL DOWN`, executes) the kill switch on every venue at once: it engages the shared halt, flattens every HL wallet in `accounts.json` with the HL kill switch, then closes the IB account as above, and prints a summary per venue. A venue that cannot be reached is reported and the others still run.
+
+```bash
+.venv/bin/python execution/kill_switch.py          # dry run: what every venue would close
+.venv/bin/python execution/kill_switch.py --live   # after typing SHUT IT ALL DOWN
+```
+
+Both executors share `execution/KILL_SWITCH`: while it exists neither opens new positions (protection still works); `--clear-kill-switch` on either removes it.
+
+## Desk-wide risk
+
+Both executors build the same risk book before sizing. Desk equity is HL margin collateral plus IB net liquidation, in USD. Open risk is each position's 1.25 × ATR(14) stop distance plus round-trip costs, plus a 5-day adverse funding reserve on HL; an IB position without usable price history counts 10% of its value. The HL executor reads IB through TWS, and the IB executor reads every configured HL wallet. If a configured account cannot be read, a dry run warns and leaves it out, and a live run stops; `--ignore-unreachable` trades without that account's risk.
 
 ## Notebooks
 
@@ -16,20 +143,20 @@ The two notebooks below contain the complete workflows, including price-history 
 
 | Notebook | What it does | Main data files |
 | --- | --- | --- |
-| [`research/portfolio_analytics.ipynb`](research/portfolio_analytics.ipynb) | Discovers live perp positions and spot balances from configured Hyperliquid wallets; fetches daily perp prices from Hyperliquid (including HIP-3 markets) and supported spot prices plus market data from CoinGecko; calculates returns and correlations; optimizes signed long/short constrained full-Kelly weights; fits BTC and available CoinGecko cross-sectional factors; compares portfolio results with BTC; writes metrics and factor outputs to CSV. | `data/daily_prices_usd.csv`, `data/daily_returns.csv`, `data/return_correlation.csv`, `data/kelly_full_weights.csv`, `data/kelly_weights.csv`, `data/portfolio_daily_returns.csv`, `data/portfolio_metrics.csv`, `data/market_data.csv`, `data/portfolio_factor_model.csv`, `data/portfolio_factor_fit.csv`, `data/factor_returns.csv` |
-| [`hl_account_analytics.ipynb`](hl_account_analytics.ipynb) | Analyzes one Hyperliquid account by reading current account and position data; saves account history locally; reports spot/perp balances, fee-net realized PnL with signed perp funding, unrealized PnL, risk metrics, PnL attribution, and charts against BTC. | `data/hl_account_history_<wallet>.csv` |
-| [`hl_multi_account_analytics.ipynb`](hl_multi_account_analytics.ipynb) | Consolidates account history, balances, positions, fills, funding, and PnL across configured Hyperliquid wallets. Displays combined account/risk summaries and charts, pooled PnL attribution, and per-wallet open positions. Position sizing uses a configurable fixed-fractional risk budget and ATR-based stop/take-profit levels. | `data/hl_account_history_<wallet>.csv` for each wallet |
-| [`hl_trade_analytics.ipynb`](hl_trade_analytics.ipynb) | Interactive, read-only view of ATR stop distance, historical adverse funding reserve, and expected five-day price/funding PnL for one perp position. | Public Hyperliquid daily candles and hourly funding history |
-| [`hl_backtest.ipynb`](hl_backtest.ipynb) | Interactive, read-only backtest for a list of coin/direction signals. Shows trade-level PnL, funding, fees, and exit reasons. | Public Hyperliquid daily candles and hourly funding history |
+| [`research/portfolio_analytics.ipynb`](research/portfolio_analytics.ipynb) | Discovers live perp positions and spot balances from configured HL wallets; fetches daily perp prices from HL (including HIP-3 markets) and supported spot prices plus market data from CoinGecko; calculates returns and correlations; optimizes signed long/short constrained full-Kelly weights; fits BTC and available CoinGecko cross-sectional factors; compares portfolio results with BTC; writes metrics and factor outputs to CSV. | `data/daily_prices_usd.csv`, `data/daily_returns.csv`, `data/return_correlation.csv`, `data/kelly_full_weights.csv`, `data/kelly_weights.csv`, `data/portfolio_daily_returns.csv`, `data/portfolio_metrics.csv`, `data/market_data.csv`, `data/portfolio_factor_model.csv`, `data/portfolio_factor_fit.csv`, `data/factor_returns.csv` |
+| [`hl_account.ipynb`](hl_account.ipynb) | Analyzes one HL account by reading current account and position data; saves account history locally; reports spot/perp balances, fee-net realized PnL with signed perp funding, unrealized PnL, risk metrics, PnL attribution, and charts against BTC. | `data/hl_account_history_<wallet>.csv` |
+| [`hl_accounts.ipynb`](hl_accounts.ipynb) | Consolidates account history, balances, positions, fills, funding, and PnL across configured HL wallets. Displays combined account/risk summaries and charts, pooled PnL attribution, and per-wallet open positions. Position sizing uses a configurable fixed-fractional risk budget and ATR-based stop/take-profit levels. | `data/hl_account_history_<wallet>.csv` for each wallet |
+| [`hl_trade_analytics.ipynb`](hl_trade_analytics.ipynb) | Interactive, read-only view of ATR stop distance, historical adverse funding reserve, and expected five-day price/funding PnL for one perp position. | Public HL daily candles and hourly funding history |
+| [`hl_backtest.ipynb`](hl_backtest.ipynb) | Interactive, read-only backtest for a list of coin/direction signals. Shows trade-level PnL, funding, fees, and exit reasons. | Public HL daily candles and hourly funding history |
 
-Implementation modules (`*_implementation.py`) provide code used by the portfolio and account reports; run the user-facing notebooks in the table above. The trade notebooks import shared helpers from `hl_trade_analytics.py` and the backtest engine from `hl_backtest.py`. All CSV and spreadsheet data files are stored in the `data/` subfolder. The account notebooks create this folder when needed and read/write their files there. Keep the existing files in `data/` between runs to preserve price and account history.
+Modules in `desk/hl/` (and `research/*_implementation.py`) provide code used by the portfolio and account reports; run the user-facing notebooks in the table above. The trade notebooks import shared helpers from `desk/hl/trade_analytics.py` and the backtest engine from `desk/hl/backtest.py`. All CSV and spreadsheet data files are stored in the `data/` subfolder. The account notebooks create this folder when needed and read/write their files there. Keep the existing files in `data/` between runs to preserve price and account history.
 
 ## Setup
 
 Use Python 3.10 or later and install Jupyter plus the libraries used by the notebooks:
 
 ```bash
-python -m pip install jupyter pandas numpy matplotlib requests seaborn
+python -m pip install jupyter pandas numpy matplotlib plotly scipy requests seaborn ib_async
 ```
 
 Start Jupyter from this repository directory:
@@ -44,49 +171,49 @@ Open either notebook and run its cells from top to bottom. Each notebook is inde
 
 Open **research/portfolio_analytics.ipynb** and run all cells in order.
 
-- Set `WALLET_ADDRESSES` in the notebook's setup cell. The refresh discovers nonzero perp positions and spot balances across those wallets using Hyperliquid's public API; it does not place trades.
+- Set `WALLET_ADDRESSES` in the notebook's setup cell. The refresh discovers nonzero perp positions and spot balances across those wallets using HL's public API; it does not place trades.
 - CoinGecko's public API is used without an API key. It is rate-limited, so refreshes may need to be retried if the public service returns HTTP 429.
-- Perp prices are refreshed from Hyperliquid's daily candle API, preserving DEX-qualified names for HIP-3 markets. CoinGecko supplies prices for supported spot-only assets and historical market capitalization/volume. Perps without a unique CoinGecko symbol still enter the modeled universe when Hyperliquid provides candles; spot-only assets without a unique CoinGecko mapping are reported and skipped. Assets with fewer than 30 common daily returns with BTC are reported and skipped.
+- Perp prices are refreshed from HL's daily candle API, preserving DEX-qualified names for HIP-3 markets. CoinGecko supplies prices for supported spot-only assets and historical market capitalization/volume. Perps without a unique CoinGecko symbol still enter the modeled universe when HL provides candles; spot-only assets without a unique CoinGecko mapping are reported and skipped. Assets with fewer than 30 common daily returns with BTC are reported and skipped.
 - Public historical requests are limited to the latest 365 days. The refresh caps requests to that window and retains older prices already stored in the CSV; older market-cap and volume factor history is retained locally but cannot be newly fetched from the public endpoint.
 - The remaining cells calculate daily returns and correlations, then optimize signed long/short full-Kelly weights and report portfolio performance and risk versus BTC. The optimizer table includes a historical expected five-day price-PnL contribution per $100 of portfolio equity; this estimate reflects signed weights and excludes funding, fees, and slippage. To run just the optimizer after loading price history and calculating returns, call `analysis.optimize_portfolio()`. The optimizer may select a direction independently of current wallet position sides; its weights are theoretical historical-return estimates, not the wallets' actual positions. Later cells estimate factor exposures to BTC market returns, altcoin-market performance, size, momentum, and trading turnover.
 - The final export cell writes the weights, return series, correlations, performance metrics, factor betas, model fit statistics, estimated factor return contributions, and factor series to CSV files.
 
 The discovered, priceable wallet assets form the modeled basket. CoinGecko cross-sectional factors use only assets with CoinGecko market-cap or volume history; all priceable assets remain in the portfolio-return series. The benchmark is BTC; signed weight bounds and other model assumptions are documented in the implementation notebook. The historical model does not include short borrow costs, perp funding, margin requirements, or liquidation risk.
 
-## 2. Hyperliquid account analytics notebook
+## 2. HL account analytics notebook
 
-Open **hl_account_analytics.ipynb** and run all cells in order.
+Open **hl_account.ipynb** and run all cells in order.
 
-- The notebook queries the configured Hyperliquid account through the public API and fetches current spot balances, perp positions, fills, and BTC candles. No API secret is required for these public account-data requests.
-- It creates or updates `data/hl_account_history_<wallet>.csv` with new account snapshots, realized trade PnL, and perp funding history. Keep that wallet's CSV between runs to preserve the local history used by the charts and statistics. Daily funding and fill-PnL rows are rebuilt from Hyperliquid's data on each refresh, so a wrong saved row cannot persist.
-- Each run fetches Hyperliquid's all-time account history and saves any points newer than the CSV, so the account-value history and risk statistics stay current.
-- Daily, weekly, and monthly return statistics, Sharpe, alpha, and beta use a time-weighted index built from Hyperliquid's value and PnL history, so deposits, withdrawals, and transfers do not move them. A daily return needs history points on consecutive days, so older periods with weekly history count toward weekly and monthly returns but not daily statistics. Each run saves new value and PnL points to `data/hl_portfolio_history_<wallet>.csv`, which Hyperliquid only keeps at this detail for about a month, so keep these files to let the daily sample grow. Account maximum drawdown uses the same index.
+- The notebook queries the configured HL account through the public API and fetches current spot balances, perp positions, fills, and BTC candles. No API secret is required for these public account-data requests.
+- It creates or updates `data/hl_account_history_<wallet>.csv` with new account snapshots, realized trade PnL, and perp funding history. Keep that wallet's CSV between runs to preserve the local history used by the charts and statistics. Daily funding and fill-PnL rows are rebuilt from HL's data on each refresh, so a wrong saved row cannot persist.
+- Each run fetches HL's all-time account history and saves any points newer than the CSV, so the account-value history and risk statistics stay current.
+- Daily, weekly, and monthly return statistics, Sharpe, alpha, and beta use a time-weighted index built from HL's value and PnL history, so deposits, withdrawals, and transfers do not move them. A daily return needs history points on consecutive days, so older periods with weekly history count toward weekly and monthly returns but not daily statistics. Each run saves new value and PnL points to `data/hl_portfolio_history_<wallet>.csv`, which HL only keeps at this detail for about a month, so keep these files to let the daily sample grow. Account maximum drawdown uses the same index.
 - Current account value counts a unified account's perp equity once, because it is already part of the USDC balance; other account modes add spot balances and perp equity.
 - The notebook's report sections match the consolidated notebook and share its code: highlights, position tables, net exposure and funding, margin and aggregate risk, and the net funding APR chart. Highlights save a per-wallet baseline in `data/hl_highlights_state_<wallet>.json`, separate from the consolidated one. Adjust `MARGIN_RESERVE_PCT`, `AGGREGATE_RISK_PCT`, `ATR_PERIOD`, and `ATR_STOP_MULTIPLE` in the setup cell.
-- The notebook reports account value, open-position metrics, fee-net spot/perp realized PnL with signed funding (Hyperliquid's `closedPnl` is before fees, so USDC fees on every fill are subtracted, and win/loss statistics are after fees), fees paid, unrealized PnL, historical and bootstrap VaR, historical volatility, and asset-level PnL attribution. It also plots account and BTC comparisons.
+- The notebook reports account value, open-position metrics, fee-net spot/perp realized PnL with signed funding (HL's `closedPnl` is before fees, so USDC fees on every fill are subtracted, and win/loss statistics are after fees), fees paid, unrealized PnL, historical and bootstrap VaR, historical volatility, and asset-level PnL attribution. It also plots account and BTC comparisons.
 - The open-positions table includes historical expected five-day price PnL, expected funding PnL, and their sum. These estimates use completed daily candles and historical hourly funding; fees, slippage, and future-rate uncertainty are not included in the expected values.
 
-To analyze another account, update `WALLET_ADDRESS` in the setup cell with that account’s public Hyperliquid address. The notebook may show less historical detail for an account if it has fewer saved snapshots or fills.
+To analyze another account, update `WALLET_ADDRESS` in the setup cell with that account’s public HL address. The notebook may show less historical detail for an account if it has fewer saved snapshots or fills.
 
-## 3. Hyperliquid consolidated account analytics notebook
+## 3. HL consolidated account analytics notebook
 
-Open **hl_multi_account_analytics.ipynb** and run its cells from top to bottom.
+Open **hl_accounts.ipynb** and run its cells from top to bottom.
 
-- Set `WALLET_ADDRESSES` in the setup cell to the public Hyperliquid addresses to combine. The notebook reads each account through Hyperliquid's public API; no API secret is needed.
+- Set `WALLET_ADDRESSES` in the setup cell to the public HL addresses to combine. The notebook reads each account through HL's public API; no API secret is needed.
 - The notebooks use a separate `data/hl_account_history_<wallet>.csv` history file for each wallet. Preserve these files between runs to retain saved account history.
-- Combined account-value history and account/risk metrics use dates with coverage from every configured wallet. In the account charts, the oldest wallet's saved history is shown before shared coverage begins, then the combined account value is used. The daily account-vs-BTC comparison is a time-weighted return built from Hyperliquid's account value and PnL history, so deposits, withdrawals, and transfers do not move it. Weekly returns follow the same oldest-wallet-then-combined coverage; traded-volume/PnL charts already pool fills across wallets. Daily rollups and calendar-period cutoffs use US Eastern time. Time-axis charts collapse periods with no realized PnL or funding for more than 30 days and label what is hidden; the weekly-return histogram omits weeks wholly inside them, while statistics still include them.
-- The open-positions section groups same-side positions across wallets and shows them separately from an aggregate account summary. The aggregate summary includes cumulative open-position funding as a percentage of combined account equity and total position value. Reserve-adjusted available margin is combined margin collateral (USDC on unified accounts, matching the executor) less the reserve; the summary shows this capacity, margin used, remaining available margin in dollars and as a percentage of capacity, and position value as a percentage of equity. `MARGIN_RESERVE_PCT` defaults to 20%. Position rows include funding and fees since open as dollar amounts, plus fees since open as a percentage of position value and position value as a percentage of wallet account value. They also show historical expected five-day price PnL, expected funding PnL, and expected PnL including funding. These expected values exclude fees and slippage. Fee ratios are shown for complete USDC-denominated fee history. Fixed-fractional sizing defaults to a risk budget of 5% of that available margin per asset, ATR(14) from completed daily candles, and a stop distance of 1.25 × ATR. The sizing table adds a directionally adverse 95th-percentile five-day funding reserve to the target-size and open-risk calculations; its displayed stop remains a price trigger and does not itself enforce a funding-adjusted net-loss threshold. Take-profit is placed the same distance in the favorable direction (1:1 risk/reward). If both long and short positions exist for an asset, each side shares the asset's risk budget equally. `Open - Target` compares a row with its own budget only; `Addable Risk ($)` and `Addable Value ($)` also apply the aggregate risk cap, and the summary shows that cap, risk used, and room. The room is one shared pool, so rows cannot all add their amounts. A separate chart shows `Net Funding APR (%) (simple, covered)` over time, rebuilt from Hyperliquid funding history across wallets, as daily and notional-weighted 7-day values.
+- Combined account-value history and account/risk metrics use dates with coverage from every configured wallet. In the account charts, the oldest wallet's saved history is shown before shared coverage begins, then the combined account value is used. The daily account-vs-BTC comparison is a time-weighted return built from HL's account value and PnL history, so deposits, withdrawals, and transfers do not move it. Weekly returns follow the same oldest-wallet-then-combined coverage; traded-volume/PnL charts already pool fills across wallets. Daily rollups and calendar-period cutoffs use US Eastern time. Time-axis charts collapse periods with no realized PnL or funding for more than 30 days and label what is hidden; the weekly-return histogram omits weeks wholly inside them, while statistics still include them.
+- The open-positions section groups same-side positions across wallets and shows them separately from an aggregate account summary. The aggregate summary includes cumulative open-position funding as a percentage of combined account equity and total position value. Reserve-adjusted available margin is combined margin collateral (USDC on unified accounts, matching the executor) less the reserve; the summary shows this capacity, margin used, remaining available margin in dollars and as a percentage of capacity, and position value as a percentage of equity. `MARGIN_RESERVE_PCT` defaults to 20%. Position rows include funding and fees since open as dollar amounts, plus fees since open as a percentage of position value and position value as a percentage of wallet account value. They also show historical expected five-day price PnL, expected funding PnL, and expected PnL including funding. These expected values exclude fees and slippage. Fee ratios are shown for complete USDC-denominated fee history. Fixed-fractional sizing defaults to a risk budget of 5% of that available margin per asset, ATR(14) from completed daily candles, and a stop distance of 1.25 × ATR. The sizing table adds a directionally adverse 95th-percentile five-day funding reserve to the target-size and open-risk calculations; its displayed stop remains a price trigger and does not itself enforce a funding-adjusted net-loss threshold. Take-profit is placed the same distance in the favorable direction (1:1 risk/reward). If both long and short positions exist for an asset, each side shares the asset's risk budget equally. `Open - Target` compares a row with its own budget only; `Addable Risk ($)` and `Addable Value ($)` also apply the aggregate risk cap, and the summary shows that cap, risk used, and room. The room is one shared pool, so rows cannot all add their amounts. A separate chart shows `Net Funding APR (%) (simple, covered)` over time, rebuilt from HL funding history across wallets, as daily and notional-weighted 7-day values.
 - Adjust `MARGIN_RESERVE_PCT`, `AGGREGATE_RISK_PCT`, `ATR_PERIOD`, and `ATR_STOP_MULTIPLE` in the setup cell to change the reserve and sizing assumptions. This is sizing analysis only; the notebook does not create, change, or submit orders.
 
-## 4. Hyperliquid trade analytics notebook
+## 4. HL trade analytics notebook
 
 Open [`hl_trade_analytics.ipynb`](hl_trade_analytics.ipynb) and run its titled cells in order. Change the coin, DEX, side, and quantity in the configuration cell. The notebook reads completed daily candles and hourly funding history from public endpoints. It estimates the directionally adverse 95th-percentile five-day funding reserve from contiguous hourly windows and adds expected historical funding PnL separately from price PnL. Historical estimates are not guarantees and exclude fees, slippage, gaps, and funding-rate changes.
 
-## 5. Hyperliquid backtest notebook
+## 5. HL backtest notebook
 
 Open [`hl_backtest.ipynb`](hl_backtest.ipynb) and run its titled cells in order. Edit the signal rows and set your current maker/taker fee rates in basis points before running. With no dated signal rules, it simulates persistent long/short entries at daily opens whenever that market is flat, one position at a time per market. The backtest uses ATR(14), a 1.25×ATR stop, a 1:1 target, and a five-daily-bar time exit by default; leverage is capped at 4× on default-Dex markets and 3× on HIP-3 DEX markets. When stop and target both touch the same daily candle, it assumes the stop fills first. Funding PnL uses entry price as the hourly notional-price proxy. Each market is tested independently; overlapping positions across assets are not combined into a portfolio equity curve or checked against the live 20% aggregate-risk cap.
 
-## 6. Guarded trade execution
+## 6. HL guarded trade execution
 
 Execution is deliberately separate from the notebooks. Install its optional dependencies into the Python environment that will run it:
 
@@ -98,7 +225,7 @@ python3 -m venv .venv
 Create a local signals CSV with `coin,side,dex` columns; `execution/trade_targets.example.csv` shows the format. Store the API-wallet private key directly in the macOS Keychain by running:
 
 ```bash
-.venv/bin/python execution/hl_trade_execution.py --wallet 0xYOUR_MAIN_WALLET_ADDRESS --store-key
+.venv/bin/python execution/hl_trade.py --wallet 0xYOUR_MAIN_WALLET_ADDRESS --store-key
 ```
 
 The script prompts for the API-wallet signing key with hidden input. The key is never written to the repository or included in command-line arguments. Do not send private keys, seed phrases, or API secrets in chat. Use a dedicated API wallet, enable only the access it needs, and avoid using a wallet holding funds beyond the intended trading allocation.
@@ -106,7 +233,7 @@ The script prompts for the API-wallet signing key with hidden input. The key is 
 To check every open position and add only missing reduce-only stop-loss/take-profit coverage, run:
 
 ```bash
-.venv/bin/python execution/hl_trade_execution.py \
+.venv/bin/python execution/hl_trade.py \
   --wallet 0xYOUR_MAIN_WALLET_ADDRESS \
   --protect-open
 ```
@@ -138,7 +265,7 @@ close,ARB,,,
 Run a dry check first:
 
 ```bash
-.venv/bin/python execution/hl_trade_execution.py \
+.venv/bin/python execution/hl_trade.py \
   --wallet 0xYOUR_MAIN_WALLET_ADDRESS \
   --risk-wallets 0xWALLET_ONE,0xWALLET_TWO \
   --actions position_actions.csv
@@ -149,7 +276,7 @@ Additions use the existing maker-only ALO entry approach; a resting entry keeps 
 First run without `--live` to inspect the proposed sizing and current aggregate risk:
 
 ```bash
-.venv/bin/python execution/hl_trade_execution.py \
+.venv/bin/python execution/hl_trade.py \
   --wallet 0xYOUR_MAIN_WALLET_ADDRESS \
   --risk-wallets 0xWALLET_ONE,0xWALLET_TWO \
   --signals trade_targets.csv
@@ -159,7 +286,7 @@ The script defaults to dry-run, does not load a key in dry-run mode, and does no
 
 Sizing defaults are a 5% risk budget on the 80% usable-equity amount per position, a 20% aggregate stop-plus-five-day-adverse-funding risk cap, a 20% equity margin reserve, 4× leverage for default-Dex crypto perps and a conservative 3× cap for HIP-3 DEX markets. The script scales new orders down to remaining risk/margin capacity and blocks risk-increasing orders when the cap is already full. Existing open positions are included in risk checks and opposite-side positions in the target wallet must be flattened manually before re-entry.
 
-Equity for these limits is margin collateral, matching how Hyperliquid margins the account. On a unified account that is the wallet's USDC balance: perp account value is already part of it, so the two are not added, and non-USDC spot tokens such as HYPE are not counted. Other account modes use perp account value. Available margin is 80% of collateral less margin used. With `--risk-wallets`, the per-position and aggregate risk caps use combined collateral across those wallets, while available margin uses the execution wallet alone.
+Equity for these limits is margin collateral, matching how HL margins the account. On a unified account that is the wallet's USDC balance: perp account value is already part of it, so the two are not added, and non-USDC spot tokens such as HYPE are not counted. Other account modes use perp account value. Available margin is 80% of collateral less margin used. With `--risk-wallets`, the per-position and aggregate risk caps use combined collateral across those wallets, while available margin uses the execution wallet alone.
 
 The caps limit estimated loss (stop distance, adverse funding, and fees), not margin, so the same margin can carry very different risk across markets and leverage levels. The sizing protocol for in-the-money positions is:
 
@@ -169,18 +296,18 @@ The caps limit estimated loss (stop distance, adverse funding, and fees), not ma
 
 The executor applies the limits to each action but does not choose positions; that ordering is applied when writing the actions CSV.
 
-## Kill switch
+## HL kill switch
 
 To see what would be shut down (read-only; no key is loaded):
 
 ```bash
-.venv/bin/python execution/hl_trade_execution.py --kill-switch \
+.venv/bin/python execution/hl_trade.py --kill-switch \
   --wallet 0xWALLET_ONE --risk-wallets 0xWALLET_ONE,0xWALLET_TWO
 ```
 
 Add `--live` and type `SHUT IT ALL DOWN` to execute. It first halts new entries, including entry loops already running on this machine, then for each wallet cancels entry orders and market-closes every perp position with reduce-only IOC orders, retrying with up to 10% slippage. A position's stop and take-profit are cancelled only once it is confirmed flat, so a failed close keeps its protection. It sweeps a second time, re-reads the exchange, and exits with status 2 and a list of anything still open.
 
-It needs each wallet's API key in the keychain and runs from `.venv` or the `py314` environment; both have the trading packages. It does not touch spot balances, vaults, or staking, and it cannot stop orders placed elsewhere, such as the Hyperliquid app. Live entries and position actions stay blocked until `--clear-kill-switch`; `--protect-open` still works.
+It needs each wallet's API key in the keychain and runs from `.venv` or the `py314` environment; both have the trading packages. It does not touch spot balances, vaults, or staking, and it cannot stop orders placed elsewhere, such as the HL app. Live entries and position actions stay blocked until `--clear-kill-switch`; `--protect-open` still works.
 
 ## Notes
 
@@ -189,6 +316,6 @@ It needs each wallet's API key in the keychain and runs from `.venv` or the `py3
 - The Kelly weights are historical estimates based on the available price sample; they are not a guarantee of future performance.
 - Expected PnL values use historical mean forward returns/funding and can be unstable for short or changing market samples.
 - The factor model is a descriptive in-sample regression over the selected assets. Factor betas and contributions are estimates, not causal explanations or forecasts.
-- Hyperliquid account history is stored locally in per-wallet CSV files. Back up the relevant `data/hl_account_history_<wallet>.csv` files if you want to preserve those records.
+- HL account history is stored locally in per-wallet CSV files. Back up the relevant `data/hl_account_history_<wallet>.csv` files if you want to preserve those records.
 - Multi-wallet daily account comparisons require overlapping saved history for all configured wallets; a short overlap can make drawdown and other historical statistics unrepresentative of the full account history.
 - Files in `data/` can contain account-level financial history and portfolio data. Avoid committing them to a public repository unless you intend to publish that data.

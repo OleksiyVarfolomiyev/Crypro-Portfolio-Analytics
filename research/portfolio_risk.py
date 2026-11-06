@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from hl_trade_analytics import bootstrap_var
+from desk.hl.trade_analytics import bootstrap_var
 
 
 def calculate_portfolio_risk_metrics(

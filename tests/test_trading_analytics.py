@@ -22,11 +22,14 @@ os.environ["HL_DISABLE_CACHE"] = "1"
 # Modules live in the repository root and its execution/ and research/ folders.
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "execution"), str(ROOT / "research")]
+# Keep tests off real accounts: no IB or wallet in accounts.json is ever contacted.
+os.environ["DESK_ACCOUNTS_FILE"] = str(ROOT / "tests" / "no_accounts.json")
 
-import hl_trade_analytics
-from hl_backtest import BacktestSettings, backtest_signal
-from hl_highlights import build_highlights, load_state, make_state, position_changes, save_state
-from hl_market_research import (
+import desk.hl.trade_analytics
+from desk.hl import trade_analytics
+from desk.hl.backtest import BacktestSettings, backtest_signal
+from desk.hl.highlights import build_highlights, load_state, make_state, position_changes, save_state
+from desk.hl.market_research import (
     asset_class,
     CHANGE,
     FUNDING,
@@ -37,7 +40,7 @@ from hl_market_research import (
     select_view,
     trending_markets,
 )
-from hl_trade_analytics import (
+from desk.hl.trade_analytics import (
     adverse_funding_cost_per_unit,
     add_expected_pnl_columns,
     implied_unrealized_history,
@@ -60,7 +63,7 @@ from hl_trade_analytics import (
     visible_month_starts,
     wilder_atr,
 )
-from hl_trade_execution import (
+from hl_trade import (
     AccountSnapshot,
     Market,
     Position,
@@ -114,7 +117,7 @@ def load_account_implementation():
         if importlib.util.find_spec(name.split(".")[0]) is None
     }
     with patch.dict(sys.modules, stubs):
-        return importlib.import_module("hl_account_analytics_implementation")
+        return importlib.import_module("desk.hl.account_analytics")
 
 
 class RealizedPnlTests(unittest.TestCase):
@@ -176,13 +179,13 @@ class RealizedPnlTests(unittest.TestCase):
         rng = np.random.default_rng(3)
         btc = pd.Series(rng.normal(0, 0.03, 200))
         account = -0.8 * btc + pd.Series(rng.normal(0.001, 0.01, 200))
-        stats = hl_trade_analytics.bootstrap_btc_regression(account, btc)
+        stats = desk.hl.trade_analytics.bootstrap_btc_regression(account, btc)
         self.assertEqual(stats["n"], 200)
         self.assertAlmostEqual(stats["beta"], -0.8, delta=0.1)
         self.assertLess(stats["beta_low"], stats["beta"])
         self.assertGreater(stats["beta_high"], stats["beta"])
-        self.assertEqual(stats, hl_trade_analytics.bootstrap_btc_regression(account, btc))
-        short = hl_trade_analytics.bootstrap_btc_regression(account.head(4), btc.head(4))
+        self.assertEqual(stats, desk.hl.trade_analytics.bootstrap_btc_regression(account, btc))
+        short = desk.hl.trade_analytics.bootstrap_btc_regression(account.head(4), btc.head(4))
         self.assertTrue(pd.isna(short["beta"]))
 
     def test_position_book_beta_signs_notional_and_reports_missing(self):
@@ -197,8 +200,8 @@ class RealizedPnlTests(unittest.TestCase):
             return pd.DataFrame({"time": days, "close": close})
         positions = [{"Coin": "ALT", "Dex": "", "Side": "SHORT", "Pos": 500.0},
                      {"Coin": "GONE", "Dex": "", "Side": "LONG", "Pos": 100.0}]
-        with patch.object(hl_trade_analytics, "fetch_daily_candles", side_effect=candles):
-            book = hl_trade_analytics.position_book_beta(positions, account_value=1_000.0)
+        with patch.object(desk.hl.trade_analytics, "fetch_daily_candles", side_effect=candles):
+            book = desk.hl.trade_analytics.position_book_beta(positions, account_value=1_000.0)
         # A short of $500 in an asset with beta 2 on $1,000 of account value.
         self.assertAlmostEqual(book["beta"], -1.0, places=6)
         self.assertEqual(book["missing"], ["GONE"])
@@ -395,7 +398,7 @@ class RealizedPnlTests(unittest.TestCase):
         history = self.account.stitch_portfolio_periods(periods)
         self.assertEqual(list(history["pnl"]), [0.0, 20.0, 30.0, 40.0])
 
-    def test_saved_points_survive_after_hyperliquid_drops_them(self):
+    def test_saved_points_survive_after_hl_drops_them(self):
         now = pd.Timestamp("2026-06-30 12:00", tz="UTC")
         times = [now - pd.Timedelta(hours=hours) for hours in (4, 2)]
         saved = pd.DataFrame({"ts": times, "accountValue": [100.0, 101.0], "pnl": [50.0, 51.0]})
@@ -409,7 +412,7 @@ class RealizedPnlTests(unittest.TestCase):
     def test_index_from_history_excludes_deposit_and_sets_drawdown_basis(self):
         now = pd.Timestamp("2026-06-30 12:00", tz="UTC")
         periods = {"allTime": self._portfolio_period(now, [(48, 100, 0), (24, 1110, 10), (0, 1120, 20)])}
-        index = hl_trade_analytics.time_weighted_index([self.account.stitch_portfolio_periods(periods)])
+        index = desk.hl.trade_analytics.time_weighted_index([self.account.stitch_portfolio_periods(periods)])
         daily, _, _ = self.account.index_period_returns(index)
         self.assertTrue((daily.abs() < 11).all())
 
@@ -744,8 +747,8 @@ class TradeAnalyticsTests(unittest.TestCase):
         )
         successful = unittest.mock.Mock(status_code=200, ok=True, json=lambda: {"ok": True})
         with (
-            patch("hl_trade_analytics.requests.post", side_effect=[rate_limited, successful]),
-            patch("hl_trade_analytics.time.sleep") as sleep,
+            patch("desk.hl.trade_analytics.requests.post", side_effect=[rate_limited, successful]),
+            patch("desk.hl.trade_analytics.time.sleep") as sleep,
         ):
             self.assertEqual(post_info({"type": "meta"}), {"ok": True})
         sleep.assert_called_once_with(3.0)
@@ -753,8 +756,8 @@ class TradeAnalyticsTests(unittest.TestCase):
     def test_info_request_reports_rate_limit_after_retry_limit(self):
         rate_limited = unittest.mock.Mock(status_code=429, ok=False, headers={})
         with (
-            patch("hl_trade_analytics.requests.post", return_value=rate_limited),
-            patch("hl_trade_analytics.time.sleep"),
+            patch("desk.hl.trade_analytics.requests.post", return_value=rate_limited),
+            patch("desk.hl.trade_analytics.time.sleep"),
             self.assertRaisesRegex(RuntimeError, r"HTTP 429"),
         ):
             post_info({"type": "meta"})
@@ -793,8 +796,8 @@ class TradeAnalyticsTests(unittest.TestCase):
             [{"time": funding_time, "fundingRate": "0.0001"}],
         ]
         with (
-            patch("hl_trade_analytics.CACHE_DIR", None),
-            patch("hl_trade_analytics.post_info", side_effect=responses) as post,
+            patch("desk.hl.trade_analytics.CACHE_DIR", None),
+            patch("desk.hl.trade_analytics.post_info", side_effect=responses) as post,
         ):
             fetch_daily_candles("AAPL", dex="xyz")
             fetch_funding_history("AAPL", dex="xyz")
@@ -823,8 +826,8 @@ class TradeAnalyticsTests(unittest.TestCase):
             "Oracle": 100.0,
         }
         with (
-            patch("hl_trade_analytics.fetch_daily_candles", return_value=make_candles()),
-            patch("hl_trade_analytics.fetch_funding_history", return_value=make_funding(rate=-0.00001)),
+            patch("desk.hl.trade_analytics.fetch_daily_candles", return_value=make_candles()),
+            patch("desk.hl.trade_analytics.fetch_funding_history", return_value=make_funding(rate=-0.00001)),
         ):
             enriched, warnings = add_expected_pnl_columns([row])
         self.assertFalse(warnings)
@@ -873,7 +876,7 @@ class TradeAnalyticsTests(unittest.TestCase):
                 meta, contexts = metas[payload["dex"]]
                 return [{"universe": meta}, contexts]
             return responses[payload["type"]]
-        with patch("hl_market_research.post_info", side_effect=post):
+        with patch("desk.hl.market_research.post_info", side_effect=post):
             markets = fetch_perp_markets()
         btc = markets.set_index("Ticker").loc["BTC"]
         self.assertAlmostEqual(btc[CHANGE], 10.0)
@@ -953,25 +956,25 @@ class TradeAnalyticsTests(unittest.TestCase):
                 for hour in hours if payload["startTime"] <= hour.timestamp() * 1000 <= payload["endTime"]
             ]
         with tempfile.TemporaryDirectory() as directory, patch.object(
-            hl_trade_analytics, "CACHE_DIR", Path(directory)
-        ), patch("hl_trade_analytics.post_info", side_effect=post):
+            desk.hl.trade_analytics, "CACHE_DIR", Path(directory)
+        ), patch("desk.hl.trade_analytics.post_info", side_effect=post):
             calls = []
-            first = hl_trade_analytics.fetch_daily_candles("BTC", lookback_days=20)
+            first = desk.hl.trade_analytics.fetch_daily_candles("BTC", lookback_days=20)
             self.assertEqual(len(calls), 1)
-            pd.testing.assert_frame_equal(first, hl_trade_analytics.fetch_daily_candles("BTC", lookback_days=20))
+            pd.testing.assert_frame_equal(first, desk.hl.trade_analytics.fetch_daily_candles("BTC", lookback_days=20))
             self.assertEqual(len(calls), 1)
             self.assertEqual(first["time"].max(), today - pd.Timedelta(days=1))
-            self.assertLess(len(hl_trade_analytics.fetch_daily_candles("BTC", lookback_days=10)), len(first))
+            self.assertLess(len(desk.hl.trade_analytics.fetch_daily_candles("BTC", lookback_days=10)), len(first))
             self.assertEqual(len(calls), 1)
-            longer = hl_trade_analytics.fetch_daily_candles("BTC", lookback_days=40)
+            longer = desk.hl.trade_analytics.fetch_daily_candles("BTC", lookback_days=40)
             self.assertEqual(len(calls), 2)
             self.assertEqual(calls[-1]["req"]["startTime"] < calls[0]["req"]["startTime"], True)
             self.assertGreater(len(longer), len(first))
 
             calls.clear()
-            funding = hl_trade_analytics.fetch_funding_history("BTC", lookback_days=5)
+            funding = desk.hl.trade_analytics.fetch_funding_history("BTC", lookback_days=5)
             self.assertEqual(len(calls), 1)
-            again = hl_trade_analytics.fetch_funding_history("BTC", lookback_days=5)
+            again = desk.hl.trade_analytics.fetch_funding_history("BTC", lookback_days=5)
             self.assertEqual(len(calls), 1)
             self.assertEqual(len(again), len(funding))
             self.assertTrue(pd.api.types.is_datetime64_any_dtype(again["time"]))
@@ -1008,7 +1011,7 @@ class TradeAnalyticsTests(unittest.TestCase):
                 [{"px": "102", "sz": "5", "n": 1}],
             ]
         }
-        with patch("hl_trade_execution.post_info", return_value=book):
+        with patch("hl_trade.post_info", return_value=book):
             buy_price = post_only_price("BTC", "", "LONG", 3)
             sell_price = post_only_price("BTC", "", "SHORT", 3)
         self.assertLess(buy_price, 102)
@@ -1182,7 +1185,7 @@ class TradeAnalyticsTests(unittest.TestCase):
         ]
         plan = SimpleNamespace(coin="USUAL", dex="", side="SHORT", quantity=21449.7)
         market = Market("USUAL", "", 0.01, 0.01, 1, 3)
-        module = "hl_trade_execution"
+        module = "hl_trade"
         # A moving price forces a reprice on each check unless a test passes fixed prices.
         prices = prices or (0.01 + step * 1e-9 for step in itertools.count())
         with patch(f"{module}.post_only_price", side_effect=prices), \
@@ -1243,7 +1246,7 @@ class TradeAnalyticsTests(unittest.TestCase):
             self._run_entry([], failure, open_orders=resting)
 
     def test_failed_send_check_needs_no_order_no_new_fill_and_a_good_read(self):
-        import hl_trade_execution as execution
+        import hl_trade as execution
         plan = SimpleNamespace(coin="USUAL", dex="")
         stop = {"coin": "USUAL", "oid": 1, "reduceOnly": True}
         entry = {"coin": "USUAL", "oid": 2, "reduceOnly": False}
@@ -1266,11 +1269,11 @@ class TradeAnalyticsTests(unittest.TestCase):
         plan = SimpleNamespace(coin="USUAL", dex="", side="SHORT", quantity=100.0)
         market = Market("USUAL", "", 0.01, 0.01, 1, 3)
         reads = [
-            hl_trade_analytics.requests.Timeout("read failed"),
+            desk.hl.trade_analytics.requests.Timeout("read failed"),
             status("open", 100.0, 100.0),
             status("filled", 100.0, 0),
         ]
-        module = "hl_trade_execution"
+        module = "hl_trade"
         prices = (0.01 + step * 1e-9 for step in itertools.count())
         with patch(f"{module}.post_only_price", side_effect=prices), \
                 patch(f"{module}._current_position_quantity", return_value=0.0), \
@@ -1284,7 +1287,7 @@ class TradeAnalyticsTests(unittest.TestCase):
         status = self._order_status_response
         def prices():
             yield ValueError("no book")
-            yield hl_trade_analytics.requests.Timeout("slow")
+            yield desk.hl.trade_analytics.requests.Timeout("slow")
             while True:
                 yield 0.01
         source = prices()
@@ -1297,7 +1300,7 @@ class TradeAnalyticsTests(unittest.TestCase):
         exchange.order.return_value = {"response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}}
         plan = SimpleNamespace(coin="USUAL", dex="", side="SHORT", quantity=100.0)
         market = Market("USUAL", "", 0.01, 0.01, 1, 3)
-        module = "hl_trade_execution"
+        module = "hl_trade"
         with patch(f"{module}.post_only_price", side_effect=next_price), \
                 patch(f"{module}._current_position_quantity", return_value=0.0), \
                 patch(f"{module}.time.sleep"), \
@@ -1354,7 +1357,7 @@ class TradeAnalyticsTests(unittest.TestCase):
             {"universe": [{"name": "xyz:AAPL", "szDecimals": 2, "maxLeverage": 3}]},
             [{"markPx": "100", "oraclePx": "99"}],
         ]
-        with patch("hl_trade_execution.post_info", return_value=response):
+        with patch("hl_trade.post_info", return_value=response):
             markets = fetch_markets(["xyz"])
         self.assertIn("xyz:AAPL", markets)
         self.assertEqual(markets["xyz:AAPL"].dex, "xyz")
@@ -1367,8 +1370,8 @@ class TradeAnalyticsTests(unittest.TestCase):
         responses = [[default_order], [xyz_order]]
 
         with (
-            patch("hl_trade_execution.get_dexes", return_value=["", "xyz"]),
-            patch("hl_trade_execution.post_info", side_effect=responses) as post_info_mock,
+            patch("hl_trade.get_dexes", return_value=["", "xyz"]),
+            patch("hl_trade.post_info", side_effect=responses) as post_info_mock,
         ):
             orders = fetch_open_orders(wallet)
 
@@ -1480,11 +1483,11 @@ class TradeAnalyticsTests(unittest.TestCase):
         )
         with (
             patch(
-                "hl_trade_execution.fetch_daily_candles",
+                "hl_trade.fetch_daily_candles",
                 side_effect=[make_candles(), ValueError("ATR(14) requires more history")],
             ),
             patch(
-                "hl_trade_execution.fetch_funding_history",
+                "hl_trade.fetch_funding_history",
                 return_value=make_funding(),
             ),
         ):
@@ -1578,9 +1581,9 @@ class TradeAnalyticsTests(unittest.TestCase):
             ]
         }
         with (
-            patch("hl_trade_execution.fetch_user_state", return_value=state),
-            patch("hl_trade_execution.parse_fee_rates", return_value=(0.0001, 0.0004)),
-            patch("hl_trade_analytics.post_info", side_effect=[abstraction, balances]),
+            patch("hl_trade.fetch_user_state", return_value=state),
+            patch("hl_trade.parse_fee_rates", return_value=(0.0001, 0.0004)),
+            patch("desk.hl.trade_analytics.post_info", side_effect=[abstraction, balances]),
         ):
             return collect_snapshot([wallet], [""], {})
 
@@ -1597,7 +1600,7 @@ class TradeAnalyticsTests(unittest.TestCase):
 
     def test_unified_account_rejects_invalid_usdc_balance(self):
         responses = ["unifiedAccount", {"balances": [{"coin": "USDC", "total": "bad"}]}]
-        with patch("hl_trade_analytics.post_info", side_effect=responses):
+        with patch("desk.hl.trade_analytics.post_info", side_effect=responses):
             with self.assertRaises(ValueError):
                 fetch_collateral_equity("0x" + "1" * 40, 400)
 
@@ -1615,8 +1618,8 @@ class TradeAnalyticsTests(unittest.TestCase):
         )
         action = PositionAction("open_target", "BTC", "", "LONG")
         with (
-            patch("hl_trade_execution.fetch_daily_candles", return_value=make_candles()),
-            patch("hl_trade_execution.fetch_funding_history", return_value=make_funding()),
+            patch("hl_trade.fetch_daily_candles", return_value=make_candles()),
+            patch("hl_trade.fetch_funding_history", return_value=make_funding()),
         ):
             [plan] = plan_position_actions([action], {"BTC": market}, snapshot, [])
         self.assertFalse(plan.block_reason)
@@ -1651,13 +1654,13 @@ class TradeAnalyticsTests(unittest.TestCase):
         action = PositionAction("target", "BTC", "", "")
         add_action = PositionAction("adjust_margin", "BTC", "", "", margin_usd=1)
         with (
-            patch("hl_trade_execution.fetch_daily_candles", return_value=make_candles()),
-            patch("hl_trade_execution.fetch_funding_history", return_value=make_funding()),
+            patch("hl_trade.fetch_daily_candles", return_value=make_candles()),
+            patch("hl_trade.fetch_funding_history", return_value=make_funding()),
         ):
             [plan] = plan_position_actions([action], {"BTC": market}, snapshot, [])
         with (
-            patch("hl_trade_execution.fetch_daily_candles", return_value=make_candles()),
-            patch("hl_trade_execution.fetch_funding_history", return_value=make_funding()),
+            patch("hl_trade.fetch_daily_candles", return_value=make_candles()),
+            patch("hl_trade.fetch_funding_history", return_value=make_funding()),
         ):
             [add_plan] = plan_position_actions([add_action], {"BTC": market}, snapshot, [])
         self.assertFalse(plan.block_reason)
@@ -1692,8 +1695,8 @@ class TradeAnalyticsTests(unittest.TestCase):
         )
         action = PositionAction("adjust_margin", "BTC", "", "", margin_usd=-100)
         with (
-            patch("hl_trade_execution.fetch_daily_candles", return_value=make_candles()),
-            patch("hl_trade_execution.fetch_funding_history", return_value=make_funding()),
+            patch("hl_trade.fetch_daily_candles", return_value=make_candles()),
+            patch("hl_trade.fetch_funding_history", return_value=make_funding()),
         ):
             [plan] = plan_position_actions([action], {"BTC": market}, snapshot, [])
         self.assertFalse(plan.block_reason)
@@ -1730,8 +1733,8 @@ class TradeAnalyticsTests(unittest.TestCase):
         )
         action = PositionAction("close", "BTC", "", "")
         with (
-            patch("hl_trade_execution.fetch_daily_candles", return_value=make_candles()),
-            patch("hl_trade_execution.fetch_funding_history", return_value=make_funding()),
+            patch("hl_trade.fetch_daily_candles", return_value=make_candles()),
+            patch("hl_trade.fetch_funding_history", return_value=make_funding()),
         ):
             [plan] = plan_position_actions([action], {"BTC": market}, snapshot, [])
         self.assertIn("no open position", plan.block_reason)
@@ -1761,7 +1764,7 @@ class RestingEntryTests(unittest.TestCase):
         return SimpleNamespace(coin="BTC", dex="", side="LONG", quantity=1.0)
 
     def _run(self, states, prices):
-        import hl_trade_execution as execution
+        import hl_trade as execution
         clock = iter(range(0, 100_000, 10))
         with (
             patch.object(execution.time, "sleep"),
@@ -1785,7 +1788,7 @@ class RestingEntryTests(unittest.TestCase):
 
 class KillSwitchTests(unittest.TestCase):
     def setUp(self):
-        import hl_trade_execution as execution
+        import hl_trade as execution
         self.execution = execution
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -1949,7 +1952,7 @@ class PortfolioAssetSelectionTests(unittest.TestCase):
         import portfolio_analytics_implementation as portfolio
         with tempfile.TemporaryDirectory() as data_dir:
             analysis = portfolio.PortfolioAnalytics(data_dir, ["0x" + "1" * 40], assets=["TRX", "xyz:AAPL", "TRX"])
-            with patch.object(analysis, "_post_hyperliquid") as post:
+            with patch.object(analysis, "_post_hl") as post:
                 assets = analysis._wallet_assets()
         post.assert_not_called()
         self.assertEqual(assets, ["TRX", "xyz:AAPL"])
@@ -1958,14 +1961,14 @@ class PortfolioAssetSelectionTests(unittest.TestCase):
 
 class NetLossGuardTests(unittest.TestCase):
     def test_guard_finds_hip3_market_and_exits_on_net_loss(self):
-        import hl_trade_execution as execution
+        import hl_trade as execution
         plan = SimpleNamespace(coin="xyz:AAPL", dex="xyz", side="LONG", quantity=2.0, risk_budget=10.0)
         trade = SimpleNamespace(
             plan=plan, quantity=2.0, entry_price=350.0, baseline_quantity=0.0, stop_oid=1, target_oid=2,
             started_at=pd.Timestamp("2026-06-01", tz="UTC"),
         )
         exchange = MagicMock()
-        # Hyperliquid names HIP-3 markets with their DEX prefix already included.
+        # HL names HIP-3 markets with their DEX prefix already included.
         metadata = [{"universe": [{"name": "xyz:TSLA"}, {"name": "xyz:AAPL"}]}, [{"markPx": "400"}, {"markPx": "340"}]]
         trade.prior_funding_pnl, trade.exiting = 0.0, False
         calls = []
@@ -1996,7 +1999,7 @@ class NetLossGuardTests(unittest.TestCase):
         return execution.ActiveTrade(**values)
 
     def test_guard_keeps_running_through_failed_checks(self):
-        import hl_trade_execution as execution
+        import hl_trade as execution
         trade = self._trade(execution)
         outcomes = iter([requests.ConnectionError("refused"), RuntimeError("bad mark"), "", "ETH: stop filled."])
         def check(*args):
@@ -2019,7 +2022,7 @@ class NetLossGuardTests(unittest.TestCase):
         self.assertIn("ETH: stop filled.", text)
 
     def test_exiting_guard_retries_the_close_until_flat(self):
-        import hl_trade_execution as execution
+        import hl_trade as execution
         trade = self._trade(execution, exiting=True)
         exchange = MagicMock()
         with (
@@ -2033,13 +2036,13 @@ class NetLossGuardTests(unittest.TestCase):
         self.assertEqual(cancel.call_count, 2)
 
     def test_guard_net_pnl_counts_funding_before_the_guard_started(self):
-        import hl_trade_execution as execution
+        import hl_trade as execution
         trade = self._trade(execution, prior_funding_pnl=3.0)
         # Short 1 at 2,000 marked at 1,990: +10 price, +3 prior funding, no fees.
         self.assertAlmostEqual(execution._guard_net_pnl(trade, 1.0, 1_990.0, 0.0, 0.0, 0.0), 13.0)
 
     def test_reattach_builds_guards_from_live_stops(self):
-        import hl_trade_execution as execution
+        import hl_trade as execution
         market = execution.Market("ETH", "", 1_900.0, 1_900.0, 4, 25)
         def position(coin, quantity, entry):
             return execution.Position("w", coin, "", quantity, entry, 1_900.0, 1_900.0, 100.0, market, 3)

@@ -1,4 +1,7 @@
-"""Guarded Hyperliquid executor: dry-run by default, live requires local confirmation.
+"""Guarded HL executor: dry-run by default, live requires local confirmation.
+
+New risk is sized against desk equity and capped by desk-wide open risk, which includes
+every other account listed in accounts.json (such as IB).
 
 Signals use a ``coin,side,dex`` CSV; position actions use
 ``action,coin,side,dex,margin_usd``. Private keys are read from the local OS
@@ -23,7 +26,7 @@ import requests
 # The shared analytics module lives in the repository root, one level above this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from hl_trade_analytics import (
+from desk.hl.trade_analytics import (
     DEFAULT_HORIZON_DAYS,
     ExpectedPnl,
     adverse_funding_cost_per_unit,
@@ -38,12 +41,15 @@ from hl_trade_analytics import (
 
 KEYCHAIN_SERVICE = "Hyperliquid API wallet"
 BASE_URL = "https://api.hyperliquid.xyz"
-RESERVE_PCT = 0.20
-RISK_PCT_OF_USABLE_MARGIN = 0.05
-MAX_TOTAL_RISK_PCT = 0.20
-MAX_RISK_PCT_OVERRIDE_LIMIT = 50.0
-STOP_ATR_MULTIPLE = 1.25
-REWARD_RISK_RATIO = 1.0
+# Sizing rules are shared with every other venue's executor.
+from desk.risk import (  # noqa: E402
+    MAX_RISK_PCT_OVERRIDE_LIMIT,
+    MAX_TOTAL_RISK_PCT,
+    RESERVE_PCT,
+    REWARD_RISK_RATIO,
+    RISK_PCT_OF_USABLE_MARGIN,
+    STOP_ATR_MULTIPLE,
+)
 FUNDING_STRESS_PERCENTILE = 0.95
 MIN_ORDER_VALUE_USD = 10.0
 ENTRY_TIMEOUT_SECONDS = 5 * 60
@@ -104,6 +110,14 @@ class AccountSnapshot:
     maker_fee_rate: float
     taker_fee_rate: float
     risk_wallets: tuple[str, ...]
+    # Other desk venues (such as IB) that share the aggregate risk cap.
+    external_equity: float = 0.0
+    external_risk: float = 0.0
+
+    @property
+    def desk_equity(self) -> float:
+        """Equity that sets the risk budgets: these wallets plus other desk venues."""
+        return self.equity + self.external_equity
 
 
 @dataclass(frozen=True)
@@ -239,7 +253,7 @@ def get_dexes(signals: list[dict[str, str]]) -> list[str]:
             dexes.add(dex)
     response = post_info({"type": "perpDexs"})
     if not isinstance(response, list):
-        raise ValueError("Hyperliquid returned an invalid perp DEX list.")
+        raise ValueError("HL returned an invalid perp DEX list.")
     dexes.update(
         str(item["name"])
         for item in response
@@ -325,7 +339,7 @@ def fetch_open_orders(wallet: str, dexes: list[str] | None = None) -> list[dict[
 
 
 def parse_fee_rates(wallet: str) -> tuple[float, float]:
-    """Return the wallet's maker and taker fee rates from Hyperliquid."""
+    """Return the wallet's maker and taker fee rates from HL."""
     response = post_info({"type": "userFees", "user": wallet})
     if not isinstance(response, dict) or "userAddRate" not in response or "userCrossRate" not in response:
         raise ValueError(f"Could not read the maker/taker fee rates for wallet {wallet}.")
@@ -985,10 +999,14 @@ def plan_trades(
     signals: list[dict[str, str]],
     markets: dict[str, Market],
     snapshot: AccountSnapshot,
+    include_external: bool = True,
 ) -> tuple[list[PlannedTrade], float]:
-    """Build risk- and margin-limited entry plans and report current portfolio risk."""
+    """Build risk- and margin-limited entry plans and report current portfolio risk.
+
+    Current risk includes other desk venues unless ``include_external`` is False.
+    """
     caches: dict[tuple[str, str], tuple[pd.DataFrame, pd.DataFrame]] = {}
-    current_risk = 0.0
+    current_risk = snapshot.external_risk if include_external else 0.0
     for position in snapshot.positions:
         key = (position.coin, position.dex)
         if key not in caches:
@@ -1004,7 +1022,7 @@ def plan_trades(
             snapshot.maker_fee_rate,
         )
 
-    total_risk_cap = snapshot.equity * MAX_TOTAL_RISK_PCT
+    total_risk_cap = snapshot.desk_equity * MAX_TOTAL_RISK_PCT
     risk_headroom = total_risk_cap - current_risk
     available_margin = max(
         0.0,
@@ -1015,7 +1033,7 @@ def plan_trades(
         coin, dex = normalize_market(signal["coin"], signal.get("dex", ""))
         market = markets.get(coin)
         if market is None:
-            raise ValueError(f"Market {coin!r} was not returned by Hyperliquid metadata.")
+            raise ValueError(f"Market {coin!r} was not returned by HL metadata.")
         own_positions = [
             position
             for position in snapshot.positions
@@ -1039,7 +1057,7 @@ def plan_trades(
             market,
             candles,
             funding,
-            snapshot.equity,
+            snapshot.desk_equity,
             risk_headroom,
             available_margin,
             snapshot.maker_fee_rate,
@@ -1061,7 +1079,7 @@ def plan_position_actions(
     """Plan requested position changes within risk and margin limits."""
     candles_by_market: dict[tuple[str, str], pd.DataFrame] = {}
     funding_by_market: dict[tuple[str, str], pd.DataFrame] = {}
-    current_risk = 0.0
+    current_risk = snapshot.external_risk
     risk_by_position: dict[tuple[str, str, str], float] = {}
     for position in snapshot.positions:
         key = (position.coin, position.dex)
@@ -1078,8 +1096,8 @@ def plan_position_actions(
         risk_by_position[(position.wallet, position.coin, position.dex)] = risk
         current_risk += risk
 
-    total_risk_cap = snapshot.equity * MAX_TOTAL_RISK_PCT
-    per_position_cap = snapshot.equity * (1 - RESERVE_PCT) * RISK_PCT_OF_USABLE_MARGIN
+    total_risk_cap = snapshot.desk_equity * MAX_TOTAL_RISK_PCT
+    per_position_cap = snapshot.desk_equity * (1 - RESERVE_PCT) * RISK_PCT_OF_USABLE_MARGIN
     margin_available = max(
         0.0,
         snapshot.target_equity * (1 - RESERVE_PCT) - snapshot.target_margin_used,
@@ -1090,7 +1108,7 @@ def plan_position_actions(
     for request in actions:
         market = markets.get(request.coin)
         if market is None:
-            raise ValueError(f"Market {request.coin!r} was not returned by Hyperliquid metadata.")
+            raise ValueError(f"Market {request.coin!r} was not returned by HL metadata.")
         matches = [
             position
             for position in snapshot.positions
@@ -1220,7 +1238,7 @@ def plan_position_actions(
                 market,
                 candles,
                 funding,
-                snapshot.equity,
+                snapshot.desk_equity,
                 headroom_for_entry,
                 margin_for_entry,
                 snapshot.maker_fee_rate,
@@ -1785,7 +1803,7 @@ def store_key(wallet: str) -> None:
 
 
 def build_exchange(wallet_address: str, private_key: str, dexes: list[str]) -> Any:
-    """Create an authenticated Hyperliquid exchange client for the selected DEXes."""
+    """Create an authenticated HL exchange client for the selected DEXes."""
     try:
         from eth_account import Account
         from hyperliquid.exchange import Exchange
@@ -1825,17 +1843,21 @@ def print_plan(snapshot: AccountSnapshot, plans: list[PlannedTrade], current_ris
     """Display account limits, estimated existing risk, and proposed entry details."""
     print(f"Risk wallets: {len(snapshot.risk_wallets)}")
     print(f"Collateral equity: ${snapshot.equity:,.2f}")
+    if snapshot.external_equity or snapshot.external_risk:
+        print(f"Other desk venues: equity ${snapshot.external_equity:,.2f}, "
+              f"open risk ${snapshot.external_risk:,.2f}")
+        print(f"Desk equity (all venues): ${snapshot.desk_equity:,.2f}")
     print(f"Perp margin used: ${snapshot.margin_used:,.2f}")
     print(
         f"Execution-wallet margin available above its 20% reserve: "
         f"${max(0.0, snapshot.target_equity * (1 - RESERVE_PCT) - snapshot.target_margin_used):,.2f}"
     )
     print(f"Estimated current stop + 5-day adverse funding risk: ${current_risk:,.2f} "
-          f"({current_risk / snapshot.equity:.2%} of collateral equity)")
-    print(f"Aggregate stop-risk cap: ${snapshot.equity * MAX_TOTAL_RISK_PCT:,.2f} "
-          f"({MAX_TOTAL_RISK_PCT * 100:g}% of collateral equity)")
+          f"({current_risk / snapshot.desk_equity:.2%} of desk equity)")
+    print(f"Aggregate stop-risk cap: ${snapshot.desk_equity * MAX_TOTAL_RISK_PCT:,.2f} "
+          f"({MAX_TOTAL_RISK_PCT * 100:g}% of desk equity)")
     print(
-        f"Per-position risk budget: ${snapshot.equity * (1 - RESERVE_PCT) * RISK_PCT_OF_USABLE_MARGIN:,.2f} "
+        f"Per-position risk budget: ${snapshot.desk_equity * (1 - RESERVE_PCT) * RISK_PCT_OF_USABLE_MARGIN:,.2f} "
         f"(5% of the 80% usable-equity amount)"
     )
     print("Unified accounts use USDC collateral; other account modes use perp equity.")
@@ -2739,8 +2761,31 @@ def run_kill_switch(wallets: list[str], dexes: list[str]) -> bool:
         else:
             print(f"{wallet}: confirmed flat, no open orders.")
     if not clean:
-        print("ACT NOW: close what is listed above in the Hyperliquid app, or run the kill switch again.")
+        print("ACT NOW: close what is listed above in the HL app, or run the kill switch again.")
     return clean
+
+
+def attach_other_venues(snapshot: AccountSnapshot, args: argparse.Namespace) -> AccountSnapshot:
+    """Add other desk venues' equity and open risk (from accounts.json) to a snapshot.
+
+    A live run stops if a configured account cannot be read, because its risk would be
+    missing from the aggregate cap; ``--ignore-unreachable`` trades without it.
+    """
+    from dataclasses import replace
+
+    from desk.risk import other_venue_book, print_book
+
+    # Configured HL wallets missing from --risk-wallets still count toward the desk cap.
+    book = other_venue_book("hl", already_counted=snapshot.risk_wallets)
+    print_book(book)
+    if book.unreachable and args.live and not args.ignore_unreachable:
+        raise RuntimeError(
+            "a configured desk account could not be read, so its risk is unknown. "
+            "Fix the connection, or rerun with --ignore-unreachable to trade without it."
+        )
+    if book.unreachable:
+        print("WARNING: unreachable accounts are left out of desk equity and risk.")
+    return replace(snapshot, external_equity=book.equity_usd, external_risk=book.risk_usd)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2784,6 +2829,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--coins",
         help="With --reattach-guards: comma-separated markets to guard (default: all with a stop).",
+    )
+    parser.add_argument(
+        "--ignore-unreachable",
+        action="store_true",
+        help="Trade even if another desk account in accounts.json (such as IB) cannot be read; "
+        "its risk is then left out of the aggregate cap.",
     )
     parser.add_argument("--store-key", action="store_true", help="Prompt locally and store the API-wallet key in Keychain.")
     parser.add_argument("--live", action="store_true", help="Allow live orders after typing the confirmation phrase.")
@@ -2909,7 +2960,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             markets = fetch_markets(dexes)
             risk_wallets = read_target_wallets(args.wallet, args.risk_wallets)
-            snapshot = collect_snapshot(risk_wallets, dexes, markets)
+            snapshot = attach_other_venues(collect_snapshot(risk_wallets, dexes, markets), args)
             plans = plan_position_actions(
                 actions,
                 markets,
@@ -2930,7 +2981,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("Confirmation did not match; no order was sent.")
                 return 0
             fresh_markets = fetch_markets(dexes)
-            fresh_snapshot = collect_snapshot(risk_wallets, dexes, fresh_markets)
+            fresh_snapshot = attach_other_venues(collect_snapshot(risk_wallets, dexes, fresh_markets), args)
             fresh_plans = plan_position_actions(
                 actions,
                 fresh_markets,
@@ -2964,7 +3015,7 @@ def main(argv: list[str] | None = None) -> int:
         dexes = get_dexes(signals)
         markets = fetch_markets(dexes)
         risk_wallets = read_target_wallets(args.wallet, args.risk_wallets)
-        snapshot = collect_snapshot(risk_wallets, dexes, markets)
+        snapshot = attach_other_venues(collect_snapshot(risk_wallets, dexes, markets), args)
         plans, current_risk = plan_trades(signals, markets, snapshot)
         print_plan(snapshot, plans, current_risk)
         if not args.live:
@@ -2978,7 +3029,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Confirmation did not match; no order was sent.")
             return 0
         fresh_markets = fetch_markets(dexes)
-        fresh_snapshot = collect_snapshot(risk_wallets, dexes, fresh_markets)
+        fresh_snapshot = attach_other_venues(collect_snapshot(risk_wallets, dexes, fresh_markets), args)
         fresh_plans, fresh_current_risk = plan_trades(signals, fresh_markets, fresh_snapshot)
         print("Refreshed preflight immediately before live submission:")
         print_plan(fresh_snapshot, fresh_plans, fresh_current_risk)

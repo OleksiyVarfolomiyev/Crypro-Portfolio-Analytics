@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
-from hl_trade_analytics import expected_forward_return, fetch_funding_history, post_info
+from desk.hl.trade_analytics import expected_forward_return, fetch_funding_history, post_info
 from factor_model import (
     alpha_verdict,
     btc_momentum_factor,
@@ -23,7 +23,7 @@ from factor_model import (
     split_in_half,
 )
 from portfolio_risk import calculate_portfolio_risk_metrics
-from hl_market_research import asset_class
+from desk.hl.market_research import asset_class
 from IPython.display import display
 
 
@@ -51,7 +51,7 @@ class _TableStyleMixin:
 # ----------------------------------------------------------------------------
 #
 # Dashboard call: `analysis.refresh_market_data()`. Discovers live perp positions and spot
-# balances. Perp USD prices come from Hyperliquid daily candles, including namespaced HIP-3
+# balances. Perp USD prices come from HL daily candles, including namespaced HIP-3
 # markets; CoinGecko provides prices and market-cap/volume history for supported assets.
 # Spot-only assets without a unique CoinGecko mapping and assets without 30 common daily
 # returns against BTC are reported and skipped.
@@ -61,7 +61,7 @@ def _coingecko_daily_series(points, column):
     """Convert CoinGecko points to daily values dated by the day they close.
 
     A point at exactly 00:00 UTC is the previous day's close, so it takes that date;
-    this matches Hyperliquid candles, which are dated by the day they cover.
+    this matches HL candles, which are dated by the day they cover.
     """
     if not points:
         return pd.Series(dtype=float, name=column)
@@ -75,25 +75,25 @@ def _coingecko_daily_series(points, column):
 
 
 class _MarketDataMixin:
-    def _post_hyperliquid(self, payload):
+    def _post_hl(self, payload):
         try:
             response = requests.post('https://api.hyperliquid.xyz/info', json=payload, timeout=30)
         except requests.RequestException as exc:
             raise RuntimeError(
-                f'Hyperliquid market-data request failed ({type(exc).__name__}).'
+                f'HL market-data request failed ({type(exc).__name__}).'
             ) from exc
         if not response.ok:
             raise RuntimeError(
-                f'Hyperliquid market-data request failed (HTTP {response.status_code}).'
+                f'HL market-data request failed (HTTP {response.status_code}).'
             )
         try:
             return response.json()
         except ValueError as exc:
-            raise RuntimeError('Hyperliquid returned invalid JSON for a market-data request.') from exc
+            raise RuntimeError('HL returned invalid JSON for a market-data request.') from exc
 
     def _wallet_assets(self):
         def post_info(payload):
-            return self._post_hyperliquid(payload)
+            return self._post_hl(payload)
 
         self.perp_asset_dex = {}
         self.spot_wallet_assets = []
@@ -107,14 +107,14 @@ class _MarketDataMixin:
 
         dexes = post_info({'type': 'perpDexs'})
         if not isinstance(dexes, list):
-            raise ValueError('Hyperliquid returned an invalid perp DEX list.')
+            raise ValueError('HL returned an invalid perp DEX list.')
         dex_names = [''] + [dex['name'] for dex in dexes if dex and dex.get('name')]
         assets = []
         for wallet in self.wallet_addresses:
             for dex in dex_names:
                 state = post_info({'type': 'clearinghouseState', 'user': wallet, 'dex': dex})
                 if not isinstance(state, dict):
-                    raise ValueError(f'Hyperliquid returned invalid perp state for wallet {wallet}.')
+                    raise ValueError(f'HL returned invalid perp state for wallet {wallet}.')
                 for item in state.get('assetPositions', []):
                     position = item.get('position', {})
                     try:
@@ -128,13 +128,13 @@ class _MarketDataMixin:
                     if size != 0 and ticker:
                         previous_dex = self.perp_asset_dex.get(ticker)
                         if previous_dex is not None and previous_dex != dex:
-                            raise ValueError(f'Hyperliquid returned ambiguous DEX mappings for {ticker}.')
+                            raise ValueError(f'HL returned ambiguous DEX mappings for {ticker}.')
                         self.perp_asset_dex[ticker] = dex
                         if ticker not in assets:
                             assets.append(ticker)
             spot_state = post_info({'type': 'spotClearinghouseState', 'user': wallet})
             if not isinstance(spot_state, dict):
-                raise ValueError(f'Hyperliquid returned invalid spot state for wallet {wallet}.')
+                raise ValueError(f'HL returned invalid spot state for wallet {wallet}.')
             for balance in spot_state.get('balances', []):
                 try:
                     amount = float(balance.get('total') or 0)
@@ -217,7 +217,7 @@ class _MarketDataMixin:
         if not isinstance(listing, list):
             raise ValueError('CoinGecko returned an invalid public coin list.')
         known_ids = {
-            'BTC': 'bitcoin', 'VVV': 'venice-token', 'HYPE': 'hyperliquid',
+            'BTC': 'bitcoin', 'VVV': 'venice-token', 'HYPE': 'hl',
             'USDC': 'usd-coin', 'USDT': 'tether', 'DAI': 'dai',
             'USDE': 'ethena-usde', 'USDH': 'hyperliquid-usd',
         }
@@ -228,7 +228,7 @@ class _MarketDataMixin:
         coin_ids, unresolved = {}, []
         for ticker in assets:
             if ':' in ticker:
-                unresolved.append(f'{ticker} (Hyperliquid DEX symbol)')
+                unresolved.append(f'{ticker} (HL DEX symbol)')
                 continue
             if ticker in known_ids:
                 coin_ids[ticker] = known_ids[ticker]
@@ -253,7 +253,7 @@ class _MarketDataMixin:
             if ticker in coin_ids or ticker in self.perp_asset_dex
         ]
         if not self.assets:
-            raise ValueError('No wallet assets have either a CoinGecko mapping or a Hyperliquid perp market.')
+            raise ValueError('No wallet assets have either a CoinGecko mapping or a HL perp market.')
         warnings = []
         unsupported = [ticker for ticker in unresolved if ticker.split(' (',1)[0] not in self.perp_asset_dex]
         if unsupported:
@@ -265,7 +265,7 @@ class _MarketDataMixin:
         ]
         if perp_without_coingecko:
             warnings.append(
-                'Using Hyperliquid candles for perp asset(s) without a CoinGecko mapping: '
+                'Using HL candles for perp asset(s) without a CoinGecko mapping: '
                 f'{", ".join(perp_without_coingecko)}.'
             )
         api_base = 'https://api.coingecko.com/api/v3'
@@ -343,7 +343,7 @@ class _MarketDataMixin:
             if not isinstance(data, dict) or 'prices' not in data:
                 raise ValueError(f'{ticker}: CoinGecko response did not contain prices.')
             fetched=_coingecko_daily_series(data['prices'],ticker)
-            # Perps use Hyperliquid candles only, so one venue sets their closes and dates.
+            # Perps use HL candles only, so one venue sets their closes and dates.
             if ticker in self.perp_asset_dex:
                 updated[ticker]=0
             elif not fetched.empty:
@@ -376,9 +376,9 @@ class _MarketDataMixin:
             }
             if dex:
                 payload['dex']=dex
-            candles = self._post_hyperliquid(payload)
+            candles = self._post_hl(payload)
             if not isinstance(candles, list):
-                raise ValueError(f'Hyperliquid returned invalid daily candles for {ticker}.')
+                raise ValueError(f'HL returned invalid daily candles for {ticker}.')
             candle_frame = pd.DataFrame(candles)
             if not candle_frame.empty and {'t','c'}.issubset(candle_frame.columns):
                 candle_frame['date'] = pd.to_datetime(
@@ -393,9 +393,9 @@ class _MarketDataMixin:
                 candle_series = pd.Series(dtype=float)
             if candle_series.empty:
                 if ticker not in coin_ids or ticker not in prices or prices[ticker].notna().sum()==0:
-                    warnings.append(f'{ticker}: no usable Hyperliquid candles or CoinGecko price history.')
+                    warnings.append(f'{ticker}: no usable HL candles or CoinGecko price history.')
                 else:
-                    warnings.append(f'{ticker}: no usable Hyperliquid candles; using CoinGecko prices.')
+                    warnings.append(f'{ticker}: no usable HL candles; using CoinGecko prices.')
                 continue
             prices = prices.reindex(prices.index.union(candle_series.index)).sort_index()
             prices.loc[candle_series.index,ticker] = candle_series
@@ -800,8 +800,8 @@ class _PerformanceMixin(_TableStyleMixin):
 # ----------------------------------------------------------------------------
 #
 # Dashboard calls: `analysis.fit_factor_model()` and `analysis.test_alpha_out_of_sample()`.
-# Fit excess returns against BTC, BTC momentum, BTC realized volatility, a Hyperliquid funding
-# spread, and available CoinGecko cross-sectional factors; Hyperliquid-only assets remain in the
+# Fit excess returns against BTC, BTC momentum, BTC realized volatility, a HL funding
+# spread, and available CoinGecko cross-sectional factors; HL-only assets remain in the
 # modeled portfolio but are excluded from factors that require CoinGecko market-cap or volume
 # history.
 

@@ -1,4 +1,4 @@
-'Reusable Hyperliquid account analytics and ' \
+'Reusable HL account analytics and ' \
     'interactive reporting.'
 from __future__ import annotations
 import html
@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
-from hl_trade_analytics import (
+from desk.hl.trade_analytics import (
     bootstrap_btc_regression,
     bootstrap_var,
     position_book_beta,
@@ -38,7 +38,7 @@ from hl_trade_analytics import (
     time_weighted_index,
     visible_month_starts,
 )
-from hl_highlights import (
+from desk.hl.highlights import (
     STATE_FILE_NAME,
     build_highlights,
     load_state,
@@ -165,7 +165,7 @@ undefined, {{numeric:true, sensitivity:'base'}});
 
 
 def post(payload):
-    """Send one request to Hyperliquid's public info endpoint, retrying rate limits."""
+    """Send one request to HL's public info endpoint, retrying rate limits."""
     transport_failures = 0
     rate_limit_retries = 0
     while True:
@@ -339,7 +339,7 @@ def merge_portfolio_history(saved, fresh):
 
 
 def update_portfolio_history(user, data_dir):
-    """Merge new Hyperliquid value and PnL points into the wallet's saved history file."""
+    """Merge new HL value and PnL points into the wallet's saved history file."""
     path = Path(data_dir) / f'hl_portfolio_history_{user.lower()}.csv'
     saved = pd.DataFrame(columns=PORTFOLIO_HISTORY_COLUMNS)
     if path.exists():
@@ -410,7 +410,7 @@ def fetch_pnl_windows(user):
 
 def fetch_perp_states(user):
     'Fetch the clearinghouse state from main ' \
-        'Hyperliquid and every listed perp DEX.'
+        'HL and every listed perp DEX.'
     dexes = post({'type': 'perpDexs'})
     names = [''] + [dex['name'] for dex in dexes if dex and dex.get('name')]
     return {dex: post({'type': 'clearinghouseState', 'user': user, 'dex': dex}) for dex in names}
@@ -618,7 +618,7 @@ def fetch_btc_day_closes(start, end, timezone=ACCOUNTING_TIMEZONE):
     """Return BTC's last hourly close in each local day, matching how account days close.
 
     Hourly candles are indexed just before their close time, so the 23:00 candle closes
-    the day it belongs to. Hyperliquid keeps about 5,000 recent candles, so days
+    the day it belongs to. HL keeps about 5,000 recent candles, so days
     older than roughly 200 days come back missing.
     """
     start_ms, end_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
@@ -1207,15 +1207,15 @@ def fetch_market_contexts(dexes):
             payload['dex'] = dex
         response = post(payload)
         if not isinstance(response, (list, tuple)) or len(response) != 2:
-            raise ValueError(f"Unexpected metaAndAssetCtxs response for DEX {dex or 'Hyperliquid'}")
+            raise ValueError(f"Unexpected metaAndAssetCtxs response for DEX {dex or 'HL'}")
         metadata, asset_contexts = response
         universe = metadata.get('universe', [])
         if len(universe) != len(asset_contexts):
             raise ValueError(
                 f'Mismatched market metadata and asset contexts for DEX '
-                f'{dex or "Hyperliquid"}'
+                f'{dex or "HL"}'
             )
-        dex_name = dex or 'Hyperliquid'
+        dex_name = dex or 'HL'
         for asset, context in zip(universe, asset_contexts):
             coin = asset.get('name')
             if coin:
@@ -1306,7 +1306,7 @@ def fetch_position_rows(user=None, fills=None, fills_complete=False, states=None
         size = as_float(position.get('szi'))
         value = as_float(position.get('positionValue'))
         implied_mark = abs(value) / abs(size) if size else 0.0
-        dex_name = dex or 'Hyperliquid'
+        dex_name = dex or 'HL'
         market_context = market_contexts.get((dex_name, position['coin']), {})
         mark = as_float(market_context.get('markPx'), default=implied_mark)
         oracle = as_float(market_context.get('oraclePx'), default=mark)
@@ -1994,7 +1994,7 @@ def print_realized_stats(frame, label, funding_history=None, account_value=float
 
 def perp_pnl_breakdown(perp_fills, funding_history=None):
     """Break perp net PnL into gross trading, fee cost, and funding contributions.
-    Hyperliquid reports fill fees as positive amounts, and normalize_fills has
+    HL reports fill fees as positive amounts, and normalize_fills has
     already subtracted USDC fees from closedPnl. Therefore gross trading PnL is
     closedPnl plus fees.
     Dollar reconciliation is only valid when all reported perp fees are USDC.
@@ -2225,7 +2225,7 @@ class _VolumeSummaryMixin:
             blank_missing_cells=volume_total_blank_cells(volume_pnl_summary))
         print('Volume is one-sided fill notional (price ? ' \
             'size), counted once per fill. Realized PnL is' \
-            ' Hyperliquid closedPnl less USDC ' \
+            ' HL closedPnl less USDC ' \
             'trading fees; funding is excluded.')
         print('Correlation describes co-movement, not ' \
             'causation. Daily observations with no fills ' \
@@ -2242,7 +2242,7 @@ class _VolumeSummaryMixin:
 
 
 def fetch_non_perp_pnl(wallets):
-    """Return Hyperliquid's all-time PnL outside perps, across the given wallets."""
+    """Return HL's all-time PnL outside perps, across the given wallets."""
     total = 0.0
     for wallet in wallets:
         periods = _fetch_portfolio_periods(wallet)
@@ -2396,8 +2396,8 @@ class _PnLAttributionMixin:
                 the dollar contributions.")
         print('Scope: available realized fills (API cap: ' \
             '10,000) + saved perp funding + current open ' \
-            'perp uPnL. The Spot table\'s Other row is Hyperliquid\'s non-perp PnL less spot ' \
-            'fill PnL, so the net matches Hyperliquid\'s total to within small timing differences.')
+            'perp uPnL. The Spot table\'s Other row is HL\'s non-perp PnL less spot ' \
+            'fill PnL, so the net matches HL\'s total to within small timing differences.')
 
 
 # ----------------------------------------------------------------------------
@@ -2523,7 +2523,7 @@ class _AnalyticsCore:
             self._positions_loaded = True
         return self.positions
 
-class HyperliquidAnalytics(
+class HLAnalytics(
     _HighlightsMixin, _AccountPnLMixin, _AccountChartsMixin, _AccountVsBTCMixin,
     _VolumeChartMixin, _OpenPositionsMixin, _RealizedPnLMixin,
     _VolumeSummaryMixin, _ExecutionQualityMixin, _PnLAttributionMixin, _AnalyticsCore,

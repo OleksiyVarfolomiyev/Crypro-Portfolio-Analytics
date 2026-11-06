@@ -1,7 +1,7 @@
-"""Rank Hyperliquid markets using the same definitions as the app's market selector.
+"""Rank HL markets using the same definitions as the app's market selector.
 
 The views mirror the Crypto, Tradfi, HIP-3, and Trending tabs. Formulas and filters
-follow the app's public code as checked on 2026-11-03; Hyperliquid can change them.
+follow the app's public code as checked on 2026-11-03; HL can change them.
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from hl_trade_analytics import post_info
+from desk.hl.trade_analytics import post_info
 
 TOP_N = 20
 TRADFI_CATEGORIES = {"stocks", "indices", "commodities", "fx", "preipo", "rates"}
@@ -118,7 +118,7 @@ def rank_markets(markets: pd.DataFrame, metric: str, top: bool, count: int = TOP
 
 def show_market_research(view: str) -> None:
     """Display the top and bottom tables for one market view."""
-    from hl_account_analytics_implementation import display_interactive_table
+    from desk.hl.account_analytics import display_interactive_table
 
     markets = fetch_perp_markets()
     if view == "trending":
@@ -150,7 +150,7 @@ def show_market_research(view: str) -> None:
     if view == "trending":
         print(f"Trending lists the biggest loser and three biggest gainers with over "
               f"${TRENDING_MIN_VOLUME:,.0f} 24h volume. The ranked tables below use that same pool.")
-        show("HYPERLIQUID TRENDING", trending_markets(markets))
+        show("HL TRENDING", trending_markets(markets))
     for title, metric, top in (
         (f"TOP {TOP_N} BY 24H CHANGE", CHANGE, True),
         (f"BOTTOM {TOP_N} BY 24H CHANGE", CHANGE, False),

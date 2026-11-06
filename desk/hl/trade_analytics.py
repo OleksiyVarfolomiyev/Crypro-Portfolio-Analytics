@@ -1,4 +1,4 @@
-"""Shared price, funding, risk, and expected-value calculations for Hyperliquid."""
+"""Shared price, funding, risk, and expected-value calculations for HL."""
 
 from __future__ import annotations
 
@@ -21,7 +21,8 @@ MAX_RATE_LIMIT_RETRIES = 4
 DEFAULT_HORIZON_DAYS = 5
 FUNDING_INTERVAL_HOURS = 1
 # Completed candles and past funding never change, so each is downloaded only once.
-CACHE_DIR = None if os.environ.get("HL_DISABLE_CACHE") else Path(__file__).resolve().parent / "data" / "api_cache"
+# The cache lives in the repository's data folder, two levels above this package module.
+CACHE_DIR = None if os.environ.get("HL_DISABLE_CACHE") else Path(__file__).resolve().parents[2] / "data" / "api_cache"
 # A full 500-row funding page costs about 45 of the API's 1,200 weight per minute.
 FULL_PAGE_PAUSE_SECONDS = 2.5
 FUNDING_TIMESTAMP_TOLERANCE = pd.Timedelta(seconds=2)
@@ -51,7 +52,7 @@ def _rate_limit_delay(response: requests.Response, retry_number: int) -> float:
 
 
 def post_info(payload: dict[str, Any], timeout: float = 30) -> Any:
-    """Send a request to Hyperliquid's public info endpoint.
+    """Send a request to HL's public info endpoint.
 
     Rate-limit responses are retried with backoff. Transport errors, other
     unsuccessful HTTP responses, and invalid JSON are reported as exceptions.
@@ -60,17 +61,17 @@ def post_info(payload: dict[str, Any], timeout: float = 30) -> Any:
         try:
             response = requests.post(INFO_URL, json=payload, timeout=timeout)
         except requests.RequestException as exc:
-            raise RuntimeError(f"Hyperliquid info request failed ({type(exc).__name__}).") from exc
+            raise RuntimeError(f"HL info request failed ({type(exc).__name__}).") from exc
         if response.status_code == 429 and attempt < MAX_RATE_LIMIT_RETRIES:
             time.sleep(_rate_limit_delay(response, attempt + 1))
             continue
         if not response.ok:
-            raise RuntimeError(f"Hyperliquid info request failed (HTTP {response.status_code}).")
+            raise RuntimeError(f"HL info request failed (HTTP {response.status_code}).")
         break
     try:
         return response.json()
     except ValueError as exc:
-        raise RuntimeError("Hyperliquid returned invalid JSON for an info request.") from exc
+        raise RuntimeError("HL returned invalid JSON for an info request.") from exc
 
 
 def normalize_market_symbol(coin: str, dex: str = "") -> tuple[str, str]:
@@ -208,7 +209,7 @@ def _download_daily_candles(
         payload["dex"] = dex
     response = post_info(payload)
     if not isinstance(response, list):
-        raise ValueError(f"Hyperliquid returned invalid daily candles for {coin}.")
+        raise ValueError(f"HL returned invalid daily candles for {coin}.")
     frame = pd.DataFrame(response)
     required = {"t", "o", "h", "l", "c"}
     if frame.empty and allow_empty:
@@ -337,7 +338,7 @@ def _download_funding(
             payload["dex"] = dex
         batch = post_info(payload)
         if not isinstance(batch, list):
-            raise ValueError(f"Hyperliquid returned invalid funding history for {coin}.")
+            raise ValueError(f"HL returned invalid funding history for {coin}.")
         if not batch:
             break
         rows.extend(batch)
@@ -586,7 +587,7 @@ def fetch_collateral_equity(wallet: str, perp_equity: float) -> float:
 def apply_fill_fees(fills: pd.DataFrame) -> pd.DataFrame:
     """Make ``closedPnl`` net of USDC fees and keep the exchange value as ``grossPnl``.
 
-    Hyperliquid reports ``closedPnl`` before fees, on opening and closing fills
+    HL reports ``closedPnl`` before fees, on opening and closing fills
     alike. Fees paid in other tokens cannot be valued here and are not subtracted.
     """
     fills = fills.copy()
@@ -968,7 +969,7 @@ def implied_unrealized_history(
 ) -> pd.Series:
     """Estimate end-of-day perp unrealized PnL from cumulative account PnL.
 
-    Hyperliquid's cumulative PnL includes open positions, so subtracting the
+    HL's cumulative PnL includes open positions, so subtracting the
     fee-net fill PnL and funding realized by each timestamp leaves unrealized
     PnL. Values are only as frequent as ``pnl_history``, whose older points
     can be days apart.

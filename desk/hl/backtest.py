@@ -1,4 +1,4 @@
-"""Historical ATR-stop backtest for Hyperliquid perpetual signals.
+"""Historical ATR-stop backtest for HL perpetual signals.
 
 Run with an input CSV containing ``coin`` and ``side`` columns. The backtest
 does not sign requests or submit orders.
@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from hl_trade_analytics import (
+from desk.hl.trade_analytics import (
     DEFAULT_HORIZON_DAYS,
     adverse_funding_cost_per_unit,
     fetch_daily_candles,

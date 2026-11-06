@@ -1,4 +1,4 @@
-"""Consolidated Hyperliquid analytics implementation.
+"""Consolidated HL analytics implementation.
 
 Methods used by `hl_multi_account_analytics.ipynb`. It reuses the single-wallet
 implementation and combines data from each configured wallet.
@@ -9,10 +9,10 @@ from types import SimpleNamespace
 import pandas as pd
 import re
 
-from hl_account_analytics_implementation import (
+from desk.hl.account_analytics import (
     ACCOUNTING_TIMEZONE,
     HISTORY_COLUMNS,
-    HyperliquidAnalytics,
+    HLAnalytics,
     _ExecutionQualityMixin,
     _HighlightsMixin,
     _OpenPositionsMixin,
@@ -47,7 +47,7 @@ from hl_account_analytics_implementation import (
 # combined live snapshot and realized/funding history.
 
 
-from hl_trade_analytics import time_weighted_index
+from desk.hl.trade_analytics import time_weighted_index
 
 
 def _combine_wallet_data(wallet_analytics):
@@ -180,7 +180,7 @@ class _MultiWalletDataMixin:
     def fetch_data(self):
         self.wallet_analytics={}
         for wallet in self.wallet_addresses:
-            account=HyperliquidAnalytics(wallet,self.data_dir)
+            account=HLAnalytics(wallet,self.data_dir)
             account.fetch_data()
             self.wallet_analytics[wallet]=account
         self.data=_combine_wallet_data(self.wallet_analytics)
@@ -339,8 +339,8 @@ class _MultiWalletAttributionMixin:
             return
         display_pnl_attribution_tables(tables,'CONSOLIDATED PNL ATTRIBUTION')
         print(f'Net attributed PnL across wallets: ${net_pnl:,.2f}. '
-              "The Spot table's Other row is Hyperliquid's non-perp PnL less spot fill PnL, so the "
-              "net matches Hyperliquid's total to within small timing differences.")
+              "The Spot table's Other row is HL's non-perp PnL less spot fill PnL, so the "
+              "net matches HL's total to within small timing differences.")
 
 
 # ----------------------------------------------------------------------------
