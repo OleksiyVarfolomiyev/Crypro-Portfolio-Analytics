@@ -236,6 +236,46 @@ def read_signals(path: Path) -> list[dict[str, str]]:
     return rows
 
 
+def backtest_highlights(trades: pd.DataFrame, skipped: list[dict] | None = None,
+                        starting_equity: float = 10_000.0) -> tuple[list, list]:
+    """What stands out in a backtest: per-signal results, costs, exit mix and skipped entries."""
+    well, attention = [], []
+    if trades.empty:
+        return well, [("Trades", "No trades were generated.")]
+    total = float(trades["net_pnl"].sum())
+    wins = (trades["net_pnl"] > 0).mean()
+    gains, losses = trades.loc[trades["net_pnl"] > 0, "net_pnl"].sum(), -trades.loc[trades["net_pnl"] < 0, "net_pnl"].sum()
+    factor = gains / losses if losses > 0 else float("inf")
+    text = (f"{len(trades)} trades, net {total:+,.2f} ({total / starting_equity:+.1%} of {starting_equity:,.0f} "
+            f"starting equity), win rate {wins:.0%}, profit factor {factor:.2f}.")
+    (well if total > 0 else attention).append(("Overall", text))
+    by_signal = trades.groupby(["coin", "side"])["net_pnl"].agg(["sum", "count", lambda v: (v > 0).mean()])
+    by_signal.columns = ["net", "trades", "win_rate"]
+    if len(by_signal) > 1:
+        best, worst = by_signal["net"].idxmax(), by_signal["net"].idxmin()
+        well.append(("Best signal", f"{best[0]} {best[1].lower()}: {by_signal.loc[best, 'net']:+,.2f} over "
+                                    f"{by_signal.loc[best, 'trades']:.0f} trades."))
+        if by_signal.loc[worst, "net"] < 0:
+            attention.append(("Worst signal", f"{worst[0]} {worst[1].lower()}: {by_signal.loc[worst, 'net']:+,.2f} over "
+                                              f"{by_signal.loc[worst, 'trades']:.0f} trades."))
+    weak = by_signal[(by_signal["win_rate"] < 0.4) & (by_signal["trades"] >= 5)]
+    if len(weak):
+        attention.append(("Low win rate", ", ".join(f"{coin} {side.lower()} {row.win_rate:.0%}"
+                                                     for (coin, side), row in weak.iterrows()) + "."))
+    price, funding, fees = (float(trades[column].sum()) for column in ("price_pnl", "funding_pnl", "fees"))
+    text = f"Price {price:+,.2f}, funding {funding:+,.2f}, fees {-fees:+,.2f}."
+    (attention if fees > abs(price) * 0.5 or funding < -abs(price) * 0.5 else well).append(("PnL sources", text))
+    exits = trades["exit_reason"].value_counts(normalize=True)
+    well.append(("Exits", ", ".join(f"{reason} {share:.0%}" for reason, share in exits.items()) + "."))
+    worst_trade = trades.loc[trades["net_pnl"].idxmin()]
+    attention.append(("Worst trade", f"{worst_trade['coin']} {worst_trade['side'].lower()} entered "
+                                     f"{str(worst_trade['entry_time'])[:10]}: {worst_trade['net_pnl']:+,.2f} "
+                                     f"({worst_trade['exit_reason']})."))
+    if skipped:
+        attention.append(("Skipped entries", f"{len(skipped)} entries skipped; see the table below."))
+    return well, attention
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--signals", type=Path, required=True, help="CSV file with coin,side,dex columns.")

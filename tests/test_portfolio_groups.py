@@ -380,24 +380,35 @@ class PortfolioHighlightsTests(unittest.TestCase):
         analysis.factor_premia = pd.DataFrame({"FM t-stat": [-1.9, 0.3], "Sort t-stat": [-1.8, 0.1]},
                                               index=["Funding (7d)", "Momentum (30d)"])
         shown = []
-        with patch.object(portfolio, "display", side_effect=lambda frame: shown.append(frame.data)), \
-                redirect_stdout(io.StringIO()) as first:
+        capture = lambda well, attention, since: shown.append((well, attention, since))
+        with patch.object(portfolio, "show_highlight_block", side_effect=capture), redirect_stdout(io.StringIO()):
             analysis.show_highlights()
-        text = " ".join(" ".join(frame["Highlight"]) for frame in shown)
+        well, attention, since = shown[-1]
+        text = " ".join(highlight for _, highlight in well + attention)
         self.assertIn("1 TradFi vs SPY", text)
         self.assertIn("NEW (40d)", text)
         self.assertIn("strongest is Funding (7d)", text)
-        self.assertIn("No earlier run saved yet", first.getvalue())
+        self.assertIsNone(since.last_run)
         # A second run reports what moved.
         analysis.performance_metrics.loc[0, "Beta (BTC)"] = 0.6
         analysis.all_assets = ["ETH", "NVDA"]
-        shown.clear()
-        with patch.object(portfolio, "display", side_effect=lambda frame: shown.append(frame.data)), \
-                patch.object(analysis, "show_table") as table, redirect_stdout(io.StringIO()):
+        with patch.object(portfolio, "show_highlight_block", side_effect=capture), redirect_stdout(io.StringIO()):
             analysis.show_highlights()
-        changes = table.call_args[0][0]
-        self.assertAlmostEqual(changes.loc["Kelly beta (btc)", "Change"], 0.2)
-        self.assertIn("Dropped: NEW", " ".join(" ".join(frame["Highlight"]) for frame in shown))
+        well, attention, since = shown[-1]
+        changes = {name: delta for name, _, _, delta in since.changes}
+        self.assertEqual(changes["Kelly beta (btc)"], "+0.200")
+        self.assertIn("Dropped: NEW", " ".join(highlight for _, highlight in well))
+
+    def test_highlights_fill_the_panel_reserved_at_the_top(self):
+        from unittest.mock import MagicMock
+
+        analysis = portfolio.PortfolioAnalytics(tempfile.mkdtemp(), ["0x" + "1" * 40], assets=["ETH"])
+        analysis.all_assets, analysis.assets = ["ETH"], ["ETH"]
+        analysis.asset_group = {"ETH": portfolio.CRYPTO}
+        analysis.short_history_assets = pd.Series(dtype=int)
+        analysis._highlights_panel = MagicMock()
+        analysis.show_highlights()
+        analysis._highlights_panel.show.assert_called_once()
 
 
 class StyleResultKeyTests(unittest.TestCase):

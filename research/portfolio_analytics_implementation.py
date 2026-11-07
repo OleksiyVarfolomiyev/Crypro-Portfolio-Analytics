@@ -44,6 +44,8 @@ from desk.hl.market_research import asset_class
 from desk.hl.trade_analytics import bootstrap_btc_regression
 from desk.accounts import Account, accounts_for, ib_data_dir, load_accounts
 from IPython.display import display
+from desk.notebook_highlights import HighlightsPanel, SinceLastRun
+from desk.notebook_highlights import show as show_highlight_block
 
 CRYPTO, TRADFI = 'Crypto', 'TradFi'
 BENCHMARKS = {CRYPTO: 'BTC', TRADFI: 'SPY'}
@@ -2079,8 +2081,14 @@ class _HighlightsMixin(_TableStyleMixin):
                 metrics[f'{label}: alpha t-stat']=float(result['summary']['Alpha t-stat'])
         return {name:value for name,value in metrics.items() if value==value}
 
+    def highlights_panel(self):
+        """Reserve the highlights block here (top of the notebook); show_highlights() fills it in."""
+        self._highlights_panel=HighlightsPanel()
+
     def show_highlights(self):
-        """What stands out, what needs attention, and what changed since the last run."""
+        """What stands out, what needs attention, and what changed since the last run.
+
+        Shown in the panel from highlights_panel() when the notebook created one, otherwise here."""
         well,attention=[],[]
         groups={group:[ticker for ticker in self.all_assets if self.asset_group.get(ticker,CRYPTO)==group]
                 for group in (CRYPTO,TRADFI)}
@@ -2178,23 +2186,11 @@ class _HighlightsMixin(_TableStyleMixin):
             if added or removed:
                 well.append(('Universe change',('Added: '+', '.join(added)+'. ' if added else '')
                              +('Dropped: '+', '.join(removed)+'.' if removed else '')))
-        for title,rows in (('WHAT STANDS OUT',well),('NEEDS ATTENTION',attention)):
-            print(f'=== {title} ===')
-            if rows:
-                display(pd.DataFrame(rows,columns=['Area','Highlight']).style.hide(axis='index')
-                        .set_properties(**{'text-align':'left'}))
-            else:
-                print('Nothing to report.')
-        print('=== SINCE LAST RUN ===')
-        if baseline is None:
-            print('No earlier run saved yet; changes appear from the next run.')
-        else:
-            print(f'Last run: {pd.Timestamp(baseline["ts"]):%Y-%m-%d %H:%M %Z}.')
-            if changes:
-                self.show_table(pd.DataFrame(changes).set_index('Metric'),
-                                {'Last run':'{:,.3f}','Now':'{:,.3f}','Change':'{:+,.3f}'})
-            else:
-                print('No key metric changed.')
+        since=SinceLastRun(last_run=pd.Timestamp(baseline['ts']) if baseline else None,
+                           changes=[(row['Metric'],f"{row['Last run']:,.3f}",f"{row['Now']:,.3f}",f"{row['Change']:+,.3f}")
+                                    for row in changes])
+        panel=getattr(self,'_highlights_panel',None)
+        (panel.show if panel is not None else show_highlight_block)(well,attention,since)
         path.write_text(json.dumps({'ts':pd.Timestamp.now(tz='UTC').isoformat(),'metrics':metrics,
                                     'assets':list(self.all_assets)},indent=1))
 

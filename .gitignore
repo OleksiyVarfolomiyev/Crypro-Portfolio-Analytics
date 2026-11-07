@@ -9,3 +9,5 @@ data/ib_*
 research/data/french/
 # IB-derived research outputs stay out of git, like the IB records themselves
 research/data/*ib_book*
+# Run-to-run highlight baselines hold account values
+data/desk_*highlights_state*.json

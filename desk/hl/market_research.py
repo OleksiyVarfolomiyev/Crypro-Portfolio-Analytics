@@ -116,6 +116,47 @@ def rank_markets(markets: pd.DataFrame, metric: str, top: bool, count: int = TOP
     return markets.dropna(subset=[metric]).sort_values(metric, ascending=not top).head(count)
 
 
+HIGH_FUNDING_8H = 0.05  # % per 8h; about 55% a year, which makes carrying the paying side expensive
+
+
+def market_highlights(universe: pd.DataFrame, view: str) -> tuple[list, list]:
+    """What stands out in one market view: biggest moves, funding extremes, and where the volume is."""
+    well, attention = [], []
+    if universe.empty:
+        return well, [("Markets", "No markets returned for this view.")]
+
+    def names(frame: pd.DataFrame, column: str, fmt: str) -> str:
+        return ", ".join(f"{row['Ticker']} {format(row[column], fmt)}" for _, row in frame.iterrows())
+
+    changes = universe.dropna(subset=[CHANGE])
+    if len(changes):
+        up = (changes[CHANGE] > 0).mean()
+        well.append(("Breadth", f"{up:.0%} of {len(changes):,} markets are up over 24h; median change "
+                                f"{changes[CHANGE].median():+.2f}%."))
+        well.append(("Biggest gainers", names(changes.nlargest(3, CHANGE), CHANGE, "+.2f") + " (%)."))
+        attention.append(("Biggest losers", names(changes.nsmallest(3, CHANGE), CHANGE, "+.2f") + " (%)."))
+    funding = universe.dropna(subset=[FUNDING])
+    if len(funding):
+        hot = funding[funding[FUNDING].abs() >= HIGH_FUNDING_8H].sort_values(FUNDING, key=abs, ascending=False)
+        if len(hot):
+            attention.append((f"Funding beyond ±{HIGH_FUNDING_8H}%/8h",
+                              f"{len(hot)} markets; " + names(hot.head(5), FUNDING, "+.4f")
+                              + " (%; positive means longs pay)."))
+        top, bottom = funding.loc[funding[FUNDING].idxmax()], funding.loc[funding[FUNDING].idxmin()]
+        well.append(("Funding range", f"highest {top['Ticker']} {top[FUNDING]:+.4f}% "
+                                      f"(~{top[FUNDING] * 3 * 365:+.0f}%/yr), lowest {bottom['Ticker']} "
+                                      f"{bottom[FUNDING]:+.4f}% (~{bottom[FUNDING] * 3 * 365:+.0f}%/yr)."))
+    volume = universe.dropna(subset=[VOLUME])
+    if len(volume) and volume[VOLUME].sum() > 0:
+        leaders = volume.nlargest(3, VOLUME)
+        share = leaders[VOLUME].sum() / volume[VOLUME].sum()
+        well.append(("Most traded", ", ".join(f"{row['Ticker']} ${row[VOLUME] / 1e6:,.0f}M" for _, row in leaders.iterrows())
+                     + f" ({share:.0%} of the view's 24h volume)."))
+    if view == "trending":
+        well.append(("Trending pool", f"{len(universe):,} markets above ${TRENDING_MIN_VOLUME / 1e6:,.0f}M 24h volume."))
+    return well, attention
+
+
 def show_market_research(view: str) -> None:
     """Display the top and bottom tables for one market view."""
     from desk.hl.account_analytics import display_interactive_table
@@ -145,6 +186,10 @@ def show_market_research(view: str) -> None:
             },
         )
 
+    from desk.notebook_highlights import show as show_highlights
+
+    print("=== HIGHLIGHTS ===")
+    show_highlights(*market_highlights(universe, view))
     print(f"{label}: {len(universe):,} markets. Change is mid vs prior-day price; funding is the "
           "current hourly rate x 8. Positive funding means longs pay shorts.")
     if view == "trending":

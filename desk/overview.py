@@ -15,6 +15,8 @@ from IPython.display import display
 
 from desk.accounts import Account, accounts_for, ib_data_dir, load_accounts
 from desk.hl.account_analytics import display_interactive_table
+from desk.notebook_highlights import HighlightsState, money, percent, signed_money
+from desk.notebook_highlights import show as show_highlights
 from desk.risk import (
     MAX_TOTAL_RISK_PCT,
     BookEntry,
@@ -27,6 +29,12 @@ from desk.venues import ib as ib_venue
 from desk.venues import onchain
 from desk.venues.base import VenueAccount
 
+OVERVIEW_HIGHLIGHTS_STATE = "desk_overview_highlights_state.json"
+HIGHLIGHT_MOVERS = 3
+CONCENTRATION_PCT = 0.25   # one position above this share of desk value is flagged
+HIGH_LEVERAGE = 2.0        # gross exposure / trading equity
+LOW_AVAILABLE_PCT = 0.10   # available margin / trading equity
+NEAR_CAP_PCT = 0.80        # open risk above this share of the cap is flagged
 IB_HISTORY_COLUMNS = ["ts", "equity_usd", "cash_usd", "margin_used_usd", "unrealized_usd", "gross_usd", "net_usd"]
 
 
@@ -43,6 +51,12 @@ def _signed_style(row_index, column, value, row):
         return "color:#188038" if value > 0 else "color:#d93025" if value < 0 else "color:inherit"
     # Balances, quantities and prices are not gains or losses, so keep them uncoloured.
     return "color:inherit"
+
+
+def _pnl_share(position) -> float:
+    """Unrealized PnL as a share of the position's value at entry."""
+    entry_value = abs(position.quantity * position.avg_price * position.multiplier * position.fx_to_usd)
+    return position.unrealized_usd / entry_value if entry_value and math.isfinite(entry_value) else float("nan")
 
 
 def save_ib_history(snapshot: VenueAccount, data_dir: Path) -> Path:
@@ -87,16 +101,21 @@ class DeskOverview:
         self.ib_fills: dict[str, pd.DataFrame] = {}
         self.wallet_activity: dict[str, pd.DataFrame] = {}
         self.problems: list[str] = []
+        self._highlights_state = None
 
-    def fetch_data(self, include_risk: bool = True):
-        """Read balances and positions (and, by default, ATR risk) for every account."""
-        snapshots = ib_venue.run_off_event_loop(self._fetch_data, include_risk)
+    def fetch_data(self, include_risk: bool = True, include_wallet_activity: bool = False):
+        """Read balances and positions (and, by default, ATR risk) for every account.
+
+        Wallet transfer history is the slowest read, so it is fetched only on request.
+        """
+        snapshots = ib_venue.run_off_event_loop(self._fetch_data, include_risk, include_wallet_activity)
         for problem in self.problems:
             print(f"WARNING: {problem}")
         return snapshots
 
-    def _fetch_data(self, include_risk: bool = True):
+    def _fetch_data(self, include_risk: bool = True, include_wallet_activity: bool = False):
         self.snapshots, self.book, self.problems, self.ib_fills = [], [], [], {}
+        self._highlights_state = None  # a fresh fetch compares with the last saved run
         self.wallet_activity = {}
         self.data_dir.mkdir(parents=True, exist_ok=True)
         hl_accounts = accounts_for("hl", self.accounts)
@@ -140,6 +159,8 @@ class DeskOverview:
                 self.snapshots.append(snapshot)
             except Exception as exc:
                 self.problems.append(f"{account.name} wallet: {type(exc).__name__}: {exc}")
+            if not include_wallet_activity:
+                continue
             try:
                 activity, notes = onchain.update_activity_file(
                     account, self.data_dir,
@@ -201,9 +222,15 @@ class DeskOverview:
                     "Symbol": position.symbol, "Side": position.side, "Quantity": position.quantity,
                     "Avg price": position.avg_price, "Mark": position.mark_price, "Currency": position.currency,
                     "Value (USD)": position.notional_usd, "Unrealized PnL": position.unrealized_usd,
-                    "% of desk": abs(position.notional_usd) / equity if equity else float("nan"),
+                    "Exposure / desk value": abs(position.notional_usd) / equity if equity else float("nan"),
                 })
-        return pd.DataFrame(rows)
+        frame = pd.DataFrame(rows)
+        if len(frame):
+            # Weight is the position's share of all gross exposure, so it sums to 100% across every
+            # table; exposure / desk value sums to gross leverage, which leveraged perps push past 100%.
+            gross = frame["Value (USD)"].abs().sum()
+            frame.insert(len(frame.columns) - 1, "Weight", frame["Value (USD)"].abs() / gross if gross else float("nan"))
+        return frame
 
     def show_positions(self):
         """Open positions on every venue, one table per asset class."""
@@ -219,15 +246,21 @@ class DeskOverview:
             total = {"Venue": "Total", "Account": "", "Symbol": "", "Side": "", "Quantity": float("nan"),
                      "Avg price": float("nan"), "Mark": float("nan"), "Currency": "",
                      "Value (USD)": group["Value (USD)"].sum(), "Unrealized PnL": group["Unrealized PnL"].sum(),
-                     "% of desk": group["% of desk"].sum()}
+                     "Weight": group["Weight"].sum(), "Exposure / desk value": group["Exposure / desk value"].sum()}
             group = pd.concat([group, pd.DataFrame([total])], ignore_index=True)
             display_interactive_table(
                 group, formatters={"Quantity": number, "Avg price": number, "Mark": number,
-                                   "Value (USD)": _money, "Unrealized PnL": _money, "% of desk": _percent},
+                                   "Value (USD)": _money, "Unrealized PnL": _money, "Weight": _percent,
+                                   "Exposure / desk value": _percent},
                 cell_style=_signed_style, bold_last=True, title=f"OPEN POSITIONS: {klass.upper()}",
                 blank_missing_cells={(len(group) - 1, column) for column in ("Quantity", "Avg price", "Mark")},
             )
-        print("Value is signed (shorts negative); % of desk is gross value over desk equity.")
+        frame = frame.assign(gross=frame["Value (USD)"].abs())
+        leverage = frame["gross"].sum() / self.desk_equity if self.desk_equity else float("nan")
+        print("Value is signed (shorts negative). Weight is each position's share of gross exposure (absolute "
+              "values), so weights sum to 100% across all tables. Exposure / desk value is gross value over desk "
+              f"value; summed over every table it is gross leverage ({leverage:.0%} now), above 100% because HL "
+              "perps are traded on margin.")
 
     def show_exposure(self):
         """Long, short, net, and gross exposure by asset class."""
@@ -289,6 +322,196 @@ class DeskOverview:
               "also adds a 5-day adverse funding reserve. Risk equity counts HL margin "
               "collateral (USDC on unified accounts, so other spot tokens are excluded) and IB net "
               "liquidation. Both executors enforce this same cap.")
+
+    def _wallets(self):
+        return [snapshot for snapshot in self.snapshots if snapshot.venue == "onchain"]
+
+    def _trading(self):
+        return [snapshot for snapshot in self.snapshots if snapshot.venue != "onchain"]
+
+    def show_wallet_holdings(self, min_usd: float = 1.0):
+        """Each HL wallet's own tokens on other chains: chain, amount, price and value."""
+        if not self._require():
+            return
+        rows = []
+        for snapshot in self._wallets():
+            for position in snapshot.positions:
+                token, _, chain = position.symbol.partition(" (")
+                detail = chain.rstrip(")")
+                chain_name = detail.rsplit(", ", 1)[-1]
+                note = detail.rsplit(", ", 1)[0] if ", " in detail else ""
+                if abs(position.notional_usd) < min_usd and "rewards" not in note:
+                    continue
+                rows.append({"Wallet": snapshot.label, "Chain": chain_name, "Token": token, "Note": note,
+                             "Amount": position.quantity, "Price": position.mark_price,
+                             "Value": position.notional_usd,
+                             "% of desk": position.notional_usd / self.desk_equity if self.desk_equity else float("nan")})
+        if not rows:
+            print("No wallet holdings outside HL.")
+            return
+        frame = pd.DataFrame(rows).sort_values("Value", ascending=False)
+        total = {"Wallet": "Total", "Chain": "", "Token": "", "Note": "", "Amount": float("nan"), "Price": float("nan"),
+                 "Value": frame["Value"].sum(), "% of desk": frame["% of desk"].sum()}
+        frame = pd.concat([frame, pd.DataFrame([total])], ignore_index=True)
+        last = len(frame) - 1
+        number = "{:,.6g}".format
+        display_interactive_table(frame, formatters={"Amount": number, "Price": number, "Value": _money,
+                                                     "% of desk": _percent},
+                                  cell_style=lambda *args: "color:inherit", bold_last=True,
+                                  blank_missing_cells={(last, "Amount"), (last, "Price")},
+                                  title="WALLET HOLDINGS OUTSIDE HL")
+        for snapshot in self._wallets():
+            for note in snapshot.notes:
+                print(f"{snapshot.label}: {note}")
+        print("Tokens are valued at DefiLlama prices; staked tokens at the price of the token they represent. "
+              "Unpriced (spam) tokens are left out. Wallet holdings count toward desk value but not toward "
+              "trading risk equity.")
+
+    def show_unrealized_pnl(self, top: int = 5):
+        """Unrealized PnL by account, and the largest winning and losing positions."""
+        if not self._require():
+            return
+        accounts = []
+        for snapshot in self._trading():
+            gross = snapshot.gross_usd
+            accounts.append({"Venue": snapshot.venue, "Account": snapshot.label, "Unrealized PnL": snapshot.unrealized_usd,
+                             "% of account value": snapshot.unrealized_usd / snapshot.equity_usd if snapshot.equity_usd else float("nan"),
+                             "% of position value": snapshot.unrealized_usd / gross if gross else float("nan"),
+                             "Positions": len(snapshot.positions)})
+        frame = pd.DataFrame(accounts)
+        total = {"Venue": "Total", "Account": "", "Unrealized PnL": frame["Unrealized PnL"].sum(),
+                 "% of account value": frame["Unrealized PnL"].sum() / sum(s.equity_usd for s in self._trading()),
+                 "% of position value": frame["Unrealized PnL"].sum() / sum(s.gross_usd for s in self._trading()),
+                 "Positions": frame["Positions"].sum()}
+        frame = pd.concat([frame, pd.DataFrame([total])], ignore_index=True)
+        display_interactive_table(frame, formatters={"Unrealized PnL": _money, "% of account value": _percent,
+                                                     "% of position value": _percent, "Positions": "{:.0f}".format},
+                                  cell_style=_signed_style, bold_last=True, title="UNREALIZED PNL BY ACCOUNT")
+        positions = pd.DataFrame([{
+            "Account": snapshot.label, "Symbol": position.symbol, "Side": position.side,
+            "Value (USD)": position.notional_usd, "Unrealized PnL": position.unrealized_usd,
+            "% of position": _pnl_share(position),
+        } for snapshot in self._trading() for position in snapshot.positions])
+        if positions.empty:
+            return
+        ranked = positions.sort_values("Unrealized PnL")
+        movers = pd.concat([ranked.tail(top).iloc[::-1], ranked.head(top)]).drop_duplicates()
+        display_interactive_table(movers, formatters={"Value (USD)": _money, "Unrealized PnL": _money, "% of position": _percent},
+                                  cell_style=_signed_style, title=f"LARGEST WINNERS AND LOSERS (TOP {top} EACH)")
+        print("Unrealized PnL is on open trading positions (HL and IB); wallet tokens have no cost basis here. "
+              "% of position compares the PnL with the position's value at entry.")
+
+    def show_desk_metrics(self):
+        """One summary of the whole desk: value, exposure, leverage, PnL and risk."""
+        if not self._require():
+            return
+        trading = self._trading()
+        wallets = self._wallets()
+        trading_equity = sum(snapshot.equity_usd for snapshot in trading)
+        gross = sum(snapshot.gross_usd for snapshot in trading)
+        net = sum(snapshot.net_usd for snapshot in trading)
+        positions = [(snapshot.label, position) for snapshot in trading for position in snapshot.positions]
+        largest = max(positions, key=lambda item: abs(item[1].notional_usd), default=None)
+        rows = [
+            ("Desk value (all accounts)", _money(self.desk_equity)),
+            ("Trading accounts (HL, IB)", _money(trading_equity)),
+            ("Wallet holdings outside HL", _money(sum(snapshot.equity_usd for snapshot in wallets))),
+            ("Cash", _money(sum(snapshot.cash_usd for snapshot in trading if snapshot.venue == "ib"))
+             + " IB cash; HL collateral is in the account values"),
+            ("Margin used", _money(sum(snapshot.margin_used_usd for snapshot in trading))),
+            ("Gross exposure", f"{_money(gross)} ({gross / trading_equity:.2f}x trading equity)" if trading_equity else _money(gross)),
+            ("Net exposure", f"{_money(net)} ({net / trading_equity:+.2f}x trading equity)" if trading_equity else _money(net)),
+            ("Long / short", f"{_money(sum(p.notional_usd for _, p in positions if p.quantity > 0))} / "
+                             f"{_money(sum(p.notional_usd for _, p in positions if p.quantity < 0))}"),
+            ("Unrealized PnL", f"{_money(sum(snapshot.unrealized_usd for snapshot in trading))}"),
+            ("Open positions", f"{len(positions)} across {len(trading)} trading accounts"),
+        ]
+        if largest:
+            label, position = largest
+            rows.append(("Largest position", f"{position.symbol} {position.side.lower()} {_money(abs(position.notional_usd))} "
+                                             f"({abs(position.notional_usd) / self.desk_equity:.1%} of desk, {label})"))
+        if self.book:
+            equity = sum(entry.equity_usd for entry in self.book)
+            used = sum(entry.risk_usd for entry in self.book)
+            cap = equity * MAX_TOTAL_RISK_PCT
+            rows.append(("Open risk vs cap", f"{_money(used)} of {_money(cap)} ({used / cap:.0%} of the "
+                                             f"{MAX_TOTAL_RISK_PCT:.0%} cap); room {_money(cap - used)}"))
+            rows.append(("Next position budget", _money(per_position_budget(equity))))
+        if self.problems:
+            rows.append(("Unreadable accounts", "; ".join(problem.split(":")[0] for problem in self.problems)))
+        display_interactive_table(pd.DataFrame(rows, columns=["Metric", "Value"]), cell_style=lambda *args: "color:inherit",
+                                  title="DESK METRICS")
+
+    def highlight_rows(self) -> tuple[list, list, dict, dict]:
+        """What stands out and what needs attention now, plus the key numbers compared run to run."""
+        well, attention = [], []
+        trading, wallets = self._trading(), self._wallets()
+        trading_equity = sum(snapshot.equity_usd for snapshot in trading)
+        wallet_value = sum(snapshot.equity_usd for snapshot in wallets)
+        gross = sum(snapshot.gross_usd for snapshot in trading)
+        net = sum(snapshot.net_usd for snapshot in trading)
+        unrealized = sum(snapshot.unrealized_usd for snapshot in trading)
+        positions = [(snapshot.label, position) for snapshot in trading for position in snapshot.positions]
+        well.append(("Desk value", f"{money(self.desk_equity)}: trading accounts {money(trading_equity)}, "
+                                   f"wallet holdings {money(wallet_value)}; {len(positions)} open positions."))
+        if positions:
+            ranked = sorted(positions, key=lambda item: item[1].unrealized_usd)
+            winners = [item for item in ranked[::-1] if item[1].unrealized_usd > 0][:HIGHLIGHT_MOVERS]
+            losers = [item for item in ranked if item[1].unrealized_usd < 0][:HIGHLIGHT_MOVERS]
+            (well if unrealized >= 0 else attention).append(
+                ("Unrealized PnL", f"{signed_money(unrealized)} on {money(gross)} of positions "
+                                   f"({percent(unrealized / gross, signed=True) if gross else 'n/a'})."))
+            if winners:
+                well.append(("Largest winners", ", ".join(f"{p.symbol} {signed_money(p.unrealized_usd)}"
+                                                          for _, p in winners) + "."))
+            if losers:
+                attention.append(("Largest losers", ", ".join(f"{p.symbol} {signed_money(p.unrealized_usd)}"
+                                                              for _, p in losers) + "."))
+            label, largest = max(positions, key=lambda item: abs(item[1].notional_usd))
+            share = abs(largest.notional_usd) / self.desk_equity if self.desk_equity else float("nan")
+            if share > CONCENTRATION_PCT:
+                attention.append(("Concentration", f"{largest.symbol} {largest.side.lower()} is {share:.0%} of desk "
+                                                   f"value ({money(abs(largest.notional_usd))}, {label})."))
+        if trading_equity:
+            leverage = gross / trading_equity
+            text = f"Gross {leverage:.2f}x and net {net / trading_equity:+.2f}x trading equity."
+            (attention if leverage > HIGH_LEVERAGE else well).append(("Leverage", text))
+            available = sum(snapshot.available_usd for snapshot in trading)
+            if available / trading_equity < LOW_AVAILABLE_PCT:
+                attention.append(("Available margin low", f"{money(available)} available, "
+                                                          f"{available / trading_equity:.0%} of trading equity."))
+        risk_used = risk_cap = float("nan")
+        if self.book:
+            equity = sum(entry.equity_usd for entry in self.book)
+            risk_used = sum(entry.risk_usd for entry in self.book)
+            risk_cap = equity * MAX_TOTAL_RISK_PCT
+            text = (f"{money(risk_used)} of {money(risk_cap)} ({risk_used / risk_cap:.0%} of the cap); "
+                    f"next position budget {money(per_position_budget(equity))}.")
+            if risk_used > risk_cap:
+                attention.insert(0, ("Open risk over cap", text))
+            elif risk_used > risk_cap * NEAR_CAP_PCT:
+                attention.append(("Open risk near cap", text))
+            else:
+                well.append(("Open risk within cap", text))
+        if self.problems:
+            attention.insert(0, ("Unreadable accounts", "; ".join(self.problems) + " Totals leave them out."))
+        metrics = {"Desk value": (self.desk_equity, "usd"), "Trading accounts": (trading_equity, "usd"),
+                   "Wallet holdings": (wallet_value, "usd"), "Unrealized PnL": (unrealized, "usd"),
+                   "Gross exposure": (gross, "usd"), "Net exposure": (net, "usd"),
+                   "Open risk": (risk_used, "usd"), "Open positions": (len(positions), "int")}
+        items = {"Positions": [f"{p.symbol} {p.side.lower()} ({label})" for label, p in positions]}
+        return well, attention, metrics, items
+
+    def show_highlights(self):
+        """What stands out, what needs attention, and what changed since the last run."""
+        if not self._require():
+            return
+        well, attention, metrics, items = self.highlight_rows()
+        if self._highlights_state is None:
+            self._highlights_state = HighlightsState(self.data_dir / OVERVIEW_HIGHLIGHTS_STATE)
+        since = self._highlights_state.compare(metrics, items)
+        show_highlights(well, attention, since,
+                        footnote="Changes in desk value include deposits, withdrawals and price moves in wallet tokens.")
 
     def show_wallet_activity(self, days: int = 30, min_usd: float = 1.0):
         """Transfers in and out of each wallet on other chains, newest first.

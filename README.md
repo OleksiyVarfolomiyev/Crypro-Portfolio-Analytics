@@ -4,7 +4,8 @@ A multi-venue trading desk: analytics, research, and guarded execution across **
 
 | Part | Venues | Where |
 | --- | --- | --- |
-| Desk overview: balances, positions, exposure by asset class, desk-wide open risk, wallet activity outside HL | All | [`desk_overview.ipynb`](desk_overview.ipynb), `desk/overview.py` |
+| Desk overview: accounts, desk metrics, exposure, positions, unrealized PnL, wallet holdings outside HL, desk-wide open risk | All | [`desk_overview.ipynb`](desk_overview.ipynb), `desk/overview.py` |
+| Desk accounts: every account combined into one desk return net of deposits; performance by account, risk metrics vs BTC and SPY, charts | All | [`desk_accounts.ipynb`](desk_accounts.ipynb), `desk/desk_accounts.py` |
 | Guarded execution: dry run by default, typed confirmations, desk-wide risk cap, shared kill switch | HL, IB | `execution/hl_trade.py`, `execution/ib_trade.py` |
 | Account analytics: PnL, funding, risk metrics, attribution, charts | HL | `hl_account*.ipynb`, `desk/hl/` |
 | Account analytics: balances, today's PnL, positions with ATR levels, current-book risk vs SPY, fills, attribution | IB | `ib_account.ipynb`, `desk/ib/` |
@@ -84,9 +85,17 @@ Open [`ib_account.ipynb`](ib_account.ipynb) and run all cells; it is the IB coun
 
 IB's API has no account-value history, so beta and alpha to SPY, Sharpe, volatility, bootstrap VaR and maximum drawdown price **today's holdings** over the past year of IB daily closes, with 90% bootstrap ranges. They describe the current book, not past account performance. Real history builds up from run to run: each run saves a net-liquidation snapshot to `trading-desk-data/ib/ib_account_history_<account>.csv` and merges executions into `trading-desk-data/ib/ib_fills_<account>.csv` (TWS keeps about a week of them), and the history and realized-PnL sections read those files.
 
+## Notebook highlights
+
+Every notebook opens with a Highlights block: what stands out, what needs attention, and, for the account and portfolio notebooks, which key numbers and positions changed since the last run (baselines are saved as `*highlights_state*.json`; the IB one is saved with the IB records). The account, desk and market research notebooks fill it in right after fetching data. The portfolio, backtest and trade analytics notebooks reserve it at the top, and a later cell fills it in once the sections it summarizes have run, so use Run All. Shared rendering lives in `desk/notebook_highlights.py`.
+
 ## Desk overview notebook
 
-Open [`desk_overview.ipynb`](desk_overview.ipynb) and run all cells. It reads every account in `accounts.json` and shows account balances in USD, exposure by asset class, open positions grouped by asset class, desk open risk against the aggregate cap, wallet activity outside HL, and recent IB fills. An account that cannot be read is reported and left out. Each run appends IB account values to `trading-desk-data/ib/ib_account_history_<account>.csv` and merges IB executions into `trading-desk-data/ib/ib_fills_<account>.csv`, because TWS only returns about a week of executions.
+Open [`desk_overview.ipynb`](desk_overview.ipynb) and run all cells. It reads every account in `accounts.json` and shows account balances in USD, desk metrics (value split between trading accounts and wallet holdings, margin, gross and net exposure and leverage, unrealized PnL, the largest position, open risk against the cap and the next position budget), exposure by asset class, open positions by asset class, desk open risk, each HL wallet's holdings on other chains, unrealized PnL by account with the largest winners and losers, and recent IB fills. An account that cannot be read is reported and left out. Wallet transfer history is no longer fetched by default (`fetch_data(include_wallet_activity=True)` and `show_wallet_activity()` still provide it). Each run appends IB account values to `trading-desk-data/ib/ib_account_history_<account>.csv` and merges IB executions into `trading-desk-data/ib/ib_fills_<account>.csv`.
+
+## Desk accounts notebook
+
+Open [`desk_accounts.ipynb`](desk_accounts.ipynb), the combined equivalent of `hl_accounts.ipynb` and `ib_account.ipynb`. HL wallets contribute their saved value and PnL history and IB its Flex daily NAV with deposits and withdrawals; together they form one desk time-weighted return, so deposits, withdrawals and transfers between accounts are never performance. The desk starts where IB's Flex window starts; an HL wallet funded later joins with its first funding counted as an inflow, and each wallet's PnL is measured from its first point in the window. Sections: accounts; performance (PnL and return net of deposits over 7, 30 and 90 days, per account and combined); risk metrics (weekly over the whole shared history and daily over the days every account has daily data: volatility, Sharpe, max drawdown, bootstrap VaR in dollars, beta and alpha against BTC and SPY with 90% ranges); value stacked by account and the desk return against BTC and SPY; and exposure, positions and open risk. Wallet tokens on other chains have no value history, so they count in current totals only.
 
 ## IB execution
 

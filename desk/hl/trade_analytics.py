@@ -1075,3 +1075,32 @@ def add_expected_pnl_columns(
         )
         enriched.append(row)
     return enriched, warnings
+
+
+def trade_highlights(market: str, side: str, mark_price: float, oracle_price: float, atr: float,
+                     stop_distance: float, funding_reserve_per_unit: float, expected: ExpectedPnl,
+                     quantity: float, horizon_days: int) -> tuple[list, list]:
+    """What stands out for one proposed position: stop width, expected PnL, funding and data depth."""
+    well, attention = [], []
+    stop_pct = stop_distance / mark_price if mark_price else np.nan
+    well.append(("Stop", f"{market} {side.lower()}: stop {stop_distance:,.6g} away ({stop_pct:.2%} of mark), "
+                         f"ATR {atr:,.6g}; risk per unit including the funding reserve "
+                         f"{stop_distance + funding_reserve_per_unit:,.6g}."))
+    text = (f"{expected.net_pnl:+,.2f} over {horizon_days}d for {quantity:g} units "
+            f"(price {expected.price_pnl:+,.2f}, funding {expected.funding_pnl:+,.2f}).")
+    (well if expected.net_pnl > 0 else attention).append(("Expected PnL (historical)", text))
+    if expected.funding_pnl < 0:
+        attention.append(("Funding", f"This side pays funding: about {expected.funding_pnl:+,.2f} over {horizon_days}d; "
+                                     f"stress reserve {funding_reserve_per_unit * quantity:,.2f}."))
+    elif expected.funding_pnl > 0:
+        well.append(("Funding", f"This side receives funding: about {expected.funding_pnl:+,.2f} over {horizon_days}d."))
+    if funding_reserve_per_unit > stop_distance * 0.25:
+        attention.append(("Funding reserve", f"The stressed funding reserve is {funding_reserve_per_unit / stop_distance:.0%} "
+                                             "of the stop distance, which shrinks the position the risk budget allows."))
+    gap = mark_price / oracle_price - 1 if oracle_price else np.nan
+    if np.isfinite(gap) and abs(gap) > 0.005:
+        attention.append(("Mark vs oracle", f"Mark is {gap:+.2%} from the oracle price."))
+    if expected.forward_observations < 60:
+        attention.append(("Short history", f"Only {expected.forward_observations} forward-return observations; "
+                                           "treat the expected PnL as rough."))
+    return well, attention

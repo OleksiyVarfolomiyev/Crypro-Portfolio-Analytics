@@ -31,6 +31,10 @@ ASSET_CLASS_BY_SEC_TYPE = {
 # Live (1) or, without a live subscription, delayed (3) data; IB returns live data
 # on type 3 whenever the account is subscribed.
 MARKET_DATA_DELAYED = 3
+# A historical request IB has not answered in this long is cancelled. After the first such
+# timeout the connection skips further history requests: when IB's historical data service
+# is down (its nightly reset, weekend maintenance), every symbol would otherwise wait in turn.
+HISTORY_TIMEOUT_SECONDS = 20
 LIVE_MARKET_DATA_TYPE = 1
 
 
@@ -337,11 +341,43 @@ def resolve_contract(ib, spec: ContractSpec):
     return chosen.contract, chosen
 
 
+class HistoryUnavailable(ValueError):
+    """IB's historical data service did not answer on this connection."""
+
+
+def _history(ib, contract, duration: str, what: str, mark_down: bool = True):
+    """Daily bars from IB, failing fast once the history service has timed out on this connection.
+
+    ``mark_down=False`` reports a timeout without skipping later requests, for a series with a
+    fallback (IB's adjusted closes can time out while plain trade prices still answer)."""
+    if getattr(ib, "desk_history_down", False):
+        raise HistoryUnavailable(f"IB historical data is not responding; skipped {contract_symbol(contract)}.")
+    errors = getattr(ib, "desk_errors", None)
+    seen = len(errors) if isinstance(errors, list) else 0
+    bars = ib.reqHistoricalData(contract, endDateTime="", durationStr=duration, barSizeSetting="1 day",
+                                whatToShow=what, useRTH=True, formatDate=1, timeout=HISTORY_TIMEOUT_SECONDS)
+    if not bars and isinstance(errors, list):
+        if hasattr(ib, "sleep"):
+            ib.sleep(0.5)  # IB's "query cancelled" for our timeout arrives just after the empty result
+        cancelled = any(message.startswith("162:") and "query cancelled" in message for message in errors[seen:])
+        if cancelled and not mark_down:
+            raise HistoryUnavailable(f"IB {what} history did not answer within {HISTORY_TIMEOUT_SECONDS}s "
+                                     f"for {contract_symbol(contract)}.")
+    else:
+        cancelled = False
+    if cancelled:
+        ib.desk_history_down = True  # cancelled by our timeout, not "no data for this contract"
+        raise HistoryUnavailable(
+            f"IB historical data did not answer within {HISTORY_TIMEOUT_SECONDS}s for {contract_symbol(contract)}; "
+            "further history requests on this connection are skipped. This usually means IB's nightly server "
+            "reset (about 23:45-00:45 New York) or weekend maintenance; try again later.")
+    return bars
+
+
 def daily_bars(ib, contract, duration: str = "1 Y") -> pd.DataFrame:
     """Completed daily bars (today's partial bar removed) with high/low/close columns."""
     what = "MIDPOINT" if contract.secType == "CASH" else "AGGTRADES" if contract.secType == "CRYPTO" else "TRADES"
-    bars = ib.reqHistoricalData(contract, endDateTime="", durationStr=duration,
-                                barSizeSetting="1 day", whatToShow=what, useRTH=True, formatDate=1)
+    bars = _history(ib, contract, duration, what)
     if not bars:
         errors = "; ".join(getattr(ib, "desk_errors", [])[-2:])
         raise ValueError(f"IB returned no daily history for {contract_symbol(contract)}"
@@ -360,8 +396,12 @@ def adjusted_daily_closes(ib, contract, duration: str = "1 Y") -> pd.Series:
     """
     series = None
     for what in ("ADJUSTED_LAST", "TRADES"):
-        bars = ib.reqHistoricalData(contract, endDateTime="", durationStr=duration, barSizeSetting="1 day",
-                                    whatToShow=what, useRTH=True, formatDate=1)
+        try:
+            bars = _history(ib, contract, duration, what, mark_down=what == "TRADES")
+        except HistoryUnavailable:
+            if what == "TRADES" or getattr(ib, "desk_history_down", False):
+                raise
+            continue  # adjusted closes timed out; unadjusted trade prices may still answer
         if bars:
             series = pd.Series({pd.Timestamp(bar.date).tz_localize(None).normalize(): float(bar.close)
                                 for bar in bars if bar.close and bar.close > 0})

@@ -372,8 +372,6 @@ class OverviewStorageTests(unittest.TestCase):
         self.assertEqual(sorted(merged["exec_id"]), ["a", "b", "c"])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class OnchainWalletTests(unittest.TestCase):
@@ -1030,3 +1028,154 @@ class ExternalNamesTests(unittest.TestCase):
             text = (ROOT / path).read_text()
             for needle in needles:
                 self.assertIn(needle, text, f"{path} lost the external name {needle!r}")
+
+
+class DeskAccountsTests(unittest.TestCase):
+    def test_ib_nav_becomes_value_and_pnl_net_of_deposits(self):
+        from desk.desk_accounts import ib_history
+
+        nav = pd.DataFrame({"date": ["2026-01-05", "2026-01-06", "2026-01-07"],
+                            "nav": [1000.0, 1010.0, 1520.1], "flows": [0.0, 0.0, 500.0]})
+        history = ib_history(nav)
+        self.assertEqual(list(history["accountValue"]), [1000.0, 1010.0, 1520.1])
+        self.assertAlmostEqual(history["pnl"].iloc[-1], 20.1)  # the 500 deposit is not PnL
+        self.assertEqual(history["ts"].iloc[0].hour, 21)
+
+    def test_daily_returns_need_both_days_covered_by_every_account(self):
+        from desk.desk_accounts import period_returns
+
+        index = pd.Series([1.0, 1.01, 1.02, 1.05, 1.06],
+                          index=pd.date_range("2026-01-01 12:00", periods=5, freq="D", tz="UTC"))
+        valid = pd.DatetimeIndex(pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-04", "2026-01-05"], utc=True))
+        returns = period_returns(index, "1D", valid)
+        # Jan 3 is missing for some account, so Jan 3 and Jan 4 returns are dropped.
+        self.assertEqual([day.day for day in returns.index], [2, 5])
+
+    def test_lifetime_pnl_before_the_window_is_not_a_loss_inside_it(self):
+        from unittest.mock import patch
+        import desk.desk_accounts as module
+
+        times = pd.date_range("2026-01-01", periods=4, freq="D", tz="UTC")
+        hl = pd.DataFrame({"ts": times, "accountValue": [100.0, 101.0, 102.0, 103.0], "pnl": [-500.0, -499.0, -498.0, -497.0]})
+        desk = module.DeskAccounts.__new__(module.DeskAccounts)
+        desk.histories, desk.windowed = {"HL": hl}, set()
+        start = times[0]
+        part = hl[hl["ts"] >= start].copy()
+        part["pnl"] = part["pnl"] - part["pnl"].iloc[0]
+        index = module.time_weighted_index([part])
+        self.assertGreater(index.iloc[-1], 1.0)  # +1 a day on ~100, not a -500 loss
+        self.assertAlmostEqual(index.iloc[-1], (101 / 100) * (102 / 101) * (103 / 102), places=6)
+
+
+class OverviewSectionsTests(unittest.TestCase):
+    def overview(self):
+        from desk.overview import DeskOverview
+        from desk.venues.base import VenueAccount
+
+        overview = DeskOverview([Account("hl", "0x" + "1" * 40)], data_dir=tempfile.mkdtemp())
+        hl = VenueAccount("hl", "0x1", "HL 1111", 1000.0, 1000.0, 300.0, 700.0, 50.0, positions=(
+            VenuePosition("hl", "0x1", "ETH", "crypto", -1.0, 2100.0, 2000.0, unrealized_usd=100.0),
+            VenuePosition("hl", "0x1", "SOL", "crypto", 10.0, 105.0, 100.0, unrealized_usd=-50.0)))
+        wallet = VenueAccount("onchain", "0x1", "HL 1111 wallet", 2112.0, 2112.0, 0.0, 2112.0, float("nan"), positions=(
+            VenuePosition("onchain", "0x1", "sVVV (VVV staked on Venice, base)", "crypto spot", 100.0, float("nan"), 21.12,
+                          unrealized_usd=float("nan")),))
+        overview.snapshots = [hl, wallet]
+        return overview
+
+    def test_metrics_holdings_and_pnl_sections(self):
+        from unittest.mock import patch
+        import desk.overview as module
+
+        overview = self.overview()
+        tables = {}
+        capture = lambda frame, **kwargs: tables.__setitem__(kwargs.get("title"), frame)
+        with patch.object(module, "display_interactive_table", side_effect=capture), redirect_stdout(io.StringIO()):
+            overview.show_desk_metrics()
+            overview.show_wallet_holdings()
+            overview.show_unrealized_pnl()
+        metrics = dict(zip(tables["DESK METRICS"]["Metric"], tables["DESK METRICS"]["Value"]))
+        self.assertEqual(metrics["Desk value (all accounts)"], "$3,112.00")
+        self.assertEqual(metrics["Wallet holdings outside HL"], "$2,112.00")
+        self.assertIn("3.00x", metrics["Gross exposure"])  # 2,000 + 1,000 gross on 1,000 trading equity
+        holdings = tables["WALLET HOLDINGS OUTSIDE HL"]
+        self.assertEqual((holdings.iloc[0]["Token"], holdings.iloc[0]["Chain"], holdings.iloc[0]["Note"]),
+                         ("sVVV", "base", "VVV staked on Venice"))
+        movers = tables["LARGEST WINNERS AND LOSERS (TOP 5 EACH)"]
+        self.assertEqual(list(movers["Symbol"]), ["ETH", "SOL"])
+        self.assertAlmostEqual(movers.iloc[0]["% of position"], 100 / 2100)
+
+
+class HistoryTimeoutTests(unittest.TestCase):
+    def test_history_requests_fail_fast_after_ib_stops_answering(self):
+        from desk.venues import ib as ib_venue
+
+        class Contract:
+            secType, symbol, localSymbol = "STK", "SPY", "SPY"
+
+        class FakeIB:
+            def __init__(self):
+                self.desk_errors, self.calls = [], 0
+
+            def reqHistoricalData(self, contract, **kwargs):
+                self.calls += 1
+                self.desk_errors.append("162: Historical Market Data Service error message:API historical data query cancelled: 4")
+                return []
+
+        ib = FakeIB()
+        with self.assertRaises(ib_venue.HistoryUnavailable):
+            ib_venue.daily_bars(ib, Contract())
+        with self.assertRaises(ib_venue.HistoryUnavailable):
+            ib_venue.adjusted_daily_closes(ib, Contract())
+        self.assertEqual(ib.calls, 1)  # the second request never waited on IB
+
+    def test_no_data_for_one_contract_does_not_stop_other_requests(self):
+        from desk.venues import ib as ib_venue
+
+        class Contract:
+            secType, symbol, localSymbol = "STK", "XYZ", "XYZ"
+
+        class FakeIB:
+            desk_errors = ["162: Historical Market Data Service error message:HMDS query returned no data"]
+
+            def reqHistoricalData(self, contract, **kwargs):
+                return []
+
+        ib = FakeIB()
+        with self.assertRaises(ValueError) as caught:
+            ib_venue.daily_bars(ib, Contract())
+        self.assertNotIsInstance(caught.exception, ib_venue.HistoryUnavailable)
+        self.assertFalse(getattr(ib, "desk_history_down", False))
+
+
+class AdjustedHistoryFallbackTests(unittest.TestCase):
+    def test_adjusted_timeout_falls_back_to_trade_prices(self):
+        from types import SimpleNamespace
+
+        from desk.venues import ib as ib_venue
+
+        class Contract:
+            secType, symbol, localSymbol = "STK", "SPY", "SPY"
+
+        class FakeIB:
+            def __init__(self):
+                self.desk_errors, self.asked = [], []
+
+            def sleep(self, seconds):
+                pass
+
+            def reqHistoricalData(self, contract, whatToShow, **kwargs):
+                self.asked.append(whatToShow)
+                if whatToShow == "ADJUSTED_LAST":
+                    self.desk_errors.append("162: Historical Market Data Service error message:API historical data query cancelled: 4")
+                    return []
+                return [SimpleNamespace(date=f"2026-11-0{day}", close=700.0 + day) for day in (2, 3, 4)]
+
+        ib = FakeIB()
+        closes = ib_venue.adjusted_daily_closes(ib, Contract())
+        self.assertEqual(ib.asked, ["ADJUSTED_LAST", "TRADES"])
+        self.assertEqual(len(closes), 3)
+        self.assertFalse(getattr(ib, "desk_history_down", False))
+
+
+if __name__ == "__main__":
+    unittest.main()

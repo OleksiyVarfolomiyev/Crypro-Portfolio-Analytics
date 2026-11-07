@@ -20,6 +20,8 @@ from IPython.display import display
 from desk.accounts import Account, accounts_for, ib_data_dir, load_accounts
 from desk.hl.account_analytics import display_interactive_table
 from desk.hl.trade_analytics import bootstrap_btc_regression, bootstrap_var, wilder_atr
+from desk.notebook_highlights import HighlightsState, signed_money
+from desk.notebook_highlights import show as show_highlights
 from desk.overview import merge_ib_fills, save_ib_history
 from desk.risk import ATR_PERIOD, REWARD_RISK_RATIO, STOP_ATR_MULTIPLE, ib_position_risk
 from desk.venues import ib as ib_venue
@@ -27,6 +29,9 @@ from desk.venues import ib as ib_venue
 BENCHMARK = "SPY"
 TRADING_DAYS = 252
 BETA_LOOKBACK_DAYS = 60
+HIGHLIGHT_MOVERS = 3
+CONCENTRATION_PCT = 0.25   # one position above this share of the account is flagged
+ACCOUNT_RISK_PCT = 0.20    # open risk above this share of the account is flagged (the desk cap's level)
 SUMMARY_TAGS = ("NetLiquidation", "TotalCashValue", "BuyingPower", "GrossPositionValue",
                 "InitMarginReq", "MaintMarginReq", "AvailableFunds", "ExcessLiquidity")
 
@@ -51,6 +56,11 @@ def _pnl_style(row_index, column, value, row):
     if isinstance(value, (int, float)) and np.isfinite(value) and ("PnL" in column or column == "1D change"):
         return "color:#188038" if value > 0 else "color:#d93025" if value < 0 else "color:inherit"
     return "color:inherit"
+
+
+def _mover(row) -> str:
+    share = row["Unrealized PnL %"]
+    return f"{row['Symbol']} {signed_money(row['Unrealized PnL'])}" + (f" ({share:+.1%})" if np.isfinite(share) else "")
 
 
 def _returns(bars: pd.DataFrame) -> pd.Series:
@@ -116,6 +126,7 @@ class IBAccountAnalytics:
         self.history = pd.DataFrame()
         self.book = pd.Series(dtype=float)
         self.notes: list[str] = []
+        self._highlights_state = None
 
     # ------------------------------------------------------------------
     def fetch_data(self):
@@ -127,6 +138,7 @@ class IBAccountAnalytics:
 
     def _fetch_data(self):
         self.notes = []
+        self._highlights_state = None  # a fresh fetch compares with the last saved run
         self.data_dir.mkdir(parents=True, exist_ok=True)
         ib = ib_venue.connect(self.account, "analytics", readonly=True, timeout=20)
         try:
@@ -141,18 +153,28 @@ class IBAccountAnalytics:
             self.bars = {}
             from ib_async import Contract
 
+            skipped, outage = [], ""
             for position in snapshot.positions:
                 try:
                     contract = Contract(conId=int(position.ref))
                     ib.qualifyContracts(contract)
                     self.bars[position.symbol] = ib_venue.daily_bars(ib, contract, "1 Y")
+                except ib_venue.HistoryUnavailable as exc:
+                    skipped.append(position.symbol)
+                    outage = outage or str(exc)
                 except Exception as exc:  # one symbol's history never blocks the report
                     self.notes.append(f"{position.symbol}: no daily history ({str(exc) or type(exc).__name__})")
             try:
                 spy, _ = ib_venue.resolve_contract(ib, ib_venue.ContractSpec(BENCHMARK))
                 self.benchmark = _returns(ib_venue.daily_bars(ib, spy, "1 Y"))
+            except ib_venue.HistoryUnavailable as exc:
+                skipped.append(BENCHMARK)
+                outage = outage or str(exc)
             except Exception as exc:
                 self.notes.append(f"{BENCHMARK} benchmark unavailable ({str(exc) or type(exc).__name__})")
+            if skipped:
+                self.notes.append(f"{outage.split(';')[0]}. No daily history for {', '.join(skipped)}: ATR stops, "
+                                  "1D change, beta, VaR and the book chart are unavailable this run.")
             self.fills = merge_ib_fills(ib_venue.recent_fills(ib, acct), self.data_dir, acct)
         finally:
             ib.disconnect()
@@ -222,6 +244,74 @@ class IBAccountAnalytics:
         return True
 
     # ------------------------------------------------------------------
+    def show_highlights(self):
+        """What stands out and what needs attention now, and what changed since the last run."""
+        if not self._require():
+            return
+        snap, well, attention = self.snapshot, [], []
+        equity = snap.equity_usd
+        today = self.pnl.get("dailyPnL", np.nan)
+        text = f"Net liquidation {_money(equity)}, {len(self.positions)} open positions"
+        if np.isfinite(today):
+            text += f"; today {signed_money(today)} ({today / (equity - today):+.2%})" if equity - today else ""
+        (well if not np.isfinite(today) or today >= 0 else attention).append(("Account", text + "."))
+        positions = self.positions
+        if not positions.empty:
+            unrealized = float(positions["Unrealized PnL"].sum())
+            (well if unrealized >= 0 else attention).append(
+                ("Unrealized PnL", f"{signed_money(unrealized)} across open positions."))
+            ranked = positions.sort_values("Unrealized PnL")
+            winners = ranked[ranked["Unrealized PnL"] > 0].tail(HIGHLIGHT_MOVERS).iloc[::-1]
+            losers = ranked[ranked["Unrealized PnL"] < 0].head(HIGHLIGHT_MOVERS)
+            if len(winners):
+                well.append(("Largest winners", ", ".join(
+                    _mover(row) for _, row in winners.iterrows()) + "."))
+            if len(losers):
+                attention.append(("Largest losers", ", ".join(
+                    _mover(row) for _, row in losers.iterrows()) + "."))
+            moves = positions.dropna(subset=["1D change"])
+            if len(moves):
+                moves = moves.reindex(moves["1D change"].abs().sort_values(ascending=False).index).head(HIGHLIGHT_MOVERS)
+                well.append(("Biggest moves since last close", ", ".join(
+                    f"{row['Symbol']} {row['1D change']:+.1%}" for _, row in moves.iterrows()) + "."))
+            top = positions.loc[positions["% of account"].idxmax()]
+            if top["% of account"] > CONCENTRATION_PCT:
+                attention.append(("Concentration", f"{top['Symbol']} {top['Side'].lower()} is "
+                                                   f"{top['% of account']:.0%} of the account."))
+            risk = float(positions["Risk to stop"].sum())
+            text = f"{_money(risk)} to ATR stops ({risk / equity:.1%} of the account)." if equity else _money(risk)
+            (attention if equity and risk / equity > ACCOUNT_RISK_PCT else well).append(("Open risk", text))
+            unpriced = positions.loc[positions["Risk basis"].str.contains("no price history", na=False), "Symbol"]
+            if len(unpriced):
+                attention.append(("No price history", ", ".join(unpriced) + ": risk uses a fallback estimate."))
+        stats = bootstrap_btc_regression(self.book, self.benchmark, periods_per_year=TRADING_DAYS, samples=500)
+        var95 = bootstrap_var(self.book, 0.95) if len(self.book) >= 20 else None
+        if np.isfinite(stats.get("beta", np.nan)):
+            text = f"Beta to {BENCHMARK} {stats['beta']:.2f}"
+            if var95:
+                text += f"; 1-day VaR 95% {_money(var95['var'] * equity)}"
+            well.append(("Current book", text + " (today's holdings priced over the past year)."))
+        realized_7d = np.nan
+        if not self.fills.empty:
+            fills = self.fills.assign(time=pd.to_datetime(self.fills["time"], utc=True, format="mixed"))
+            week = fills[fills["time"] >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=7)]
+            if len(week):
+                realized_7d = float(week["realized_pnl"].sum())
+                (well if realized_7d >= 0 else attention).append(
+                    ("Last 7 days of fills", f"{len(week)} fills, realized {signed_money(realized_7d)} after commission."))
+        for note in self.notes:
+            attention.append(("Data", note))
+        metrics = {"Net liquidation": (equity, "usd"), "Unrealized PnL": (snap.unrealized_usd, "usd"),
+                   "Open risk to stops": (float(positions["Risk to stop"].sum()) if not positions.empty else 0.0, "usd"),
+                   f"Beta to {BENCHMARK}": (stats.get("beta", np.nan), "num"),
+                   "Gross position value": (snap.gross_usd, "usd")}
+        items = {"Positions": [f"{row['Symbol']} {row['Side'].lower()}" for _, row in positions.iterrows()]}
+        if self._highlights_state is None:
+            self._highlights_state = HighlightsState(self.data_dir / f"ib_highlights_state_{snap.account}.json")
+        since = self._highlights_state.compare(metrics, items)
+        show_highlights(well, attention, since,
+                        footnote="Changes in net liquidation include deposits and withdrawals.")
+
     def show_account(self):
         """Balances, today's PnL, and current-book risk statistics."""
         if not self._require():
