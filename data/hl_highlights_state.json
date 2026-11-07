@@ -1,86 +1,38 @@
 {
- "ts": "2026-11-06T09:52:00.686985-05:00",
- "cumulative_pnl": 152.130688,
+ "ts": "2026-11-06T20:07:10.157193-05:00",
+ "cumulative_pnl": 273.799341,
  "positions": {
   "c248|NEAR|SHORT": {
    "size": 109.2,
-   "upnl": 29.87712
+   "upnl": 36.46188
   },
   "c248|IMX|SHORT": {
    "size": 1466.7,
-   "upnl": 0.962678
-  },
-  "c248|GRASS|SHORT": {
-   "size": 100.5,
-   "upnl": 10.543455
-  },
-  "c248|INIT|SHORT": {
-   "size": 244.0,
-   "upnl": 13.07596
-  },
-  "c248|XPL|SHORT": {
-   "size": 8895.0,
-   "upnl": 30.696645
+   "upnl": 4.878767
   },
   "c248|USELESS|SHORT": {
    "size": 653.0,
-   "upnl": -5.336316
-  },
-  "c248|xyz:ANT|SHORT": {
-   "size": 7.27,
-   "upnl": 15.1943
+   "upnl": -1.170829
   },
   "07f2|INJ|SHORT": {
    "size": 139.9,
-   "upnl": -75.546
+   "upnl": -61.196457
   },
   "07f2|TRX|SHORT": {
    "size": 1484.0,
-   "upnl": -8.6072
-  },
-  "07f2|RUNE|SHORT": {
-   "size": 570.6,
-   "upnl": 17.841654
-  },
-  "07f2|ZRO|SHORT": {
-   "size": 21.3,
-   "upnl": -0.626643
+   "upnl": -7.44968
   },
   "07f2|RSR|SHORT": {
    "size": 31594.0,
-   "upnl": -5.284862
-  },
-  "07f2|SAGA|SHORT": {
-   "size": 18854.0,
-   "upnl": 8.86138
-  },
-  "07f2|GOAT|SHORT": {
-   "size": 77249.0,
-   "upnl": 29.663616
-  },
-  "07f2|PENGU|SHORT": {
-   "size": 26548.0,
-   "upnl": 13.763236
-  },
-  "07f2|INIT|SHORT": {
-   "size": 180.0,
-   "upnl": 1.8792
-  },
-  "07f2|HEMI|SHORT": {
-   "size": 4096.0,
-   "upnl": 0.077824
-  },
-  "07f2|PONS|SHORT": {
-   "size": 2158.0,
-   "upnl": 51.70568
+   "upnl": -3.736756
   },
   "07f2|xyz:MU|LONG": {
    "size": 1.842,
-   "upnl": 60.21498
+   "upnl": 18.58578
   },
   "07f2|xyz:RELIANCE|SHORT": {
    "size": 4.2,
-   "upnl": -1.9482
+   "upnl": -2.0154
   }
  }
 }

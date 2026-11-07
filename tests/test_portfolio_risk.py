@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "execution"), str(ROOT / "research")]
 # Keep tests off real accounts: no IB or wallet in accounts.json is ever contacted.
 os.environ["DESK_ACCOUNTS_FILE"] = str(ROOT / "tests" / "no_accounts.json")
+# IB records from tests go to a throwaway folder, never the real one next to the repository.
+os.environ["DESK_IB_DATA_DIR"] = __import__("tempfile").mkdtemp(prefix="desk-ib-")
 
 from portfolio_risk import bootstrap_var, calculate_portfolio_risk_metrics
 

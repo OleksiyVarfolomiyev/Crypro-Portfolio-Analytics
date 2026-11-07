@@ -1,0 +1,37 @@
+{
+ "ts": "2026-11-06T23:30:22.780793+00:00",
+ "metrics": {
+  "Assets analysed": 21,
+  "Assets in Kelly": 19,
+  "Kelly Sharpe (in-sample)": 3.536101910005216,
+  "Kelly beta (btc)": 0.2481926513877988,
+  "Kelly beta (spy)": 0.7448333663247897,
+  "HL book (actual): alpha (/yr)": 0.2253737768190115,
+  "HL book (actual): alpha t-stat": 0.5638235774696387,
+  "IB book (actual): alpha (/yr)": -0.38389915538685854,
+  "IB book (actual): alpha t-stat": -2.090351535083502
+ },
+ "assets": [
+  "NEAR",
+  "IMX",
+  "USELESS",
+  "INJ",
+  "TRX",
+  "RUNE",
+  "ZRO",
+  "RSR",
+  "GOAT",
+  "PENGU",
+  "PONS",
+  "xyz:MU",
+  "HYPE",
+  "DPI",
+  "VVV",
+  "GOOGL",
+  "KYIV",
+  "META",
+  "NET",
+  "NVDA",
+  "SWMR"
+ ]
+}

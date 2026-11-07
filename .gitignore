@@ -4,3 +4,8 @@ __pycache__/
 data/api_cache/
 execution/KILL_SWITCH
 accounts.json
+data/ib_*
+# Downloaded public factor data (re-fetched automatically)
+research/data/french/
+# IB-derived research outputs stay out of git, like the IB records themselves
+research/data/*ib_book*

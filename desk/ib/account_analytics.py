@@ -17,7 +17,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from IPython.display import display
 
-from desk.accounts import Account, accounts_for, load_accounts
+from desk.accounts import Account, accounts_for, ib_data_dir, load_accounts
 from desk.hl.account_analytics import display_interactive_table
 from desk.hl.trade_analytics import bootstrap_btc_regression, bootstrap_var, wilder_atr
 from desk.overview import merge_ib_fills, save_ib_history
@@ -96,7 +96,7 @@ def simple_beta(returns: pd.Series, benchmark: pd.Series) -> float:
 class IBAccountAnalytics:
     """Report for one IB account, mirroring the HL account notebook's sections."""
 
-    def __init__(self, account: str | None = None, data_dir: str | Path = "data", port: int | None = None):
+    def __init__(self, account: str | None = None, data_dir: str | Path | None = None, port: int | None = None):
         configured = accounts_for("ib", load_accounts())
         chosen = next((item for item in configured if account in (None, "", item.id, item.label)), None)
         if chosen is None:
@@ -104,7 +104,8 @@ class IBAccountAnalytics:
         if port:
             chosen = Account(chosen.venue, chosen.id, chosen.label, chosen.host, port)
         self.account = chosen
-        self.data_dir = Path(data_dir)
+        # IB records live outside the repository unless a folder is given explicitly.
+        self.data_dir = Path(data_dir) if data_dir is not None else ib_data_dir()
         self.snapshot = None
         self.summary: dict[str, float] = {}
         self.pnl: dict[str, float] = {}

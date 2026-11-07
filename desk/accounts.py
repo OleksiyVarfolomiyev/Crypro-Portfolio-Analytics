@@ -23,6 +23,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ACCOUNTS_FILE = ROOT / "accounts.json"
+# IB account records (snapshots, fills, Flex NAV history) are kept outside the repository, in a
+# folder next to it, so brokerage account numbers and balances never reach git.
+IB_DATA_DIR = ROOT.parent / "trading-desk-data" / "ib"
 VENUES = ("hl", "ib")
 # Older accounts files may use the long venue names.
 VENUE_ALIASES = {"hyperliquid": "hl", "ibkr": "ib", "interactive brokers": "ib"}
@@ -44,6 +47,8 @@ class Account:
     port: int = IB_DEFAULT_PORT
     # HL wallets: also report the same address's holdings and activity on other chains.
     onchain: bool = True
+    # IB: the Flex query that returns daily NAV history (see desk/venues/ib_flex.py).
+    flex_query_id: str = ""
 
     @property
     def name(self) -> str:
@@ -84,8 +89,16 @@ def parse_accounts(items: list[dict]) -> list[Account]:
             venue=venue, id=account_id, label=str(item.get("label", "")).strip(),
             host=str(item.get("host", IB_DEFAULT_HOST)), port=port,
             onchain=bool(item.get("onchain", True)) and venue == "hl",
+            flex_query_id=str(item.get("flex_query_id", "")).strip() if venue == "ib" else "",
         ))
     return accounts
+
+
+def ib_data_dir() -> Path:
+    """Folder for IB account data: next to the repository, or ``DESK_IB_DATA_DIR`` if set."""
+    folder = Path(os.environ.get("DESK_IB_DATA_DIR", IB_DATA_DIR))
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
 
 def load_accounts(path: Path | str | None = None) -> list[Account]:

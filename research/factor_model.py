@@ -121,3 +121,82 @@ def alpha_verdict(alpha: float, t_stat: float) -> str:
     if t_stat < SIGNIFICANT_T_STAT:
         return "not established: alpha is positive but not distinguishable from zero"
     return "survives: alpha is positive and statistically significant"
+
+
+def newey_west_mean(series: pd.Series, lags: int = HAC_MAX_LAGS) -> tuple[float, float, int]:
+    """Mean of a time series with a Newey-West t-stat (Bartlett weights); returns (mean, t, n)."""
+    values = pd.to_numeric(series, errors="coerce").dropna().to_numpy(dtype=float)
+    n = len(values)
+    if n < 3:
+        return float("nan"), float("nan"), n
+    mean = values.mean()
+    deviations = values - mean
+    variance = deviations @ deviations / n
+    for lag in range(1, min(lags, n - 1) + 1):
+        variance += 2 * (1 - lag / (lags + 1)) * (deviations[lag:] @ deviations[:-lag]) / n
+    standard_error = np.sqrt(max(variance, 0.0) / n)
+    return float(mean), float(mean / standard_error) if standard_error > 0 else float("nan"), n
+
+
+def fama_macbeth(
+    returns: pd.DataFrame,
+    characteristics: dict[str, pd.DataFrame],
+    min_assets: int = 8,
+    lags: int = HAC_MAX_LAGS,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fama-MacBeth premia: one cross-sectional regression per day, then t-stats over days.
+
+    ``returns`` is dates x assets; each characteristic is a frame on the same grid that must
+    already be lagged (known before the return it explains). Each day, characteristics are
+    standardized across the assets with data, so a premium is the daily return per one
+    cross-sectional standard deviation. Because every day's slope is estimated from all assets
+    together, correlation across assets on a day only moves that day's slope; the t-stat comes
+    from the time series of slopes, with Newey-West correction for autocorrelation.
+
+    Returns (summary, daily slopes). Days with fewer than ``min_assets`` complete assets, or
+    too few to identify every slope, are skipped.
+    """
+    names = list(characteristics)
+    slopes, counts = {}, {}
+    for date in returns.index:
+        y = returns.loc[date]
+        x = pd.DataFrame({name: frame.loc[date] if date in frame.index else np.nan
+                          for name, frame in characteristics.items()})
+        sample = pd.concat([y.rename("__return__"), x], axis=1).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(sample) < max(min_assets, len(names) + 3):
+            continue
+        spread = sample[names].std(ddof=0)
+        if not (spread > 0).all():
+            continue
+        z = (sample[names] - sample[names].mean()) / spread
+        design = np.column_stack([np.ones(len(sample)), z.to_numpy(dtype=float)])
+        coefficients, _, rank, _ = np.linalg.lstsq(design, sample["__return__"].to_numpy(dtype=float), rcond=None)
+        if rank < design.shape[1]:
+            continue
+        slopes[date] = coefficients[1:]
+        counts[date] = len(sample)
+    daily = pd.DataFrame.from_dict(slopes, orient="index", columns=names).sort_index()
+    rows = []
+    for name in names:
+        mean, t_stat, days = newey_west_mean(daily[name], lags) if not daily.empty else (np.nan, np.nan, 0)
+        rows.append({"Characteristic": name, "Premium (daily)": mean, "t-stat": t_stat, "Days": days,
+                     "Avg assets": float(np.mean(list(counts.values()))) if counts else float("nan")})
+    return pd.DataFrame(rows).set_index("Characteristic"), daily
+
+
+def sort_spread(signal: pd.DataFrame, returns: pd.DataFrame, min_assets: int = 4) -> pd.Series:
+    """Daily return of an equal-weight long top-half, short bottom-half portfolio sorted on ``signal``.
+
+    ``signal`` must already be lagged. A day needs ``min_assets`` assets with both values.
+    """
+    spread = pd.Series(np.nan, index=returns.index, dtype=float)
+    for date in returns.index:
+        if date not in signal.index:
+            continue
+        both = pd.concat([signal.loc[date].rename("signal"), returns.loc[date].rename("return")], axis=1).dropna()
+        if len(both) < min_assets:
+            continue
+        ranked = both.sort_values("signal")
+        half = len(ranked) // 2
+        spread.loc[date] = ranked["return"].iloc[-half:].mean() - ranked["return"].iloc[:half].mean()
+    return spread

@@ -1,0 +1,22 @@
+asset,group,source,benchmark,in_kelly
+NEAR,Crypto,HL perp,BTC,True
+IMX,Crypto,HL perp,BTC,True
+USELESS,Crypto,HL perp,BTC,False
+INJ,Crypto,HL perp,BTC,True
+TRX,Crypto,HL perp,BTC,True
+RUNE,Crypto,HL perp,BTC,True
+ZRO,Crypto,HL perp,BTC,True
+RSR,Crypto,HL perp,BTC,True
+GOAT,Crypto,HL perp,BTC,True
+PENGU,Crypto,HL perp,BTC,True
+PONS,Crypto,HL perp,BTC,False
+xyz:MU,TradFi,HL perp,SPY,True
+HYPE,Crypto,HL spot,BTC,True
+DPI,Crypto,Wallet,BTC,True
+VVV,Crypto,Wallet,BTC,True
+GOOGL,TradFi,IB,SPY,True
+KYIV,TradFi,IB,SPY,True
+META,TradFi,IB,SPY,True
+NET,TradFi,IB,SPY,True
+NVDA,TradFi,IB,SPY,True
+SWMR,TradFi,IB,SPY,True

@@ -13,7 +13,7 @@ from pathlib import Path
 import pandas as pd
 from IPython.display import display
 
-from desk.accounts import Account, accounts_for, load_accounts
+from desk.accounts import Account, accounts_for, ib_data_dir, load_accounts
 from desk.hl.account_analytics import display_interactive_table
 from desk.risk import (
     MAX_TOTAL_RISK_PCT,
@@ -124,9 +124,9 @@ class DeskOverview:
                 else:
                     snapshot = ib_venue.snapshot_from_ib(ib, account)
                 self.snapshots.append(snapshot)
-                save_ib_history(snapshot, self.data_dir)
+                save_ib_history(snapshot, ib_data_dir())
                 self.ib_fills[snapshot.account] = merge_ib_fills(
-                    ib_venue.recent_fills(ib, snapshot.account), self.data_dir, snapshot.account)
+                    ib_venue.recent_fills(ib, snapshot.account), ib_data_dir(), snapshot.account)
             except Exception as exc:
                 self.problems.append(f"{account.name}: {str(exc) or type(exc).__name__}")
             finally:

@@ -352,6 +352,30 @@ def daily_bars(ib, contract, duration: str = "1 Y") -> pd.DataFrame:
     return frame[frame["date"].dt.tz_localize(None) < today].reset_index(drop=True)
 
 
+def adjusted_daily_closes(ib, contract, duration: str = "1 Y") -> pd.Series:
+    """Completed daily closes adjusted for splits and dividends, dated by session (UTC midnight).
+
+    Uses IB's ADJUSTED_LAST bars, which suit return analysis; falls back to unadjusted
+    trade prices where IB offers no adjusted series (non-stock contracts).
+    """
+    series = None
+    for what in ("ADJUSTED_LAST", "TRADES"):
+        bars = ib.reqHistoricalData(contract, endDateTime="", durationStr=duration, barSizeSetting="1 day",
+                                    whatToShow=what, useRTH=True, formatDate=1)
+        if bars:
+            series = pd.Series({pd.Timestamp(bar.date).tz_localize(None).normalize(): float(bar.close)
+                                for bar in bars if bar.close and bar.close > 0})
+            break
+    if series is None or series.empty:
+        errors = "; ".join(getattr(ib, "desk_errors", [])[-2:])
+        raise ValueError(f"IB returned no daily history for {contract_symbol(contract)}"
+                         + (f" ({errors})" if errors else "") + ".")
+    today = pd.Timestamp.now(tz=ACCOUNTING_TIMEZONE).tz_localize(None).normalize()
+    series = series[series.index < today].sort_index()  # today's session is not complete
+    series.index = series.index.tz_localize("UTC")
+    return series
+
+
 @dataclass(frozen=True)
 class Quote:
     bid: float

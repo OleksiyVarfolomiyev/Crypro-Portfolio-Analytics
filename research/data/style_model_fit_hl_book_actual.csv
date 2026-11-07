@@ -1,0 +1,11 @@
+,Style model
+Book,HL book (actual)
+Periods,28 weeks
+From,2026-03-22
+To,2026-09-27
+R-squared,0.6624662322642123
+Adjusted R-squared,0.5443294135566866
+Alpha (/yr),0.2253737768190115
+Alpha t-stat,0.5638235774696387
+Residual volatility (/yr),0.3085973876311582
+Information ratio,0.7303165413972421

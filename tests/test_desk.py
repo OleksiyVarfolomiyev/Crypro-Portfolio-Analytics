@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "execution"), str(ROOT / "research")]
 # Keep tests off real accounts: no IB or wallet in accounts.json is ever contacted.
 os.environ["DESK_ACCOUNTS_FILE"] = str(ROOT / "tests" / "no_accounts.json")
+# IB records from tests go to a throwaway folder, never the real one next to the repository.
+os.environ["DESK_IB_DATA_DIR"] = __import__("tempfile").mkdtemp(prefix="desk-ib-")
 
 import ib_trade  # noqa: E402
 from desk import risk  # noqa: E402
@@ -1010,3 +1012,21 @@ class RejectedStopSafetyNetTests(unittest.TestCase):
         placed, cancelled, report = self.run_with({"STP LMT", "STP"})
         self.assertEqual(cancelled, ["LMT"])
         self.assertIn("WARNING", report)
+
+
+class ExternalNamesTests(unittest.TestCase):
+    """Names owned by outside services must survive any internal renaming (hyperliquid -> hl)."""
+
+    REQUIRED = {
+        "research/portfolio_analytics_implementation.py": ["'HYPE': 'hyperliquid'", "'USDH': 'hyperliquid-usd'",
+                                                           "https://api.hyperliquid.xyz/info"],
+        "execution/hl_trade.py": ['KEYCHAIN_SERVICE = "Hyperliquid API wallet"', "https://api.hyperliquid.xyz",
+                                  "from hyperliquid."],
+        "requirements-trading.txt": ["hyperliquid-python-sdk"],
+    }
+
+    def test_external_identifiers_are_unchanged(self):
+        for path, needles in self.REQUIRED.items():
+            text = (ROOT / path).read_text()
+            for needle in needles:
+                self.assertIn(needle, text, f"{path} lost the external name {needle!r}")
