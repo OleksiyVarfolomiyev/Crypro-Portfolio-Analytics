@@ -35,6 +35,10 @@ MARKET_DATA_DELAYED = 3
 # timeout the connection skips further history requests: when IB's historical data service
 # is down (its nightly reset, weekend maintenance), every symbol would otherwise wait in turn.
 HISTORY_TIMEOUT_SECONDS = 20
+# Blocking requests on read-only connections give up after this long instead of waiting forever
+# (ib_async's default). Longer than the history timeout, so that one keeps its fail-fast handling.
+READ_REQUEST_TIMEOUT_SECONDS = 30
+LINK_LOST, LINK_RESTORED = "1100:", ("1101:", "1102:")
 LIVE_MARKET_DATA_TYPE = 1
 
 
@@ -94,6 +98,25 @@ def client_ids(purpose: str, attempts: int = 3) -> list[int]:
     return [base * 1000 + random.randint(1, 999) for _ in range(attempts)]
 
 
+def ibkr_link_down(errors: list[str]) -> bool:
+    """Whether TWS's last word on its link to IBKR was "lost" (1100) rather than "restored" (1101/1102)."""
+    lost = max((i for i, message in enumerate(errors) if message.startswith(LINK_LOST)), default=-1)
+    restored = max((i for i, message in enumerate(errors) if message.startswith(LINK_RESTORED)), default=-1)
+    return lost > restored
+
+
+def describe_failure(ib, exc: Exception) -> str:
+    """A readable reason for a failed IB read, naming IBKR maintenance when that is the likely cause."""
+    errors = getattr(ib, "desk_errors", None) or []
+    if ibkr_link_down(errors):
+        return ("TWS has lost its connection to IBKR's servers (error 1100), usually IBKR's nightly reset or "
+                "weekend maintenance")
+    if isinstance(exc, TimeoutError):
+        return (f"TWS did not answer within {READ_REQUEST_TIMEOUT_SECONDS}s; IBKR may be in maintenance or TWS "
+                "may be disconnected from IBKR")
+    return str(exc) or type(exc).__name__
+
+
 def connect(account: Account, purpose: str = "overview", readonly: bool = True, timeout: float = 10):
     """Connect to TWS for one account and return the ``ib_async.IB`` client.
 
@@ -138,6 +161,13 @@ def connect(account: Account, purpose: str = "overview", readonly: bool = True, 
     if account.id and account.id not in managed:
         ib.disconnect()
         raise IBConnectionError(f"TWS does not manage account {account.id}; it manages {managed}.")
+    if readonly:
+        ib.RequestTimeout = READ_REQUEST_TIMEOUT_SECONDS
+        if ibkr_link_down(errors):
+            ib.disconnect()
+            raise IBConnectionError(
+                "TWS is running but has lost its connection to IBKR's servers (error 1100), usually IBKR's "
+                "nightly reset or weekend maintenance. IB data is unavailable until TWS reconnects.")
     ib.reqMarketDataType(MARKET_DATA_DELAYED)
     return ib
 

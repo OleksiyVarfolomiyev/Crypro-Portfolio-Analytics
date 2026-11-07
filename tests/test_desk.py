@@ -1177,5 +1177,26 @@ class AdjustedHistoryFallbackTests(unittest.TestCase):
         self.assertFalse(getattr(ib, "desk_history_down", False))
 
 
+class IBKRLinkTests(unittest.TestCase):
+    def test_link_is_down_until_tws_reports_it_restored(self):
+        from desk.venues.ib import ibkr_link_down
+
+        lost = "1100: Connectivity between IBKR and Trader Workstation has been lost."
+        self.assertFalse(ibkr_link_down([]))
+        self.assertTrue(ibkr_link_down(["2104: farm ok", lost]))
+        self.assertFalse(ibkr_link_down([lost, "1102: Connectivity between IBKR and TWS has been restored - data maintained."]))
+        self.assertTrue(ibkr_link_down([lost, "1101: restored - data lost", lost]))
+
+    def test_failure_text_names_the_likely_cause(self):
+        from types import SimpleNamespace
+
+        from desk.venues.ib import describe_failure
+
+        self.assertIn("did not answer within", describe_failure(SimpleNamespace(desk_errors=[]), TimeoutError()))
+        lost = SimpleNamespace(desk_errors=["1100: Connectivity between IBKR and Trader Workstation has been lost."])
+        self.assertIn("maintenance", describe_failure(lost, RuntimeError("x")))
+        self.assertEqual(describe_failure(SimpleNamespace(), ValueError("bad contract")), "bad contract")
+
+
 if __name__ == "__main__":
     unittest.main()

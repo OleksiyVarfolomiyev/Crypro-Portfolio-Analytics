@@ -103,17 +103,22 @@ class DeskOverview:
         self.problems: list[str] = []
         self._highlights_state = None
 
-    def fetch_data(self, include_risk: bool = True, include_wallet_activity: bool = False):
+    def fetch_data(self, include_risk: bool = True, include_wallet_activity: bool = False,
+                   record_ib_history: bool = True):
         """Read balances and positions (and, by default, ATR risk) for every account.
 
         Wallet transfer history is the slowest read, so it is fetched only on request.
+        ``record_ib_history=False`` skips appending this read to the saved IB account history,
+        for callers that refresh every few minutes.
         """
-        snapshots = ib_venue.run_off_event_loop(self._fetch_data, include_risk, include_wallet_activity)
+        snapshots = ib_venue.run_off_event_loop(self._fetch_data, include_risk, include_wallet_activity,
+                                                record_ib_history)
         for problem in self.problems:
             print(f"WARNING: {problem}")
         return snapshots
 
-    def _fetch_data(self, include_risk: bool = True, include_wallet_activity: bool = False):
+    def _fetch_data(self, include_risk: bool = True, include_wallet_activity: bool = False,
+                    record_ib_history: bool = True):
         self.snapshots, self.book, self.problems, self.ib_fills = [], [], [], {}
         self._highlights_state = None  # a fresh fetch compares with the last saved run
         self.wallet_activity = {}
@@ -143,11 +148,12 @@ class DeskOverview:
                 else:
                     snapshot = ib_venue.snapshot_from_ib(ib, account)
                 self.snapshots.append(snapshot)
-                save_ib_history(snapshot, ib_data_dir())
+                if record_ib_history:
+                    save_ib_history(snapshot, ib_data_dir())
                 self.ib_fills[snapshot.account] = merge_ib_fills(
                     ib_venue.recent_fills(ib, snapshot.account), ib_data_dir(), snapshot.account)
             except Exception as exc:
-                self.problems.append(f"{account.name}: {str(exc) or type(exc).__name__}")
+                self.problems.append(f"{account.name}: {ib_venue.describe_failure(ib, exc)}")
             finally:
                 ib.disconnect()
         for account in hl_accounts:
@@ -190,14 +196,7 @@ class DeskOverview:
         """One row per account plus a desk total."""
         if not self._require():
             return
-        rows = [{
-            "Venue": snapshot.venue, "Account": snapshot.label, "Equity": snapshot.equity_usd,
-            "Cash": snapshot.cash_usd, "Margin used": snapshot.margin_used_usd,
-            "Available": snapshot.available_usd, "Unrealized PnL": snapshot.unrealized_usd,
-            "Gross": snapshot.gross_usd, "Net": snapshot.net_usd, "Positions": len(snapshot.positions),
-            "% of desk": snapshot.equity_usd / self.desk_equity if self.desk_equity else float("nan"),
-        } for snapshot in self.snapshots]
-        frame = pd.DataFrame(rows)
+        frame = self.accounts_frame()
         total = frame.drop(columns=["Venue", "Account", "% of desk"]).sum(numeric_only=True)
         frame.loc[len(frame)] = {"Venue": "Total", "Account": "", **total.to_dict(), "% of desk": 1.0}
         money = {column: _money for column in ["Equity", "Cash", "Margin used", "Available",
@@ -211,6 +210,16 @@ class DeskOverview:
               "Onchain rows are each HL wallet's own token holdings on other chains, "
               "valued at DefiLlama prices; they count toward desk value but not toward trading "
               "risk equity, since the executors cannot trade them.")
+
+    def accounts_frame(self) -> pd.DataFrame:
+        """One row per account read (no total row)."""
+        return pd.DataFrame([{
+            "Venue": snapshot.venue, "Account": snapshot.label, "Equity": snapshot.equity_usd,
+            "Cash": snapshot.cash_usd, "Margin used": snapshot.margin_used_usd,
+            "Available": snapshot.available_usd, "Unrealized PnL": snapshot.unrealized_usd,
+            "Gross": snapshot.gross_usd, "Net": snapshot.net_usd, "Positions": len(snapshot.positions),
+            "% of desk": snapshot.equity_usd / self.desk_equity if self.desk_equity else float("nan"),
+        } for snapshot in self.snapshots])
 
     def positions_frame(self) -> pd.DataFrame:
         equity = self.desk_equity
@@ -262,14 +271,11 @@ class DeskOverview:
               f"value; summed over every table it is gross leverage ({leverage:.0%} now), above 100% because HL "
               "perps are traded on margin.")
 
-    def show_exposure(self):
-        """Long, short, net, and gross exposure by asset class."""
-        if not self._require():
-            return
+    def exposure_frame(self) -> pd.DataFrame:
+        """Long, short, net and gross exposure by asset class, with a Total row last."""
         frame = self.positions_frame()
         if frame.empty:
-            print("No open positions.")
-            return
+            return frame
         value = frame["Value (USD)"]
         summary = pd.DataFrame({
             "Long": value.clip(lower=0).groupby(frame["Asset class"]).sum(),
@@ -280,11 +286,37 @@ class DeskOverview:
         summary.loc["Total"] = summary.sum()
         summary["Gross / equity"] = summary["Gross"] / self.desk_equity
         summary["Net / equity"] = summary["Net"] / self.desk_equity
-        summary = summary.reset_index(names="Asset class")
+        return summary.reset_index(names="Asset class")
+
+    def show_exposure(self):
+        """Long, short, net, and gross exposure by asset class."""
+        if not self._require():
+            return
+        summary = self.exposure_frame()
+        if summary.empty:
+            print("No open positions.")
+            return
         display_interactive_table(
             summary, formatters={**{column: _money for column in ["Long", "Short", "Net", "Gross"]},
                                  "Gross / equity": _percent, "Net / equity": _percent},
             cell_style=_signed_style, bold_last=True, title="EXPOSURE BY ASSET CLASS")
+
+    def risk_totals(self) -> tuple[float, float, float]:
+        """Executor risk equity, open risk used, and the aggregate cap."""
+        equity = sum(entry.equity_usd for entry in self.book)
+        return equity, sum(entry.risk_usd for entry in self.book), equity * MAX_TOTAL_RISK_PCT
+
+    def risk_frame(self) -> pd.DataFrame:
+        """Open risk per account against risk equity, with a Total row last."""
+        equity, used, _ = self.risk_totals()
+        rows = [{"Venue": entry.venue, "Account": entry.label, "Positions": entry.positions,
+                 "Risk equity": entry.equity_usd, "Open risk": entry.risk_usd,
+                 "% of desk equity": entry.risk_usd / equity if equity else float("nan")}
+                for entry in self.book]
+        rows.append({"Venue": "Total", "Account": "", "Positions": sum(entry.positions for entry in self.book),
+                     "Risk equity": equity, "Open risk": used,
+                     "% of desk equity": used / equity if equity else float("nan")})
+        return pd.DataFrame(rows)
 
     def show_risk(self):
         """Estimated open risk per venue against the desk-wide aggregate cap."""
@@ -295,18 +327,9 @@ class DeskOverview:
             return
         # Executor equity: HL margin collateral (USDC on unified accounts) plus IB
         # net liquidation, so the cap shown here is the one the executors enforce.
-        equity = sum(entry.equity_usd for entry in self.book)
-        cap = equity * MAX_TOTAL_RISK_PCT
-        rows = [{"Venue": entry.venue, "Account": entry.label, "Positions": entry.positions,
-                 "Risk equity": entry.equity_usd, "Open risk": entry.risk_usd,
-                 "% of desk equity": entry.risk_usd / equity if equity else float("nan")}
-                for entry in self.book]
-        used = sum(entry.risk_usd for entry in self.book)
-        rows.append({"Venue": "Total", "Account": "", "Positions": sum(entry.positions for entry in self.book),
-                     "Risk equity": equity, "Open risk": used,
-                     "% of desk equity": used / equity if equity else float("nan")})
+        equity, used, cap = self.risk_totals()
         display_interactive_table(
-            pd.DataFrame(rows), formatters={"Risk equity": _money, "Open risk": _money,
+            self.risk_frame(), formatters={"Risk equity": _money, "Open risk": _money,
                                             "% of desk equity": _percent, "Positions": "{:.0f}".format},
             cell_style=lambda *args: "color:inherit", bold_last=True, title="DESK OPEN RISK")
         if self.problems:
@@ -333,23 +356,10 @@ class DeskOverview:
         """Each HL wallet's own tokens on other chains: chain, amount, price and value."""
         if not self._require():
             return
-        rows = []
-        for snapshot in self._wallets():
-            for position in snapshot.positions:
-                token, _, chain = position.symbol.partition(" (")
-                detail = chain.rstrip(")")
-                chain_name = detail.rsplit(", ", 1)[-1]
-                note = detail.rsplit(", ", 1)[0] if ", " in detail else ""
-                if abs(position.notional_usd) < min_usd and "rewards" not in note:
-                    continue
-                rows.append({"Wallet": snapshot.label, "Chain": chain_name, "Token": token, "Note": note,
-                             "Amount": position.quantity, "Price": position.mark_price,
-                             "Value": position.notional_usd,
-                             "% of desk": position.notional_usd / self.desk_equity if self.desk_equity else float("nan")})
-        if not rows:
+        frame = self.wallet_holdings_frame(min_usd)
+        if frame.empty:
             print("No wallet holdings outside HL.")
             return
-        frame = pd.DataFrame(rows).sort_values("Value", ascending=False)
         total = {"Wallet": "Total", "Chain": "", "Token": "", "Note": "", "Amount": float("nan"), "Price": float("nan"),
                  "Value": frame["Value"].sum(), "% of desk": frame["% of desk"].sum()}
         frame = pd.concat([frame, pd.DataFrame([total])], ignore_index=True)
@@ -366,6 +376,24 @@ class DeskOverview:
         print("Tokens are valued at DefiLlama prices; staked tokens at the price of the token they represent. "
               "Unpriced (spam) tokens are left out. Wallet holdings count toward desk value but not toward "
               "trading risk equity.")
+
+    def wallet_holdings_frame(self, min_usd: float = 1.0) -> pd.DataFrame:
+        """Each HL wallet's tokens on other chains, largest first (no total row)."""
+        rows = []
+        for snapshot in self._wallets():
+            for position in snapshot.positions:
+                token, _, chain = position.symbol.partition(" (")
+                detail = chain.rstrip(")")
+                chain_name = detail.rsplit(", ", 1)[-1]
+                note = detail.rsplit(", ", 1)[0] if ", " in detail else ""
+                if abs(position.notional_usd) < min_usd and "rewards" not in note:
+                    continue
+                rows.append({"Wallet": snapshot.label, "Chain": chain_name, "Token": token, "Note": note,
+                             "Amount": position.quantity, "Price": position.mark_price,
+                             "Value": position.notional_usd,
+                             "% of desk": position.notional_usd / self.desk_equity if self.desk_equity else float("nan")})
+        frame = pd.DataFrame(rows)
+        return frame.sort_values("Value", ascending=False).reset_index(drop=True) if len(frame) else frame
 
     def show_unrealized_pnl(self, top: int = 5):
         """Unrealized PnL by account, and the largest winning and losing positions."""
@@ -387,19 +415,25 @@ class DeskOverview:
         display_interactive_table(frame, formatters={"Unrealized PnL": _money, "% of account value": _percent,
                                                      "% of position value": _percent, "Positions": "{:.0f}".format},
                                   cell_style=_signed_style, bold_last=True, title="UNREALIZED PNL BY ACCOUNT")
+        movers = self.movers_frame(top)
+        if movers.empty:
+            return
+        display_interactive_table(movers, formatters={"Value (USD)": _money, "Unrealized PnL": _money, "% of position": _percent},
+                                  cell_style=_signed_style, title=f"LARGEST WINNERS AND LOSERS (TOP {top} EACH)")
+        print("Unrealized PnL is on open trading positions (HL and IB); wallet tokens have no cost basis here. "
+              "% of position compares the PnL with the position's value at entry.")
+
+    def movers_frame(self, top: int = 5) -> pd.DataFrame:
+        """The largest winning and losing trading positions by unrealized PnL."""
         positions = pd.DataFrame([{
             "Account": snapshot.label, "Symbol": position.symbol, "Side": position.side,
             "Value (USD)": position.notional_usd, "Unrealized PnL": position.unrealized_usd,
             "% of position": _pnl_share(position),
         } for snapshot in self._trading() for position in snapshot.positions])
         if positions.empty:
-            return
+            return positions
         ranked = positions.sort_values("Unrealized PnL")
-        movers = pd.concat([ranked.tail(top).iloc[::-1], ranked.head(top)]).drop_duplicates()
-        display_interactive_table(movers, formatters={"Value (USD)": _money, "Unrealized PnL": _money, "% of position": _percent},
-                                  cell_style=_signed_style, title=f"LARGEST WINNERS AND LOSERS (TOP {top} EACH)")
-        print("Unrealized PnL is on open trading positions (HL and IB); wallet tokens have no cost basis here. "
-              "% of position compares the PnL with the position's value at entry.")
+        return pd.concat([ranked.tail(top).iloc[::-1], ranked.head(top)]).drop_duplicates().reset_index(drop=True)
 
     def show_desk_metrics(self):
         """One summary of the whole desk: value, exposure, leverage, PnL and risk."""

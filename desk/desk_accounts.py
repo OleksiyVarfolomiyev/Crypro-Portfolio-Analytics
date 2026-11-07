@@ -90,11 +90,15 @@ class DeskAccounts:
         self._highlights_state = None
 
     # ------------------------------------------------------------------
-    def fetch_data(self, refresh_history: bool = True):
-        """Current state of every account, plus each account's value and PnL history."""
+    def fetch_data(self, refresh_history: bool = True, record_ib_history: bool = True):
+        """Current state of every account, plus each account's value and PnL history.
+
+        ``refresh_history=False`` reuses the saved HL and IB Flex histories and the benchmark prices
+        already loaded, so a frequent refresh (the dashboard) only re-reads current balances.
+        """
         self.notes = []
         self._highlights_state = None  # a fresh fetch compares with the last saved run
-        self.overview.fetch_data()
+        self.overview.fetch_data(record_ib_history=record_ib_history)
         self.histories, self.windowed = {}, set()
         for account in accounts_for("hl", self.accounts):
             try:
@@ -147,7 +151,8 @@ class DeskAccounts:
                 days |= set(pd.date_range(start.normalize(), first - pd.Timedelta(days=1), freq="D", tz="UTC"))
             self.daily_days = days if self.daily_days is None else self.daily_days & days
         self.daily_days = pd.DatetimeIndex(sorted(self.daily_days or []))
-        self.benchmarks = self._benchmarks(start - pd.Timedelta(days=10))
+        if refresh_history or self.benchmarks.empty:
+            self.benchmarks = self._benchmarks(start - pd.Timedelta(days=10))
         if any(account.venue == "hl" and account.onchain for account in self.accounts):
             self.notes.append("Wallet tokens on other chains have no value history; they count in current totals only.")
         for note in self.notes:
@@ -231,19 +236,23 @@ class DeskAccounts:
             rows.append(row)
         return pd.DataFrame(rows)
 
+    def performance_frame(self) -> pd.DataFrame:
+        """Per-account PnL and return over each window, with the combined desk row last."""
+        table = self.account_pnl()
+        returns = self.desk_returns()
+        desk = {"Account": "Desk (combined)", "Value": table["Value"].sum()}
+        for label in WINDOWS:
+            desk[f"Return {label}"] = returns.get(label, np.nan)
+            desk[f"PnL {label}"] = table[f"PnL {label}"].sum(min_count=1)
+        table = pd.concat([table, pd.DataFrame([desk])], ignore_index=True)
+        return table[["Account", "Value"] + [f"{kind} {label}" for label in WINDOWS for kind in ("PnL", "Return")]]
+
     def show_performance(self):
         """Desk and per-account returns and PnL over 7, 30 and 90 days and since the shared start."""
         if not self._require():
             return
-        table = self.account_pnl()
-        now = pd.Timestamp.now(tz="UTC")
-        desk = {"Account": "Desk (combined)", "Value": table["Value"].sum()}
-        for label, days in WINDOWS.items():
-            prior = self.index[self.index.index <= now - pd.Timedelta(days=days)]
-            desk[f"Return {label}"] = float(self.index.iloc[-1] / prior.iloc[-1] - 1) if len(prior) else np.nan
-            desk[f"PnL {label}"] = table[f"PnL {label}"].sum(min_count=1)
-        table = pd.concat([table, pd.DataFrame([desk])], ignore_index=True)
-        columns = ["Account", "Value"] + [f"{kind} {label}" for label in WINDOWS for kind in ("PnL", "Return")]
+        table = self.performance_frame()
+        columns = list(table.columns)
         money = lambda value: "n/a" if not np.isfinite(value) else f"${value:,.2f}"
         percent = lambda value: "n/a" if not np.isfinite(value) else f"{value:+.2%}"
         display_interactive_table(table[columns], bold_last=True, title="DESK PERFORMANCE (NET OF DEPOSITS)",
@@ -267,6 +276,16 @@ class DeskAccounts:
         """Desk performance and risk highlights plus the overview's current-state ones, with changes since the last run."""
         if not self._require():
             return
+        well, attention, metrics, items = self.highlight_rows()
+        if self._highlights_state is None:
+            self._highlights_state = HighlightsState(self.data_dir / ACCOUNTS_HIGHLIGHTS_STATE)
+        since = self._highlights_state.compare(metrics, items)
+        show_highlights(well, attention, since,
+                        footnote="Returns are time-weighted and net of deposits and withdrawals. Betas here are "
+                                 "simple weekly estimates; the risk metrics section has bootstrap ranges.")
+
+    def highlight_rows(self) -> tuple[list, list, dict, dict]:
+        """What stands out and needs attention (performance, risk and current state), and the key numbers."""
         well, attention, metrics, items = self.overview.highlight_rows() if self.overview.snapshots else ([], [], {}, {})
         returns = self.desk_returns()
         text = (f"{percent(returns['since start'], signed=True)} since {self.common_start:%Y-%m-%d}; "
@@ -307,12 +326,7 @@ class DeskAccounts:
                         "Desk return 30D": (returns.get("30D", np.nan), "pct"),
                         "Drawdown now": (drawdown, "pct"), "Weekly Sharpe": (sharpe, "num"),
                         "Beta SPY (weekly)": (beta_spy, "num"), "Beta BTC (weekly)": (beta_btc, "num")})
-        if self._highlights_state is None:
-            self._highlights_state = HighlightsState(self.data_dir / ACCOUNTS_HIGHLIGHTS_STATE)
-        since = self._highlights_state.compare(metrics, items)
-        show_highlights(well, attention, since,
-                        footnote="Returns are time-weighted and net of deposits and withdrawals. Betas here are "
-                                 "simple weekly estimates; the risk metrics section has bootstrap ranges.")
+        return well, attention, metrics, items
 
     def risk_metrics(self) -> pd.DataFrame:
         """Volatility, Sharpe, drawdown, VaR and benchmark betas, weekly and (where possible) daily."""

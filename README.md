@@ -6,6 +6,7 @@ A multi-venue trading desk: analytics, research, and guarded execution across **
 | --- | --- | --- |
 | Desk overview: accounts, desk metrics, exposure, positions, unrealized PnL, wallet holdings outside HL, desk-wide open risk | All | [`desk_overview.ipynb`](desk_overview.ipynb), `desk/overview.py` |
 | Desk accounts: every account combined into one desk return net of deposits; performance by account, risk metrics vs BTC and SPY, charts | All | [`desk_accounts.ipynb`](desk_accounts.ipynb), `desk/desk_accounts.py` |
+| Live dashboard: the desk accounts view as a self-refreshing local web page | All | `python -m desk.dashboard`, `desk/dashboard.py` |
 | Guarded execution: dry run by default, typed confirmations, desk-wide risk cap, shared kill switch | HL, IB | `execution/hl_trade.py`, `execution/ib_trade.py` |
 | Account analytics: PnL, funding, risk metrics, attribution, charts | HL | `hl_account*.ipynb`, `desk/hl/` |
 | Account analytics: balances, today's PnL, positions with ATR levels, current-book risk vs SPY, fills, attribution | IB | `ib_account.ipynb`, `desk/ib/` |
@@ -84,6 +85,20 @@ Every account is read on its own, so one failure never hides another. The overvi
 Open [`ib_account.ipynb`](ib_account.ipynb) and run all cells; it is the IB counterpart of `hl_account.ipynb` and uses a read-only TWS connection. It shows net liquidation, cash, buying power, margin, unrealized PnL and today's PnL; open positions with average cost, unrealized PnL, the 1.25 × ATR(14) stop and 1:1 target the executor would place now, risk to that stop, and 60-day beta to SPY; and PnL attribution by symbol.
 
 IB's API has no account-value history, so beta and alpha to SPY, Sharpe, volatility, bootstrap VaR and maximum drawdown price **today's holdings** over the past year of IB daily closes, with 90% bootstrap ranges. They describe the current book, not past account performance. Real history builds up from run to run: each run saves a net-liquidation snapshot to `trading-desk-data/ib/ib_account_history_<account>.csv` and merges executions into `trading-desk-data/ib/ib_fills_<account>.csv` (TWS keeps about a week of them), and the history and realized-PnL sections read those files.
+
+## Live dashboard
+
+`desk_accounts.ipynb` as a web page that keeps itself current. With the py314 environment (it needs plotly), from any folder:
+
+```bash
+/Users/admin/anaconda3/envs/py314/bin/python /Users/admin/Dropbox/Investing/trading-desk/run_dashboard.py --open
+```
+
+From the repository root, `python -m desk.dashboard --open` does the same.
+
+It serves http://127.0.0.1:8050 (`--port` to change) and re-reads every account every 3 minutes (`--interval` in seconds, minimum 30); the **Refresh now** button refreshes immediately. The page shows key-number tiles (desk value, unrealized PnL, returns, drawdown, leverage, open risk against the cap, largest position), which accounts were read, highlights, desk value by account and the desk return against BTC and SPY, and the performance, accounts, risk-metrics, positions, exposure, open-risk, winners-and-losers and wallet tables. HL value history, IB Flex history, benchmark prices and risk statistics refresh hourly; IB account snapshots are added to the saved IB history at most every 30 minutes. An unreadable account is named in a red banner and left out of every total; a failed refresh keeps the last good data on screen and says how old it is. During IBKR maintenance, IB reads give up after 30 seconds instead of hanging.
+
+The server listens on 127.0.0.1 only and has no login, because the page shows balances. It is read-only and never places orders. `kill -USR1 <pid>` writes every thread's stack to its output if a refresh seems stuck. Code: `desk/dashboard.py`, page in `desk/dashboard_static/`.
 
 ## Notebook highlights
 

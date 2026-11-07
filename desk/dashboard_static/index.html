@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Desk Dashboard</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/plotly.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="title">
+    <h1>Trading desk</h1>
+    <span class="subtitle">HL, IB and wallets · read-only</span>
+  </div>
+  <div class="status" id="status" role="status" aria-live="polite">
+    <span class="dot" id="status-dot"></span><span id="status-text">Connecting…</span>
+  </div>
+  <button type="button" id="refresh" class="button">Refresh now</button>
+</header>
+
+<main id="main">
+  <div id="banners"></div>
+
+  <section id="loading" class="card loading">
+    Reading every account (HL, IB through TWS, wallets on other chains). The first refresh takes about a minute.
+  </section>
+
+  <div id="content" hidden>
+    <section class="tiles" id="tiles" aria-label="Key numbers"></section>
+
+    <section class="accounts-status" id="accounts-status" aria-label="Account connections"></section>
+
+    <section class="grid two">
+      <div class="card">
+        <h2><span class="icon good" aria-hidden="true">✓</span>What stands out</h2>
+        <ul class="highlights" id="hl-well"></ul>
+      </div>
+      <div class="card">
+        <h2><span class="icon bad" aria-hidden="true">!</span>Needs attention</h2>
+        <ul class="highlights" id="hl-attention"></ul>
+      </div>
+    </section>
+
+    <section class="grid two">
+      <div class="card">
+        <h2>Desk value by account</h2>
+        <p class="caption">USD, daily; wallet tokens on other chains have no history and are not included.</p>
+        <div class="chart" id="chart-value"></div>
+      </div>
+      <div class="card">
+        <h2>Desk return vs BTC and SPY</h2>
+        <p class="caption">Time-weighted, net of deposits and withdrawals; each line starts at 100.</p>
+        <div class="chart" id="chart-twr"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Performance</h2>
+      <p class="caption">PnL is each account's value change less deposits and withdrawals; returns are time-weighted.</p>
+      <div class="table-wrap" id="t-performance"></div>
+    </section>
+
+    <section class="card">
+      <h2>Accounts</h2>
+      <div class="table-wrap" id="t-accounts"></div>
+    </section>
+
+    <section class="card">
+      <h2>Risk metrics</h2>
+      <p class="caption">Weekly over the whole shared history; daily over days every account has a daily value. VaR is one period's bootstrap loss on today's value. Updated hourly.</p>
+      <div class="table-wrap" id="t-risk"></div>
+    </section>
+
+    <section class="card">
+      <h2>Open positions</h2>
+      <p class="caption">Value is signed (shorts negative). Weight is the share of gross exposure (sums to 100%); exposure / desk value sums to gross leverage.</p>
+      <div class="table-wrap" id="t-positions"></div>
+    </section>
+
+    <section class="grid two">
+      <div class="card">
+        <h2>Exposure by asset class</h2>
+        <div class="table-wrap" id="t-exposure"></div>
+      </div>
+      <div class="card">
+        <h2>Open risk vs the desk cap</h2>
+        <p class="caption">Each position's 1.25 × ATR(14) stop distance plus costs; HL adds a 5-day funding reserve.</p>
+        <div class="table-wrap" id="t-open_risk"></div>
+      </div>
+    </section>
+
+    <section class="grid two">
+      <div class="card">
+        <h2>Largest winners and losers</h2>
+        <div class="table-wrap" id="t-movers"></div>
+      </div>
+      <div class="card">
+        <h2>Wallet holdings outside HL</h2>
+        <div class="table-wrap" id="t-wallets"></div>
+      </div>
+    </section>
+
+    <details class="card notes">
+      <summary>Data notes</summary>
+      <ul id="notes"></ul>
+    </details>
+  </div>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
